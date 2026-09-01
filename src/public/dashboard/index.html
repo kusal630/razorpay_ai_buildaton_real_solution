@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Sellable Dashboard</title>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { font-family: -apple-system, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }
+    .container { max-width: 1200px; margin: 0 auto; }
+    .card { background: white; border-radius: 8px; padding: 20px; margin: 10px 0; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+    h1 { color: #333; }
+    h2 { color: #555; border-bottom: 2px solid #007bff; padding-bottom: 5px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid #eee; }
+    th { background: #f8f9fa; }
+    .status-ok { color: green; }
+    .status-error { color: red; }
+    .btn { padding: 8px 16px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; margin: 5px; }
+    .btn-danger { background: #dc3545; }
+    .btn-success { background: #28a745; }
+    #login { max-width: 400px; margin: 100px auto; }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div id="login" class="card">
+      <h2>Login</h2>
+      <form id="loginForm">
+        <input type="email" id="email" placeholder="Email" style="width:100%;padding:8px;margin:5px 0;">
+        <input type="password" id="password" placeholder="Password" style="width:100%;padding:8px;margin:5px 0;">
+        <button type="submit" class="btn" style="width:100%">Login</button>
+      </form>
+    </div>
+
+    <div id="dashboard" class="hidden">
+      <h1>Sellable Dashboard</h1>
+      <div class="card">
+        <h2>Revenue Attribution</h2>
+        <div id="revenue"></div>
+      </div>
+      <div class="card">
+        <h2>Audit Trail</h2>
+        <div id="audit"></div>
+        <button class="btn" onclick="verifyChain()">Verify Chain</button>
+        <button class="btn" onclick="createCheckpoint()">Create Checkpoint</button>
+      </div>
+      <div class="card">
+        <h2>Approvals</h2>
+        <div id="approvals"></div>
+      </div>
+      <div class="card">
+        <h2>System Status</h2>
+        <div id="status"></div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let csrfToken = '';
+
+    document.getElementById('loginForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const res = await fetch('/ops/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: document.getElementById('email').value,
+          password: document.getElementById('password').value,
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        csrfToken = data.csrfToken;
+        document.getElementById('login').classList.add('hidden');
+        document.getElementById('dashboard').classList.remove('hidden');
+        loadDashboard();
+      } else {
+        alert('Login failed');
+      }
+    });
+
+    async function loadDashboard() {
+      const res = await fetch('/ops/dashboard');
+      const data = await res.json();
+
+      document.getElementById('revenue').innerHTML = '<table><tr><th>Source</th><th>Count</th><th>Total</th></tr>' +
+        data.revenue.map(r => `<tr><td>${r.source}</td><td>${r.count}</td><td>₹${(r.total/100).toFixed(2)}</td></tr>`).join('') +
+        '</table>';
+
+      document.getElementById('audit').innerHTML = '<table><tr><th>Outcome</th><th>Count</th></tr>' +
+        data.audit.map(a => `<tr><td>${a.outcome}</td><td>${a.count}</td></tr>`).join('') +
+        '</table>';
+
+      document.getElementById('approvals').innerHTML = '<table><tr><th>Status</th><th>Count</th></tr>' +
+        data.approvals.map(a => `<tr><td>${a.status}</td><td>${a.count}</td></tr>`).join('') +
+        '</table>';
+    }
+
+    async function verifyChain() {
+      const res = await fetch('/ops/verify-chain', {
+        method: 'POST',
+        headers: { 'X-CSRF-Token': csrfToken },
+      });
+      const data = await res.json();
+      alert(data.valid ? 'Chain valid!' : `Chain broken at seq ${data.brokenAt}`);
+    }
+
+    async function createCheckpoint() {
+      const res = await fetch('/ops/checkpoint', {
+        method: 'POST',
+        headers: { 'X-CSRF-Token': csrfToken },
+      });
+      const data = await res.json();
+      alert(`Checkpoint created: ${data.id}`);
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: sellable
+          POSTGRES_PASSWORD: sellable
+          POSTGRES_DB: sellable
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgres://sellable:sellable@localhost:5432/sellable
+      REDIS_URL: redis://localhost:6379
+      RAZORPAY_KEY_ID: rzp_test_xxx
+      RAZORPAY_KEY_SECRET: xxx
+      RAZORPAY_WEBHOOK_SECRET: xxx
+      RAZORPAY_MODE: test
+      LIVE_MODE_ACK: "false"
+      ENABLE_DEV_TOOLS: "true"
+      APP_ENCRYPTION_KEY: dGVzdC1lbmNyeXB0aW9uLWtleS0xMjM0NTY=
+      SESSION_SECRET: test-session-secret
+      LLM_BASE_URL: http://localhost:0
+      LLM_API_KEY: sk-test
+      LLM_MODEL: gpt-4o-mini
+      BASE_URL: http://localhost:3000
+      ABANDON_MINUTES: 1
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit Tests
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      - name: Start server
+        run: |
+          npm run seed
+          npm start &
+          sleep 5
+          curl -f http://localhost:3000/healthz
+
+      - name: E2E Tests
+        if: env.INTEGRATION == 'true'
+        run: npx playwright test
+        env:
+          BASE_URL: http://localhost:3000
+          TEST_TRACK_KEY: test-track-key
+          TEST_BUYER_KEY: test-buyer-key
+          INTEGRATION: ${{ secrets.INTEGRATION }}
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run lint || true

@@ -1,0 +1,7 @@
+# Claims Allowlist - reviewed at sign-off
+# Exceptions to the claims linter are listed here and must be reviewed before each release.
+
+# Format: each line is a phrase that is allowed despite being in the banned list.
+# Lines starting with # are comments.
+
+# None currently - all claims have been cleaned.
