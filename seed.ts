@@ -74,10 +74,65 @@ async function seed() {
     }
     console.log("Policy rules created");
 
+    // C2: Demo seed - Riya with ledgered checkout-notice consent event
+    const riyaEmail = "riya@example.com";
+    const { rows: riyaRows } = await pool.query(
+      `INSERT INTO customers (merchant_id, email_enc, name_enc, phone_enc, consent_marketing)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (merchant_id, email_enc) DO UPDATE SET consent_marketing = $5
+       RETURNING id`,
+      [
+        merchantId,
+        riyaEmail,
+        "Riya Sharma",
+        "+919876543210",
+        JSON.stringify({
+          opt_in: true,
+          source: "checkout_notice",
+          evidence_reference: "checkout_notice_001",
+          consented_at: new Date().toISOString(),
+        }),
+      ]
+    );
+    const riyaId = riyaRows[0].id;
+    console.log("Riya customer created:", riyaId);
+
+    // C2: Ledger consent event for Riya
+    await pool.query(
+      `INSERT INTO consent_events (customer_id, consent_type, opt_in, source, evidence_reference, merchant_id)
+       VALUES ($1, 'marketing', true, 'checkout_notice', 'checkout_notice_001', $2)`,
+      [riyaId, merchantId]
+    );
+    console.log("Riya consent event ledgered");
+
+    // Demo: Customer without marketing consent (for C1 clamp demo)
+    const noConsentEmail = "noconsent@example.com";
+    const { rows: noConsentRows } = await pool.query(
+      `INSERT INTO customers (merchant_id, email_enc, name_enc, phone_enc, consent_marketing)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (merchant_id, email_enc) DO UPDATE SET consent_marketing = $5
+       RETURNING id`,
+      [
+        merchantId,
+        noConsentEmail,
+        "No Consent User",
+        "+919876543211",
+        JSON.stringify({
+          opt_in: false,
+          source: null,
+          consented_at: null,
+        }),
+      ]
+    );
+    console.log("No-consent customer created:", noConsentRows[0].id);
+
     console.log("\n--- Seed Complete ---");
     console.log("Login: admin@sellable.io / admin123");
     console.log("Track Key:", trackKey);
     console.log("Buyer Key:", buyerKey);
+    console.log("\n--- Demo Narrative ---");
+    console.log("1. Riya: checkout-notice consent → Rs.0 first touch (transactional) → Rs.100 repeat (marketing PASS) → payment → attribution");
+    console.log("2. NoConsent: positive EV incentive → plain link sent (clamp), reason: consent_marketing_missing");
   } finally {
     await pool.end();
   }

@@ -18,8 +18,12 @@ services:
 
   redis:
     image: redis:7-alpine
+    # H7: Redis AOF everysec for durability
+    command: redis-server --appendonly yes --appendfsync everysec
     ports:
       - "6379:6379"
+    volumes:
+      - redisdata:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -44,3 +48,4 @@ services:
 
 volumes:
   pgdata:
+  redisdata:

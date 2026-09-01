@@ -1,5 +1,6 @@
 import * as razorpayService from "./razorpayService.js";
-import * as auditLedger from "./auditLedger.js";
+import { appendAuditSerialized } from "./auditLedger2.js";
+import { updateAuditOutcome } from "./auditLedger.js";
 import * as crypto from "./crypto.js";
 import { getConfig } from "../config.js";
 import { query } from "../db.js";
@@ -32,8 +33,8 @@ export async function execute(
 ): Promise<{ seq: number; result?: unknown }> {
   const config = getConfig();
 
-  // Append PROPOSED audit row
-  const seq = await auditLedger.appendAudit({
+  // V2: Append PROPOSED audit row with serialized lock (N1)
+  const seq = await appendAuditSerialized({
     actor,
     action: action.type,
     params_json: action.params,
@@ -45,19 +46,19 @@ export async function execute(
 
   // BLOCK -> never execute
   if (policyResult.decision === "BLOCK") {
-    await auditLedger.updateAuditOutcome(seq, "BLOCKED", { reason: "policy_block" });
+    await updateAuditOutcome(seq, "BLOCKED", { reason: "policy_block" });
     return { seq };
   }
 
   // ABSTAIN -> EV negative, nothing sent (N12)
   if (policyResult.decision === "ABSTAIN") {
-    await auditLedger.updateAuditOutcome(seq, "ABSTAINED", { reason: "ev_negative" });
+    await updateAuditOutcome(seq, "ABSTAINED", { reason: "ev_negative" });
     return { seq };
   }
 
   // ESCALATE -> create approval, don't execute yet
   if (policyResult.decision === "ESCALATE") {
-    await auditLedger.updateAuditOutcome(seq, "ESCALATED", { reason: "policy_escalate" });
+    await updateAuditOutcome(seq, "ESCALATED", { reason: "policy_escalate" });
     await query(
       `INSERT INTO approvals (merchant_id, audit_seq, context_json) VALUES ($1, $2, $3)`,
       [config.RAZORPAY_MODE === "test" ? "00000000-0000-0000-0000-000000000001" : "", seq, JSON.stringify(rationale)]
@@ -93,10 +94,10 @@ export async function execute(
         throw new Error(`Unknown action type: ${action.type}`);
     }
 
-    await auditLedger.updateAuditOutcome(seq, "SUCCESS", { result });
+    await updateAuditOutcome(seq, "SUCCESS", { result });
     return { seq, result };
   } catch (err: any) {
-    await auditLedger.updateAuditOutcome(seq, "FAILED", { error: err.message });
+    await updateAuditOutcome(seq, "FAILED", { error: err.message });
     throw err;
   }
 }

@@ -6,6 +6,7 @@ import { processAbandonedCart } from "../agents/recoveryBot.js";
 import { processUpsell } from "../agents/upsellBot.js";
 import { createLogger } from "../logger.js";
 import { redactForPersist } from "../lib/redact.js";
+import { handleOverpayment, registerLink } from "../lib/linkLifecycle.js";
 
 const log = createLogger("webhookProcessor");
 
@@ -46,14 +47,60 @@ export const webhookProcessorWorker = createWorker("webhook-processing", async (
     const eventType = event.event;
     const payloadData = event.payload?.payment?.entity || event.payload?.payment_link?.entity || {};
 
+    // H8: Record event ordering for out-of-order detection
+    const eventTimestamp = event.created_at || Math.floor(Date.now() / 1000);
+    await query(
+      `INSERT INTO webhook_events (event_id, status, created_at_raw)
+       VALUES ($1, 'processing', $2)
+       ON CONFLICT (event_id) DO NOTHING`,
+      [event_id, eventTimestamp]
+    );
+
     switch (eventType) {
       case "payment.captured": {
         const orderId = payloadData.order_id;
         if (orderId) {
+          // H1: Check for overpayment
+          const { rows: orderRows } = await query(
+            "SELECT amount_paise, cart_id FROM orders WHERE id = $1",
+            [orderId]
+          );
+
+          if (orderRows[0]) {
+            const expectedAmount = Number(orderRows[0].amount_paise);
+            const capturedAmount = Number(payloadData.amount || 0);
+
+            if (capturedAmount > expectedAmount) {
+              // H1: Handle overpayment
+              const overpaymentResult = await handleOverpayment({
+                orderId,
+                cartId: orderRows[0].cart_id,
+                capturedAmountPaise: capturedAmount,
+                expectedAmountPaise: expectedAmount,
+              });
+
+              if (overpaymentResult.action === "auto_refunded") {
+                // Don't mark as paid - refund in progress
+                log.info({ orderId, overpayment: capturedAmount - expectedAmount }, "Overpayment auto-refunded");
+                break;
+              }
+            }
+          }
+
+          // Normal payment.captured processing
           await query(
             "UPDATE orders SET status = 'paid', paid_at = NOW() WHERE id = $1",
             [orderId]
           );
+
+          // H2: Record fee from payment entity
+          if (payloadData.fee) {
+            await query(
+              `UPDATE orders SET fee_paise = $1, fee_basis = 'entity' WHERE id = $2`,
+              [Number(payloadData.fee), orderId]
+            );
+          }
+
           // Find related audit seq
           const { rows: auditRows } = await query(
             "SELECT seq FROM audit_log WHERE outcome_detail_json->>'result' LIKE $1 ORDER BY seq DESC LIMIT 1",
@@ -87,6 +134,23 @@ export const webhookProcessorWorker = createWorker("webhook-processing", async (
         }
         break;
       }
+      case "payment_link.created": {
+        // H1: Register new active link
+        const linkId = payloadData.id;
+        const referenceId = payloadData.reference_id;
+        const notes = payloadData.notes || {};
+
+        if (linkId && notes.cart_id) {
+          await registerLink({
+            paymentLinkId: linkId,
+            cartId: notes.cart_id,
+            merchantId: "00000000-0000-0000-0000-000000000001", // Single merchant
+            amountPaise: Number(payloadData.amount || 0),
+            incentivePaise: Number(notes.incentive_paise || 0),
+          });
+        }
+        break;
+      }
       case "payment_link.paid": {
         const linkId = payloadData.id;
         const referenceId = payloadData.reference_id;
@@ -94,6 +158,11 @@ export const webhookProcessorWorker = createWorker("webhook-processing", async (
           const seq = parseInt(referenceId);
           if (!isNaN(seq)) {
             await updateAuditOutcome(seq, "SUCCESS", { payment_link_id: linkId, status: "paid" });
+            // H1: Mark link as converted
+            await query(
+              `UPDATE open_links SET status = 'converted' WHERE payment_link_id = $1`,
+              [linkId]
+            );
           }
         }
         break;

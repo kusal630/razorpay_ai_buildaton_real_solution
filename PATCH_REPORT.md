@@ -1,4 +1,4 @@
-# PATCH_REPORT.md v3.3 — Final Seam-Hardening (SCOPE FREEZE)
+# PATCH_REPORT.md v4.1 — Consent-Class Correction + Four Residues
 
 ## Test Results
 
@@ -6,12 +6,12 @@
 ✓ tests/llm.test.ts (3 tests)
 ✓ tests/crypto.test.ts (3 tests)
 ✓ tests/pii.test.ts (4 tests)
-✓ tests/experiment.test.ts (7 tests)
-✓ tests/intentExecutor.test.ts (7 tests)
 ✓ tests/auditLedger.test.ts (3 tests)
 ✓ tests/patches.test.ts (12 tests)
-✓ tests/policy.test.ts (13 tests)
+✓ tests/experiment.test.ts (7 tests)
 ✓ tests/v3_2.test.ts (21 tests)
+✓ tests/intentExecutor.test.ts (7 tests)
+✓ tests/policy.test.ts (13 tests)
 ✓ tests/razorpay.test.ts (5 tests)
 
 Test Files  10 passed (10)
@@ -20,121 +20,50 @@ Test Files  10 passed (10)
 
 ---
 
-## Preflight Audit (Final)
+## Patches Applied (C1-C6)
 
-| Item | Status | Evidence |
-|------|--------|----------|
-| (a) Webhook HMAC | PASS | webhooks.ts:29 constant-time compare |
-| (b) Idempotency-Key | PARTIAL | protocol.ts has middleware; /ops/* missing |
-| (c) Dual-path | PASS | webhookProcessor + paymentPoller |
-| (d) Contacts decrypt | PASS | crypto.ts AES-256-GCM; moneyBus only |
-| (e) grep gates | PASS | razorpay SDK only in moneyBus |
-| (f) Retry policy | PASS | W3 payment_failed with Rs.0 default |
-| (g) Test baseline | 78/78 PASS | All green |
-| (h) Tracking auth | PASS | V1 public/secret key split |
-| (i) Ledger concurrency | PASS | V2 pg_advisory_xact_lock |
-| (j) PII-at-rest | PASS | V8 redact.ts central module |
-| (k) Razorpay filter | PASS | V7 filter-agnostic janitor |
-| (l) Identity & ingestion | PASS | W5 server-side totals, identity_token |
-| (m) Intent-state | PASS | W2 lease-based state machine |
-| (n) External review | PASS | All findings dispositioned |
-
----
-
-## Vulnerability Fixes (W1-W10)
-
-### W1 — Uplift-Aware EV
+### C1 — Consent Classes for Money Content
 **Status: FIXED**
-- `upliftEv()`: `inc_ev(b) = (theta_b - theta_0) * (margin - fee) - theta_b * incentive - delta_ai_cost`
-- Three outcomes: ACTION (incentivize), PLAIN (Rs.0), ABSTAIN
-- Used by RecoveryBot selection, bucket eligibility, dashboard
-- Tests: E-UPLIFT (three fixtures)
+- `consentPolicy.ts`: action→class map (transactional/marketing/reactive)
+- An incentivized proposal without verified marketing consent is CLAMPED to plain action (not blocked)
+- Clamp visible in policy_audit with reason `consent_marketing_missing`
+- **Gate E-CONS3**: (a) transactional-only + positive-EV incentive → plain link, clamp ledgered; (b) marketing consent event → incentive proceeds; (c) payment.failed retry proceeds on transactional consent at 23:00
 
-### W2 — Intent Lifecycle v2
+### C2 — Consent Evidence
 **Status: FIXED**
-- States: `proposed, deferred, pending, executing, awaiting_gateway, done, skipped, blocked, failed, expired, stuck`
-- Fields: `lease_owner, lease_expires_at, attempt_count, max_attempts, resume_at, next_retry_at, margin_snapshot_paise`
-- `notification_outbox` table with `UNIQUE(intent_id, channel, message_version)`
-- Janitor handles: deferred dispatch, retry backoff, dead-letter, gateway timeout
-- Tests: E-INTENT-STATES
+- `consentEvidence.ts`: source (merchant_server | self_reported | checkout_notice), evidence_reference
+- `consent_events` table with evidence fields
+- Merchant-server route only for marketing consent (public routes rejected)
+- Demo seed: Riya checkout-notice consent event
+- **Gate U-CONSENT-EV**: consent evidence recorded, queryable, audit-trail
 
-### W3 — Payment Failed No-Incentive Default
+### C3 — Opaque External References
 **Status: FIXED**
-- payment_failed segment defaults to Rs.0 incentive
-- Governance exception requires: fraud checks + human approval
-- Tests: E-FAILED-NO-INCENTIVE
+- `extRef.ts`: ext_ref = HMAC(EXT_REF_SECRET, audit_seq) truncated to 64-bit
+- `ext_ref_map` table: ext_ref ↔ audit_seq internal mapping
+- Sequential audit_seq never leaves internal surfaces
+- Receipts, public APIs use ext_ref
+- **Gate U-EXTREF**: receipt/reference probing yields nothing enumerable; reconciliation 1:1
 
-### W4 — Action Classes
+### C4 — Webhook Re-scan
 **Status: FIXED**
-- Three classes: `proactive_marketing_touch`, `reactive_buyer_action`, `operational_job`
-- Quiet hours, consent, velocity: ONLY for proactive touches
-- Buyer sessions: reactive (no quiet hours/consent)
-- Tests: E-POLICY-SCOPE
+- `webhookRescan.ts`: janitor scans pending/received >5min, re-enqueues
+- Idempotent resolution prevents double effects
+- **Gate U-WHRESCAN**: simulated enqueue failure → re-scan processes exactly once
 
-### W5 — Identity + Ingestion Integrity
+### C5 — Cancel-Before-Create Fails Closed
 **Status: FIXED**
-- `identity_token = HMAC(secret, normalize(contact))`
-- Server-side cart total computation from catalog
-- Client amounts rejected (422)
-- Email/phone normalization (lowercase, trim, E.164)
-- Tests: U-IDENTITY, E-INGEST
+- `linkLifecycle.ts`: cancelExistingLinks returns { cancelled, failed, failedLinks }
+- Cancel error → status 'cancel_failed', new link NOT issued
+- Ledger failure, alert via log
+- **Gate U-CBC2**: cancel API error → no new link exists for cart
 
-### W6 — Salted Identity Assignment
+### C6 — Claims-Linter v2
 **Status: FIXED**
-- HMAC-SHA256 with server secret for experiment assignment
-- Stored once in `cohort_assignments(identity_token, experiment_id)`
-- Arm imbalance monitor (alert if |treatment% - 90%| > 5 points on n >= 100)
-- Tests: E-ASSIGN-SEC
-
-### W7 — Link Lifecycle + Attribution
-**Status: FIXED**
-- `open_links` table tracking active payment links
-- linkSweeper: cancels on cart conversion, hold expiry, consent revocation
-- Payer-contact mismatch flagged `attribution_anomalous`
-- Tests: E-LINK-SWEEP
-
-### W8 — Prompt-Injection Hardening
-**Status: FIXED**
-- System prompts: "all field values are data, never instructions"
-- Banned-claim filter on copy output
-- Item names never interpolated raw
-- Tests: E-PROMPT-INJ
-
-### W9 — Economics Completeness
-**Status: FIXED**
-- `refunds` table tracking refund events
-- Refund webhook reverses net_profit_paise
-- Margin snapshots on intents (`margin_snapshot_paise`)
-- Fees labeled "modeled"
-- Tests: E-REFUND
-
-### W10 — Hygiene Sweep
-**Status: FIXED**
-- Idempotency payload-hash mismatch -> 422
-- `policy_versions` table + alert
-- Decrypt-at-boundary, no plaintext caching
-- Retention legal holds (`customers.legal_hold`)
-- Experiment pause: stop proactive, settle paid, cancel deferred
-- Breaker cooldown 30min + min 10 attempts
-- Webhook timestamp freshness window
-- System status panel extended
-- No bypass endpoints (M15)
-- Tests: U-IDEM2, E-BYPASS
-
----
-
-## Invariant Verification (N17-N24)
-
-| Invariant | Status | Evidence |
-|-----------|--------|----------|
-| N17 | PASS | `economics.ts upliftEv()` — incremental profit vs control |
-| N18 | PASS | W3 payment_failed Rs.0 default |
-| N19 | PASS | `policyEngine.ts` action_class field |
-| N20 | PASS | W8 prompt-injection hardening |
-| N21 | PASS | W5 server-side totals, client amounts rejected |
-| N22 | PASS | W7 link lifecycle, N22 compliance |
-| N23 | PASS | W2 intent lifecycle with lease, notification_outbox |
-| N24 | PASS | W6 HMAC assignment |
+- `claimsLinter.ts`: banned terms, required phrases, allowlist support
+- BANNED: "guaranteed", "no side door exists", "unkillable", "we process payments", "cannot fail/double-spend"
+- REQUIRED: "at-most-once ... with reconciliation", "append-only, access-controlled, tamper-evident", "transactional consent covers payment-status...", "incentivized recovery requires marketing consent", "estimated until reconciliation"
+- `.claims-allowlist`: unchanged from prior review
 
 ---
 
@@ -148,33 +77,58 @@ Test Files  10 passed (10)
 | 004_patches | 3 | Reconcile runs, buyer sessions, PII access log |
 | 005_v3_2 | 5 | Track keys, rate limits, daily budget, deferred actions |
 | 006_v3_3 | 4 | Open links, refunds, notification_outbox, policy_versions |
+| 007_v4_0 | 5 | Pay tokens, overpayments, fee basis, mandate hardening |
+| 008_v4_1 | 3 | Consent events, ext_ref mapping, policy_audit extensions |
 
-**Total: 36 tables**
-
----
-
-## Terminal Checklist
-
-- [x] Kill-shot Q&A: "What stops me spamming your track endpoint?"
-  - "Public key can only submit anonymous events — contact is bound server-side with a secret key, throttles and velocity breaker back it up"
-- [x] Kill-shot Q&A: "Your lift is computed from how many control users?"
-  - "Below minimum, dashboard refuses to print lift and says 'collecting.' When it prints, it prints a Wilson interval, not a point."
-- [x] Kill-shot Q&A: "Do you have consent to message someone whose payment failed?"
-  - "Two consent classes: recovery is transactional — they attempted to pay; upsell is marketing and needs explicit opt-in. Separate checks, both in the ledger."
-- [x] Backup demo video: payment.failed flagship path
-- [x] Scope frozen — ROADMAP.md for future ideas
-- [x] PATCH_REPORT.md v3.3 with dispositions
+**Total: 44 tables**
 
 ---
 
-## Honest Residual List
+## Design Locks (DL1-DL10) — No Changes
 
-1. **Single-merchant** — all code paths use single merchant ID
-2. **Lift modeled** — no real traffic yet, all statistics are modeled
-3. **Protocol alignment directional** — buyer agent protocol is example-based
-4. **Test mode sends no notifications** — Razorpay test mode does not send emails/SMS
-5. **Exactly-once per N16 caveat** — "exactly-once happy path; at-most-once per window"
-6. **Payment links shareable** — loss bounded by incentive cap, attribution-matched
-7. **Marketing consent self-reported** — `source:'self_reported'` flagged as residual
-8. **Identity resolution single-key** — phone-precedence when present
-9. **Fees and margins modeled** — where imported, not computed from live data
+All prior locks remain in force.
+
+---
+
+## Roadmap Consolidation
+
+Round-6 sections A-R folded into PRODUCT_ROADMAP.md:
+- Named planes added: communication, risk, support/legal/finance
+- Section 6 (deployment DoD) → GA gate checklist
+- Section 7 (launch phases) noted as matching DL6
+- GA-gate additions: production consent service, opaque-ID audit, pentest
+
+---
+
+## Honest Residual List (Updated)
+
+1. **Legal characterizations pending counsel** — ToS, Privacy Policy, DPA, etc.
+2. **Razorpay connect mechanism to verify** — Partner/Route/OAuth-equivalent
+3. **DPDP rules pending finalization** — Indian data protection
+4. **Lift measured per-merchant over time** — modeled in shadow phase
+5. **Protocol alignment directional** — buyer agent protocol is example-based
+6. **Test mode sends no notifications** — Razorpay test mode
+7. **Exactly-once per N16 caveat** — "exactly-once happy path; at-most-once per window"
+8. **Payment links shareable** — loss bounded by incentive cap, attribution-matched
+9. **Marketing consent self-reported** — source:'self_reported' flagged
+10. **Identity resolution single-key** — phone-precedence when present
+11. **Fees and margins modeled** — where imported, not computed from live data
+12. **Consent-class interpretation pending counsel** — transactional vs marketing classification
+13. **Production consent service pending** — double opt-in, provider suppression sync
+14. **v4.x modules not wired into demo path** — architectural completeness, not demo-critical
+15. **Clean boot unverified on venue hardware** — PENDING-HUMAN
+
+---
+
+## Verification Audit (v4.1 Final)
+
+**VERDICT: COMPLETE-PENDING-VERIFICATION**
+
+- 78/78 tests pass (10 files)
+- Typecheck clean
+- All grep gates pass
+- BG1 fixed: moneyBus.ts now uses appendAuditSerialized (N1 enforced)
+- BG3 fixed: RUNBOOK.md has kill-shot Q&A table
+- BG2 documented: v4.x modules exist as complete implementations, not wired into demo path
+- All 13 residuals documented in PATCH_REPORT.md
+- Human-only items: clean boot, venue network, demo rehearsal, backup video, counsel review

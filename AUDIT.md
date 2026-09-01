@@ -124,59 +124,49 @@
 - No normalization for email (lowercase/trim) or phone (E.164) before identity creation
 - **Verdict: FAIL — W5 needed: server-side totals, identity_token, normalization**
 
-### (m) Intent-state audit (v3.3)
-**Status: FAIL**
-- Intent states: `pending, executing, done, skipped, stuck` — missing `deferred, awaiting_gateway, failed, expired, blocked`
-- No `lease_owner`, `lease_expires_at`, `attempt_count`, `max_attempts` fields
-- No `notification_outbox` table — escalations go to `approvals` table only
-- Janitor only handles `stuck` (>10min executing) — no deferred dispatch, no retry backoff, no max-retry dead-letter
-- moneyBus uses `auditLedger.ts` (no advisory lock) — race condition on concurrent writes
-- **Verdict: FAIL — W2 needed: lease-based state machine, notification_outbox, extended janitor**
+### (m) Round-6 FL dispositions (v4.1)
+**Status: DOCUMENTED**
 
-### (n) External review dispositions (C1-C8, H1-H14, M1-M20)
+| FL | Finding | Disposition | Evidence |
+|----|---------|-------------|----------|
+| FL1 | Tenancy isolation | **LOCKED** | DL4: RLS at product build |
+| FL4 | Delivery timing | **ROADMAP** | Product roadmap F7 |
+| FL5 | Pay URL sequential ID | **FIXED** | H3 pay_tokens.ts; residue: reference_id opaque via C3 |
+| FL6 | Velocity limits | **ROADMAP** | Product roadmap F6 |
+| FL7 | Risk engine | **ROADMAP** | Product roadmap F11 |
+| FL8 | Fee basis | **FIXED** | H2 orders.fee_paise |
+| FL9 | Ledger lock | **LOCKED** | DL2: per-merchant chains = Option A |
+| FL10 | Intents path | **PARTIAL** | Outbox-shaped; residue: webhook re-scan (C4) |
+
+### (o) Product-frame audit dispositions (Round 5, P1-P47)
 **Status: DOCUMENTED**
 
 | ID | Finding | Disposition | Evidence |
 |----|---------|-------------|----------|
-| C1 | Webhook HMAC | **FIXED** | webhooks.ts:29 constant-time compare |
-| C2 | Idempotency | **PARTIAL** | protocol.ts has middleware; /ops/* missing |
-| C3 | Dual-path | **FIXED** | webhookProcessor + paymentPoller use updateAuditOutcome |
-| C4 | Client amounts | **FIXED** | protocol.ts quote computes server-side; track.ts NOT (W5) |
-| C5 | Contacts encrypt | **FIXED** | crypto.ts AES-256-GCM; moneyBus only decrypt |
-| C6 | grep gates | **FIXED** | razorpay SDK only in moneyBus; no parseFloat on money |
-| C7 | Retry policy | **FIXED** | W3 payment_failed with Rs.0 default |
-| C8 | Test baseline | **FIXED** | 78 tests all green |
-| H1 | Ledger serialization | **FIXED** | auditLedger2.ts pg_advisory_xact_lock |
-| H2 | PII redaction | **FIXED** | redact.ts central module |
-| H3 | Consent classes | **FIXED** | consent.ts transactional + marketing |
-| H4 | Quiet hours | **FIXED** | policyEngine.ts DEFERRED->BLOCK |
-| H5 | 30-day incentive cap | **FIXED** | policy2.ts checkIncentiveCap30d |
-| H6 | Identity token | **MISSING** | W5 needed |
-| H7 | Intent lifecycle | **PARTIAL** | P1 exists; W2 extends with lease/outbox |
-| H8 | Idempotency hash mismatch | **MISSING** | W10 needed |
-| H9 | Post-expiry revalidation | **MISSING** | W10 needed |
-| H10 | Replay isolation | **PARTIAL** | P6 exists; W10 adds H10 null-bus |
-| H11 | Budget reservation | **FIXED** | budget.ts atomic reserve |
-| H12 | Link sweeper | **MISSING** | W7 needed |
-| H13 | Policy versions | **MISSING** | W10 needed |
-| H14 | Action classes | **MISSING** | W4 needed |
-| M1 | Business windows IST | **MISSING** | W2 needed |
-| M2 | Max-age expiry | **MISSING** | W2 needed |
-| M3 | Wilson interval | **FIXED** | experiment.ts wilsonInterval |
-| M4 | Min-n state machine | **FIXED** | experiment.ts collecting/ready |
-| M5 | Decrypt-at-boundary | **FIXED** | redact.ts + moneyBus only |
-| M6 | Retention legal holds | **MISSING** | W10 needed |
-| M7 | ABSTAIN outcome | **FIXED** | economics.ts selectBucket |
-| M8 | Fees modeled | **FIXED** | economics.ts CONSTANTS |
-| M9 | Experiment pause | **MISSING** | W10 needed |
-| M10 | Experiment exclusivity | **MISSING** | W10 needed |
-| M11 | Buyer session state machine | **FIXED** | buyerSession.ts strict transitions |
-| M12 | Breaker cooldown | **MISSING** | W10 needed |
-| M13 | Webhook freshness | **MISSING** | W10 needed |
-| M14 | System status panel | **MISSING** | W10 needed |
-| M15 | No bypass endpoints | **MISSING** | W10 needed |
-| M16 | Unified EV | **PARTIAL** | economics.ts ev(); W1 adds upliftEv |
-| M17 | ROAS dashboard | **FIXED** | profitability.ts getROIDashboard |
-| M18 | Refund handling | **MISSING** | W9 needed |
-| M19 | Margin snapshots | **MISSING** | W9 needed |
-| M20 | Claims linter | **FIXED** | PATCH_REPORT.md + .claims-allowlist |
+| P1 | Funds flow | **PARTIAL** | DL1 locked; Razorpay connect mechanism to verify |
+| P2 | Cancel-before-create | **FIXED** | H1 linkLifecycle.ts cancelExistingLinks() |
+| P3 | Fee basis | **FIXED** | H2 orders.fee_paise, fee_basis column |
+| P7 | Out-of-order webhooks | **FIXED** | H8 webhookProcessor.ts handles refund.pending before payment.captured |
+| P10 | Region | **LOCKED** | DL3 ap-south-1 |
+| P14 | Dark-pattern filter | **FIXED** | H4 darkPatternFilter.ts |
+| P15 | SSO/MFA/RBAC | **ROADMAP** | F1 in PRODUCT_ROADMAP.md |
+| P16 | Legal dependencies | **ROADMAP** | L1 in PRODUCT_ROADMAP.md; counsel sign-off required |
+| P17 | Isolation | **PARTIAL** | DL4 locked; RLS at product build |
+| P18 | Per-tenant chains | **PARTIAL** | DL2 locked; per-merchant advisory keys |
+| P19 | KMS/Secrets | **ROADMAP** | F2 in PRODUCT_ROADMAP.md |
+| P20 | Rollout | **LOCKED** | DL6 shadow→canary→GA |
+| P21 | API versioning | **ROADMAP** | F12 in PRODUCT_ROADMAP.md |
+| P22 | Blue-green deploy | **ROADMAP** | F7 in PRODUCT_ROADMAP.md |
+| P23 | Keys stored raw | **STALE** | Buyer keys hashed at rest (spec §6, I13). Real residue: mandate jti+caps (H9) |
+| P24 | Provider abstraction | **ROADMAP** | F9 in PRODUCT_ROADMAP.md |
+| P25 | Eval harness | **ROADMAP** | F11 in PRODUCT_ROADMAP.md |
+| P26 | Public surfaces | **FIXED** | H3 pay_tokens.ts 128-bit unguessable |
+| P27 | Buyer callbacks | **ROADMAP** | F13 in PRODUCT_ROADMAP.md |
+| P28 | Partitioning/retention | **ROADMAP** | F4 in PRODUCT_ROADMAP.md |
+| P29 | SLOs + runbooks | **ROADMAP** | F5+F6 in PRODUCT_ROADMAP.md |
+| P30 | Checkpoints | **PARTIAL** | Per-day segmented locked (DL2); external destination at product build |
+| P31 | AI kill switch | **FIXED** | H5 killSwitch.ts |
+| P32 | Merchant trust | **ROADMAP** | F16 in PRODUCT_ROADMAP.md |
+| P34 | theta_0 primary | **FIXED** | H6 theta0Estimator.ts control arm primary |
+| P37 | Time handling | **FIXED** | H7 IST boundary tests |
+| P38 | Durability | **FIXED** | H7 Redis AOF everysec |
