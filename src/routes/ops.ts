@@ -102,10 +102,10 @@ async function runDoctorChecks() {
   try { await query("SELECT 1"); checks.db = "green"; } catch { checks.db = "red"; }
   try {
     const rp = (await import("../lib/razorpayService.js")).getRazorpay();
-    await rp.paymentLink.fetch("nonexistent_test");
+    await rp.orders.all({ count: 1 });
     checks.razorpay = "green";
   } catch (err: any) {
-    checks.razorpay = err.statusCode === 400 || err.statusCode === 404 ? "green" : "red";
+    checks.razorpay = "red";
   }
   try {
     const config = getConfig();

@@ -18,14 +18,17 @@ async function doctor() {
     results.db = { status: "red", detail: err.message };
   }
 
-  // Razorpay auth
+  // Razorpay auth — list endpoint authenticates first (fetch 404s even on
+  // bad keys, so it cannot prove auth). Success = green; anything else = red.
   try {
     const rp = new Razorpay({ key_id: process.env.RAZORPAY_KEY_ID || "", key_secret: process.env.RAZORPAY_KEY_SECRET || "" });
-    await rp.paymentLink.fetch("nonexistent_test_id");
+    await rp.orders.all({ count: 1 });
     results.razorpay = { status: "green", detail: "API auth OK" };
   } catch (err: any) {
-    // 400/404 means auth worked
-    results.razorpay = { status: err.statusCode === 400 || err.statusCode === 404 ? "green" : "red", detail: err.statusCode === 400 ? "API auth OK (400 expected)" : err.message };
+    const detail = err.statusCode === 401 || err.statusCode === 403
+      ? "auth failed — check TEST keys"
+      : (err.message || `unreachable (HTTP ${err.statusCode || "?"})`);
+    results.razorpay = { status: "red", detail };
   }
 
   // LLM
