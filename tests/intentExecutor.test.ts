@@ -31,9 +31,9 @@ vi.mock("../src/db.js", () => ({
   }),
 }));
 
-// Mock auditLedger2
-vi.mock("../src/lib/auditLedger2.js", () => ({
-  appendAuditSerialized: vi.fn().mockResolvedValue(1),
+// Mock ledger (duplicate-skip path appends via appendLedger)
+vi.mock("../src/lib/ledger.js", () => ({
+  appendLedger: vi.fn().mockResolvedValue({ seq: 2, hash: "abc" }),
 }));
 
 import { createIntent, completeIntent, failIntent } from "../src/lib/intentExecutor.js";
@@ -48,9 +48,9 @@ describe("P1: Write-ahead Intent Deduplication", () => {
   });
 
   it("creates a new intent on first call", async () => {
-    // First call: ON CONFLICT DO NOTHING returns a row
+    // First call: ON CONFLICT DO NOTHING returns a row (uuid id on remote shape)
     const mockClient = {
-      query: vi.fn().mockResolvedValue({ rows: [{ id: 1 }] }),
+      query: vi.fn().mockResolvedValue({ rows: [{ id: "11111111-1111-4111-8111-111111111111" }] }),
     };
     mockWithTransaction.mockImplementation(async (fn: any) => fn(mockClient));
 
@@ -58,10 +58,11 @@ describe("P1: Write-ahead Intent Deduplication", () => {
       merchantId: "merchant-1",
       customerId: "customer-1",
       actionType: "recovery_link",
+      targetId: "cart-1",
     });
 
     expect(result.isNew).toBe(true);
-    expect(result.intentId).toBe(1);
+    expect(result.intentId).toBe("11111111-1111-4111-8111-111111111111");
   });
 
   it("detects duplicate intent and skips", async () => {
@@ -76,6 +77,7 @@ describe("P1: Write-ahead Intent Deduplication", () => {
       merchantId: "merchant-1",
       customerId: "customer-1",
       actionType: "recovery_link",
+      targetId: "cart-1",
     });
 
     expect(result.isNew).toBe(false);
@@ -98,7 +100,7 @@ describe("P1: Write-ahead Intent Deduplication", () => {
     });
 
     const insertCall = mockClient.query.mock.calls[0];
-    const dedupeKey = insertCall[1][3]; // 4th parameter is dedupe_key
+    const dedupeKey = insertCall[1][7]; // 8th parameter is dedupe_key (remote shape)
     expect(dedupeKey).toBe("merchant-1:customer-1:cart-1:recovery_link:2026-09-01");
   });
 
@@ -112,46 +114,48 @@ describe("P1: Write-ahead Intent Deduplication", () => {
       merchantId: "merchant-1",
       customerId: "customer-1",
       actionType: "recovery_link",
+      targetId: "cart-1",
       windowDay: "2026-09-01",
     });
 
-    const key1 = mockClient.query.mock.calls[0][1][3];
+    const key1 = mockClient.query.mock.calls[0][1][7];
 
     await createIntent({
       merchantId: "merchant-1",
       customerId: "customer-1",
       actionType: "recovery_link",
+      targetId: "cart-1",
       windowDay: "2026-09-02",
     });
 
-    const key2 = mockClient.query.mock.calls[1][1][3];
+    const key2 = mockClient.query.mock.calls[1][1][7];
     expect(key1).not.toBe(key2);
   });
 
-  it("completes intent with audit_seq", async () => {
+  it("completes intent (remote shape: no audit_seq column)", async () => {
     mockQuery.mockResolvedValue({ rows: [] });
-    await completeIntent(1, 100);
+    await completeIntent("11111111-1111-4111-8111-111111111111");
     expect(mockQuery).toHaveBeenCalledWith(
-      "UPDATE action_intents SET status = 'done', audit_seq = $1, lease_owner = NULL, lease_expires_at = NULL WHERE id = $2",
-      [100, 1]
+      "UPDATE action_intents SET status = 'done', lease_expires_at = NULL WHERE id = $1",
+      ["11111111-1111-4111-8111-111111111111"]
     );
   });
 
   it("fails intent as retryable", async () => {
     mockQuery.mockResolvedValue({ rows: [] });
-    await failIntent(1, 'pending');
+    await failIntent("11111111-1111-4111-8111-111111111111", 'pending');
     expect(mockQuery).toHaveBeenCalledWith(
-      "UPDATE action_intents SET status = $1, lease_owner = NULL, lease_expires_at = NULL WHERE id = $2",
-      ['pending', 1]
+      "UPDATE action_intents SET status = $1, lease_expires_at = NULL WHERE id = $2",
+      ['pending', "11111111-1111-4111-8111-111111111111"]
     );
   });
 
   it("fails intent as skipped (policy blocked)", async () => {
     mockQuery.mockResolvedValue({ rows: [] });
-    await failIntent(1, 'skipped');
+    await failIntent("11111111-1111-4111-8111-111111111111", 'skipped');
     expect(mockQuery).toHaveBeenCalledWith(
-      "UPDATE action_intents SET status = $1, lease_owner = NULL, lease_expires_at = NULL WHERE id = $2",
-      ['skipped', 1]
+      "UPDATE action_intents SET status = $1, lease_expires_at = NULL WHERE id = $2",
+      ['skipped', "11111111-1111-4111-8111-111111111111"]
     );
   });
 });

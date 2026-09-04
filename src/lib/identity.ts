@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import { query } from "../db.js";
+import { encrypt } from "./crypto.js";
 import { createLogger } from "../logger.js";
 
 const log = createLogger("identity");
@@ -36,6 +37,7 @@ export function normalizeContact(contact: {
 /**
  * W5: Generate identity token using HMAC-SHA256.
  * identity_token = HMAC(secret, normalize(contact))
+ * Stored in customers.identity_hash on the remote schema.
  */
 export function generateIdentityToken(contact: {
   email?: string;
@@ -46,7 +48,8 @@ export function generateIdentityToken(contact: {
 }
 
 /**
- * W5: Find or create customer by identity token.
+ * W5: Find or create customer by identity hash.
+ * Remote shape: (id, merchant_id, identity_hash, contact_enc, segment, ...).
  * Returns { customerId, isNew, identityToken }.
  */
 export async function findOrCreateCustomer(
@@ -60,9 +63,9 @@ export async function findOrCreateCustomer(
 ): Promise<{ customerId: string; isNew: boolean; identityToken: string }> {
   const identityToken = generateIdentityToken(contact);
 
-  // Check existing by identity token
+  // Check existing by identity hash
   const { rows: existing } = await query(
-    "SELECT id FROM customers WHERE merchant_id = $1 AND identity_token = $2",
+    "SELECT id FROM customers WHERE merchant_id = $1 AND identity_hash = $2",
     [merchantId, identityToken]
   );
 
@@ -70,21 +73,21 @@ export async function findOrCreateCustomer(
     return { customerId: existing[0].id, isNew: false, identityToken };
   }
 
-  // Create new customer
+  // Create new customer (contact stored encrypted at rest)
+  const raw = contact.phone || contact.email || "";
+  let contactEnc = raw;
+  try {
+    contactEnc = raw ? encrypt(raw) : "";
+  } catch {
+    contactEnc = raw;
+  }
   const { rows } = await query(
-    `INSERT INTO customers (merchant_id, name_enc, email_enc, phone_enc, segment, identity_token)
-     VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-    [
-      merchantId,
-      contact.name || "",
-      contact.email || "",
-      contact.phone || "",
-      contact.segment || "default",
-      identityToken,
-    ]
+    `INSERT INTO customers (merchant_id, identity_hash, contact_enc, segment)
+     VALUES ($1, $2, $3, $4) RETURNING id`,
+    [merchantId, identityToken, contactEnc, contact.segment || "default"]
   );
 
-  log.debug({ customerId: rows[0].id, identityToken }, "New customer created");
+  log.debug({ customerId: rows[0].id }, "New customer created");
   return { customerId: rows[0].id, isNew: true, identityToken };
 }
 
@@ -96,7 +99,7 @@ export async function getCustomerByIdentity(
   identityToken: string
 ): Promise<{ id: string } | null> {
   const { rows } = await query(
-    "SELECT id FROM customers WHERE merchant_id = $1 AND identity_token = $2",
+    "SELECT id FROM customers WHERE merchant_id = $1 AND identity_hash = $2",
     [merchantId, identityToken]
   );
   return rows[0] || null;

@@ -19,6 +19,7 @@ const envSchema = z
       .default("true")
       .transform((v) => v === "true"),
     APP_ENCRYPTION_KEY: z.string(),
+    APP_SECRET: z.string().default("sellable-app-secret-key-2024"),
     SESSION_SECRET: z.string(),
     LLM_BASE_URL: z.string().default("https://api.openai.com/v1"),
     LLM_API_KEY: z.string().default(""),

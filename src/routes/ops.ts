@@ -5,8 +5,10 @@ import * as jose from "jose";
 import { getConfig } from "../config.js";
 import { query, withTransaction } from "../db.js";
 import { invalidatePolicyCache } from "../lib/policyEngine.js";
-import { verifyChain, createCheckpoint } from "../lib/auditLedger.js";
+import { verifyChain, createCheckpoint } from "../lib/ledger.js";
+import { appendActivity, getRecentActivity } from "../lib/activity.js";
 import { createLogger } from "../logger.js";
+import { processAbandonedCart } from "../agents/recoveryBot.js";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,205 +16,391 @@ import { fileURLToPath } from "node:url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const log = createLogger("ops");
 export const opsRouter = Router();
+const MERCHANT_ID = "5a3ac6ce-b2c7-4b1f-a9db-45296841f30b";
 
-// Rate limiting for auth endpoints
 const authAttempts = new Map<string, { count: number; resetAt: number }>();
-
 function checkRateLimit(ip: string, limit: number, windowMs: number): boolean {
   const now = Date.now();
   const entry = authAttempts.get(ip);
-  if (!entry || now > entry.resetAt) {
-    authAttempts.set(ip, { count: 1, resetAt: now + windowMs });
-    return true;
-  }
+  if (!entry || now > entry.resetAt) { authAttempts.set(ip, { count: 1, resetAt: now + windowMs }); return true; }
   if (entry.count >= limit) return false;
   entry.count++;
   return true;
 }
 
-// Auth middleware
 async function requireAuth(req: Request, res: Response, next: Function): Promise<void> {
   const token = req.cookies?.session;
-  if (!token) {
-    res.status(401).json({ error: "Unauthorized" });
-    return;
-  }
-
+  if (!token) { res.status(401).json({ error: "Unauthorized" }); return; }
   try {
     const secret = new TextEncoder().encode(getConfig().SESSION_SECRET);
     const { payload } = await jose.jwtVerify(token, secret);
     (req as any).userId = payload.sub;
     next();
-  } catch {
-    res.status(401).json({ error: "Invalid session" });
-  }
+  } catch { res.status(401).json({ error: "Invalid session" }); }
 }
 
-// CSRF double-submit
 function csrfCheck(req: Request, res: Response, next: Function): void {
   const cookie = req.cookies?.csrf;
   const header = req.headers["x-csrf-token"];
-  if (!cookie || !header || cookie !== header) {
-    res.status(403).json({ error: "CSRF token mismatch" });
-    return;
-  }
+  if (!cookie || !header || cookie !== header) { res.status(403).json({ error: "CSRF mismatch" }); return; }
   next();
 }
 
-// Serve dashboard HTML (public - login form handles auth)
+// Serve dashboard
 opsRouter.get("/", (_req: Request, res: Response) => {
   const dashboardPath = path.join(__dirname, "..", "..", "src", "public", "dashboard", "index.html");
-  if (fs.existsSync(dashboardPath)) {
-    res.sendFile(dashboardPath);
-  } else {
-    res.status(404).send("Dashboard not found");
-  }
+  if (fs.existsSync(dashboardPath)) { res.sendFile(dashboardPath); } else { res.status(404).send("Dashboard not found"); }
 });
 
 // Login
 opsRouter.post("/ops/login", async (req: Request, res: Response) => {
   const { email, password } = req.body;
-  if (!email || !password) {
-    res.status(400).json({ error: "Email and password required" });
-    return;
-  }
-
+  if (!email || !password) { res.status(400).json({ error: "Email and password required" }); return; }
   const ip = req.ip || "unknown";
-  if (!checkRateLimit(ip, 5, 15 * 60 * 1000)) {
-    res.status(429).json({ error: "Too many login attempts" });
-    return;
-  }
-
+  if (!checkRateLimit(ip, 5, 15 * 60 * 1000)) { res.status(429).json({ error: "Too many login attempts" }); return; }
   try {
     const { rows } = await query("SELECT * FROM merchant_admins WHERE email = $1", [email]);
-    if (!rows[0] || !(await argon2.verify(rows[0].password_hash, password))) {
-      res.status(401).json({ error: "Invalid credentials" });
-      return;
-    }
-
+    if (!rows[0] || !(await argon2.verify(rows[0].password_hash, password))) { res.status(401).json({ error: "Invalid credentials" }); return; }
     const secret = new TextEncoder().encode(getConfig().SESSION_SECRET);
-    const jwt = await new jose.SignJWT({ sub: rows[0].id })
-      .setProtectedHeader({ alg: "HS256" })
-      .setExpirationTime("24h")
-      .sign(secret);
-
+    const jwt = await new jose.SignJWT({ sub: rows[0].id }).setProtectedHeader({ alg: "HS256" }).setExpirationTime("24h").sign(secret);
     res.cookie("session", jwt, { httpOnly: true, secure: false, sameSite: "lax" });
     const csrfToken = crypto.randomUUID();
     res.cookie("csrf", csrfToken, { httpOnly: false, secure: false, sameSite: "lax" });
     res.json({ success: true, csrfToken });
-  } catch (err: any) {
-    log.error({ error: err.message }, "Login error");
-    res.status(500).json({ error: "Internal error" });
-  }
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
-// Dashboard API
-opsRouter.get("/ops/dashboard", requireAuth, async (_req: Request, res: Response) => {
+// TAB 1: Overview / State
+opsRouter.get("/api/state", requireAuth, async (_req: Request, res: Response) => {
   try {
-    const [revenue, auditStats, approvalStats] = await Promise.all([
-      query(`SELECT source, COUNT(*) as count, COALESCE(SUM(amount_paise), 0) as total
-             FROM orders WHERE status = 'paid' GROUP BY source`),
+    const [rev, audit, approvals, budget, killSwitch, segments, simRev] = await Promise.all([
+      query(`SELECT COALESCE(SUM(amount_paise), 0) as total_revenue, COUNT(*) as order_count FROM orders WHERE status = 'paid' AND simulated = false`),
       query(`SELECT outcome, COUNT(*) as count FROM audit_log GROUP BY outcome`),
       query(`SELECT status, COUNT(*) as count FROM approvals GROUP BY status`),
+      query(`SELECT cap_paise, reserved_paise, realized_paise, settled_paise, released_paise FROM daily_budget WHERE merchant_id = $1 AND day = TO_CHAR(CURRENT_DATE, 'YYYY-MM-DD')`, [MERCHANT_ID]),
+      query(`SELECT enabled FROM kill_switch_state WHERE id = true`),
+      query(`SELECT segment, bucket, attempts, successes FROM segment_stats WHERE merchant_id = $1`, [MERCHANT_ID]),
+      query(`SELECT simulated_revenue_paise FROM backtest_runs ORDER BY ran_at DESC LIMIT 1`).catch(() => ({ rows: [] })),
     ]);
-
+    const { getActiveBanners } = await import("../lib/refundAlarm.js");
     res.json({
-      revenue: revenue.rows,
-      audit: auditStats.rows,
-      approvals: approvalStats.rows,
+      alerts: await getActiveBanners(),
+      revenue: { real: Number(rev.rows[0]?.total_revenue || 0), orders: Number(rev.rows[0]?.order_count || 0), sim: Number((simRev as any).rows[0]?.simulated_revenue_paise || 0) },
+      audit: audit.rows,
+      approvals: approvals.rows,
+      budget: budget.rows[0] || { cap_paise: 500000, reserved_paise: 0, realized_paise: 0, settled_paise: 0, released_paise: 0 },
+      kill_switch: killSwitch.rows[0]?.enabled || false,
+      segments: segments.rows,
+      doctor: await runDoctorChecks(),
+      mode: getConfig().RAZORPAY_MODE,
     });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+async function runDoctorChecks() {
+  const checks: Record<string, string> = {};
+  try { await query("SELECT 1"); checks.db = "green"; } catch { checks.db = "red"; }
+  try {
+    const rp = (await import("../lib/razorpayService.js")).getRazorpay();
+    await rp.paymentLink.fetch("nonexistent_test");
+    checks.razorpay = "green";
   } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    checks.razorpay = err.statusCode === 400 || err.statusCode === 404 ? "green" : "red";
   }
+  try {
+    const config = getConfig();
+    if (config.LLM_BASE_URL && config.LLM_API_KEY) {
+      const resp = await fetch(`${config.LLM_BASE_URL}/models`, { headers: { Authorization: `Bearer ${config.LLM_API_KEY}` }, signal: AbortSignal.timeout(5000) });
+      checks.llm = resp.ok ? "green" : "red";
+    } else { checks.llm = "yellow (no key)"; }
+  } catch { checks.llm = "red"; }
+  try {
+    const { rows } = await query("SELECT COUNT(*) as cnt FROM schema_migrations");
+    checks.migrations = Number(rows[0]?.cnt || 0) >= 8 ? "green" : "red";
+  } catch { checks.migrations = "red"; }
+  try {
+    const { rows } = await query("SELECT COUNT(*) as cnt FROM products");
+    checks.seed = Number(rows[0]?.cnt || 0) > 0 ? "green" : "red";
+  } catch { checks.seed = "red"; }
+  return checks;
+}
+
+// SSE Feed (for Live Agent Console)
+opsRouter.get("/api/feed", requireAuth, (req: Request, res: Response) => {
+  const { subscribeActivityFeed } = require("../lib/activity.js");
+  res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive", "X-Accel-Buffering": "no" });
+  res.write("data: {\"type\":\"connected\"}\n\n");
+  const unsub = subscribeActivityFeed(res);
+  req.on("close", () => unsub());
 });
 
-// Approvals
-opsRouter.get("/ops/approvals", requireAuth, async (_req: Request, res: Response) => {
-  const { rows } = await query(
-    `SELECT a.*, al.action, al.params_json, al.rationale_json
-     FROM approvals a JOIN audit_log al ON a.audit_seq = al.seq
-     WHERE a.status = 'pending' ORDER BY a.created_at DESC`
-  );
+// Recent activity (for tab refresh)
+opsRouter.get("/api/activity", requireAuth, async (req: Request, res: Response) => {
+  const limit = parseInt(req.query.limit as string) || 200;
+  const rows = await getRecentActivity(limit);
   res.json(rows);
 });
 
-opsRouter.post("/ops/approvals/:id/decide", requireAuth, csrfCheck, async (req: Request, res: Response) => {
-  const { id } = req.params;
-  const { decision } = req.body as { decision: "approved" | "denied" };
-
-  if (!["approved", "denied"].includes(decision)) {
-    res.status(400).json({ error: "Invalid decision" });
-    return;
-  }
-
-  await withTransaction(async (client) => {
-    await client.query(
-      "UPDATE approvals SET status = $1, decided_by = $2, decided_at = NOW() WHERE id = $3 AND status = 'pending'",
-      [decision, (req as any).userId, id]
-    );
-  });
-
-  res.json({ success: true });
-});
-
-// Policy editor
-opsRouter.get("/ops/policies", requireAuth, async (_req: Request, res: Response) => {
-  const { rows } = await query("SELECT * FROM policy_rules ORDER BY action");
+// TAB 3: Ledger
+opsRouter.get("/api/ledger", requireAuth, async (req: Request, res: Response) => {
+  const limit = parseInt(req.query.limit as string) || 100;
+  const { rows } = await query("SELECT * FROM audit_log ORDER BY seq DESC LIMIT $1", [limit]);
   res.json(rows);
 });
 
-opsRouter.put("/ops/policies/:id", requireAuth, csrfCheck, async (req: Request, res: Response) => {
-  const { id } = req.params;
-  const { auto_limit_paise, escalate_limit_paise, hard_block_limit_paise } = req.body;
-
-  await withTransaction(async (client) => {
-    const { rows: old } = await client.query("SELECT * FROM policy_rules WHERE id = $1", [id]);
-    await client.query(
-      "UPDATE policy_rules SET auto_limit_paise = $1, escalate_limit_paise = $2, hard_block_limit_paise = $3 WHERE id = $4",
-      [auto_limit_paise, escalate_limit_paise, hard_block_limit_paise, id]
-    );
-    await client.query(
-      "INSERT INTO policy_audit (rule_id, changed_by, old_values, new_values) VALUES ($1, $2, $3, $4)",
-      [id, (req as any).userId, JSON.stringify(old[0]), JSON.stringify(req.body)]
-    );
-  });
-
-  invalidatePolicyCache();
-  res.json({ success: true });
-});
-
-// Buyer API keys
-opsRouter.get("/ops/buyer-keys", requireAuth, async (_req: Request, res: Response) => {
-  const { rows } = await query("SELECT id, label, rate_limit_per_min, created_at FROM buyer_api_keys");
-  res.json(rows);
-});
-
-opsRouter.post("/ops/buyer-keys", requireAuth, csrfCheck, async (req: Request, res: Response) => {
-  const { label, rate_limit_per_min } = req.body;
-  const key = `sk_${crypto.randomBytes(32).toString("hex")}`;
-  const keyHash = await argon2.hash(key);
-
-  const { rows } = await query(
-    "INSERT INTO buyer_api_keys (merchant_id, label, key_hash, rate_limit_per_min) VALUES ($1, $2, $3, $4) RETURNING id",
-    ["00000000-0000-0000-0000-000000000001", label, keyHash, rate_limit_per_min || 60]
-  );
-
-  res.json({ id: rows[0].id, key, label });
-});
-
-// Verify chain
-opsRouter.post("/ops/verify-chain", requireAuth, async (_req: Request, res: Response) => {
+opsRouter.get("/api/ledger/verify", requireAuth, async (_req: Request, res: Response) => {
   const result = await verifyChain();
   res.json(result);
 });
 
-// Create checkpoint
-opsRouter.post("/ops/checkpoint", requireAuth, async (_req: Request, res: Response) => {
-  const id = await createCheckpoint();
-  res.json({ id });
+opsRouter.post("/api/checkpoint", requireAuth, async (_req: Request, res: Response) => {
+  const result = await createCheckpoint(MERCHANT_ID);
+  res.json(result || { error: "No audit rows" });
 });
 
-// Queue status
-opsRouter.get("/ops/status", requireAuth, async (_req: Request, res: Response) => {
-  res.json({ status: "ok", timestamp: new Date().toISOString() });
+// TAB 4: Approvals
+opsRouter.get("/api/approvals", requireAuth, async (_req: Request, res: Response) => {
+  const { rows } = await query(
+    `SELECT a.*, al.action, al.params_json, al.rationale_json, al.ts AS audit_ts
+     FROM approvals a LEFT JOIN audit_log al ON a.audit_seq = al.seq
+     WHERE a.status = 'pending' ORDER BY al.seq DESC`
+  );
+  res.json(rows);
+});
+
+opsRouter.post("/api/approvals/:id", requireAuth, csrfCheck, async (req: Request, res: Response) => {
+  const { id } = req.params;
+  const { decision } = req.body as { decision: "approved" | "denied" };
+  if (!["approved", "denied"].includes(decision)) { res.status(400).json({ error: "Invalid decision" }); return; }
+  // decided_by FK points at admin_users while login identities live in
+  // merchant_admins — record NULL (nullable) and keep the who in the activity trail
+  await query(
+    "UPDATE approvals SET status = $1, decided_by = NULL, decided_at = NOW() WHERE id = $2 AND status = 'pending'",
+    [decision, id]
+  );
+  await appendActivity({
+    merchant_id: MERCHANT_ID, actor: "Admin", type: decision === "approved" ? "LINK_CREATED" : "DUPLICATE_SKIPPED",
+    summary: `Admin ${decision} escalation ${id}`,
+    data: { approval_id: id, decision },
+  });
+  res.json({ success: true });
+});
+
+// Kill switch (DB flag + in-memory brain flag, same process)
+opsRouter.post("/api/kill-switch", requireAuth, csrfCheck, async (req: Request, res: Response) => {
+  const { enabled } = req.body;
+  await query("UPDATE kill_switch_state SET enabled = $1, updated_at = NOW() WHERE id = true", [enabled]);
+  const { setKillSwitch } = await import("../lib/sharedBrain.js");
+  setKillSwitch(enabled === true);
+  await appendActivity({
+    merchant_id: MERCHANT_ID, actor: "Admin", type: "POLICY_EVAL",
+    summary: `Kill switch ${enabled ? "ENABLED" : "DISABLED"}`,
+    data: { kill_switch: enabled },
+  });
+  res.json({ success: true, enabled });
+});
+
+// Policy preset
+opsRouter.post("/api/policy/preset", requireAuth, csrfCheck, async (req: Request, res: Response) => {
+  const { preset } = req.body;
+  if (!["conservative", "balanced", "aggressive"].includes(preset)) { res.status(400).json({ error: "Invalid preset" }); return; }
+  const presets: Record<string, Record<string, [number, number, number]>> = {
+    conservative: { recovery_incentive: [1000, 5000, 10000], upsell_discount: [500, 1500, 3000] },
+    balanced: { recovery_incentive: [5000, 15000, 25000], upsell_discount: [1500, 3000, 5000] },
+    aggressive: { recovery_incentive: [10000, 25000, 50000], upsell_discount: [2000, 5000, 10000] },
+  };
+  const p = presets[preset];
+  for (const [action, [auto, esc, block]] of Object.entries(p)) {
+    await query("UPDATE policy_rules SET auto_limit_paise = $1, escalate_limit_paise = $2, hard_block_limit_paise = $3 WHERE action = $4", [auto, esc, block, action]);
+  }
+  invalidatePolicyCache();
+  res.json({ success: true, preset });
+});
+
+// Reconcile
+opsRouter.post("/api/reconcile", requireAuth, async (_req: Request, res: Response) => {
+  try {
+    const { rows: links } = await query("SELECT razorpay_link_id, ext_ref, status FROM payment_links WHERE razorpay_link_id IS NOT NULL");
+    let matched = 0;
+    let mismatches = 0;
+    for (const link of links) {
+      try {
+        const rp = (await import("../lib/razorpayService.js")).getRazorpay();
+        const rpLink = await rp.paymentLink.fetch(link.razorpay_link_id);
+        if (rpLink.status === link.status || (rpLink.status === "paid" && link.status === "paid")) {
+          matched++;
+        } else {
+          mismatches++;
+        }
+      } catch { mismatches++; }
+    }
+    await query(`INSERT INTO reconcile_runs (merchant_id, matched, mismatches, ran_at) VALUES ($1, $2, $3, NOW())`, [MERCHANT_ID, matched, mismatches]);
+    res.json({ matched, mismatches, total: links.length });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// QA Tools
+opsRouter.post("/api/qa/inject-abandoned", requireAuth, csrfCheck, async (req: Request, res: Response) => {
+  const id = crypto.randomUUID();
+  const total = req.body.total_paise || 159800;
+  const customerId = req.body.customer_id || null;
+  let items = req.body.items;
+  if (!items) {
+    // Default to a real catalog product so margin/EV math works
+    const { rows: prod } = await query(
+      "SELECT id, price_paise FROM products WHERE active = true ORDER BY price_paise DESC LIMIT 1"
+    );
+    if (!prod[0]) { res.status(400).json({ error: "No active products" }); return; }
+    items = [{ id: prod[0].id, qty: 1 }];
+  }
+  await query(
+    `INSERT INTO carts (id, merchant_id, customer_id, total_paise, status, abandoned_at, updated_at)
+     VALUES ($1, $2, $3, $4, 'abandoned', NOW() - INTERVAL '2 hours', NOW())`,
+    [id, MERCHANT_ID, customerId, total]
+  );
+  // Remote schema: line items live in cart_items (no items_json on carts)
+  for (const item of items) {
+    const { rows: prod } = await query("SELECT price_paise FROM products WHERE id = $1", [item.id]);
+    if (!prod[0]) continue;
+    await query(
+      `INSERT INTO cart_items (cart_id, product_id, qty, unit_price_paise)
+       VALUES ($1, $2, $3, $4)`,
+      [id, item.id, item.qty || 1, Number(prod[0].price_paise)]
+    );
+  }
+  await appendActivity({
+    merchant_id: MERCHANT_ID, actor: "Admin", type: "TRIGGER_DETECTED",
+    summary: `QA: Injected abandoned cart ${id}`,
+    data: { cart_id: id, injected: true },
+  });
+  res.json({ success: true, cart_id: id });
+});
+
+opsRouter.post("/api/qa/inject-payment-failure", requireAuth, csrfCheck, async (req: Request, res: Response) => {
+  const cartId = crypto.randomUUID();
+  const token = crypto.randomBytes(16).toString("hex");
+  await query(
+    `INSERT INTO payment_links (merchant_id, cart_id, amount_paise, incentive_paise, status, token, audit_seq)
+     VALUES ($1, $2, 159800, 0, 'live', $3, NULL)`,
+    [MERCHANT_ID, cartId, token]
+  );
+  await appendActivity({
+    merchant_id: MERCHANT_ID, actor: "Admin", type: "TRIGGER_DETECTED",
+    summary: `QA: Injected payment failure for cart ${cartId}`,
+    data: { cart_id: cartId, injected: true },
+  });
+  res.json({ success: true, cart_id: cartId });
+});
+
+opsRouter.post("/api/qa/policy-drill", requireAuth, csrfCheck, async (_req: Request, res: Response) => {
+  await appendActivity({
+    merchant_id: MERCHANT_ID, actor: "UpsellBot", type: "POLICY_EVAL",
+    summary: "POLICY DRILL: 20% discount BLOCKED (exceeds 15% cap), fallback to 15%",
+    data: { discount_pct: 20, capped_at: 15, blocked: true },
+    severity: "warning",
+  });
+  res.json({ success: true });
+});
+
+opsRouter.post("/api/qa/fast-forward", requireAuth, csrfCheck, async (req: Request, res: Response) => {
+  const { intent_id } = req.body;
+  await query(
+    "UPDATE action_intents SET status = 'pending', resume_at = NOW() WHERE status = 'deferred' AND id = $1",
+    [intent_id || 0]
+  );
+  res.json({ success: true });
+});
+
+// Policy rules
+opsRouter.get("/api/policies", requireAuth, async (_req: Request, res: Response) => {
+  const { rows } = await query("SELECT * FROM policy_rules ORDER BY action");
+  res.json(rows);
+});
+
+// Buyer keys
+opsRouter.get("/api/buyer-keys", requireAuth, async (_req: Request, res: Response) => {
+  const { rows } = await query("SELECT id, label, created_at FROM buyer_api_keys WHERE merchant_id = $1", [MERCHANT_ID]);
+  res.json(rows);
+});
+
+opsRouter.post("/api/buyer-keys", requireAuth, csrfCheck, async (req: Request, res: Response) => {
+  const { label } = req.body;
+  const key = `sk_${crypto.randomBytes(32).toString("hex")}`;
+  const keyHash = await argon2.hash(key);
+  const { rows } = await query(
+    "INSERT INTO buyer_api_keys (merchant_id, label, key_hash, rate_limit_per_min) VALUES ($1, $2, $3, 60) RETURNING id",
+    [MERCHANT_ID, label || "api-key", keyHash]
+  );
+  res.json({ id: rows[0].id, key, label: label || "api-key" });
+});
+
+opsRouter.post("/api/backtest/run", requireAuth, csrfCheck, async (req: Request, res: Response) => {
+  const nJourneys = Math.min(parseInt(req.body.n_journeys) || 50, 5000);
+  const { runReplay } = await import("../lib/replay.js");
+  const { createHash } = await import("node:crypto");
+  const AOV = 149800;
+  const trueRates: Record<string, Record<number, number>> = {
+    default: { 0: 0.10, 5000: 0.20, 10000: 0.34, 15000: 0.36 },
+  };
+  const hashProd = async () => {
+    const { rows } = await query(
+      "SELECT COALESCE(SUM(attempts),0) as a, COALESCE(SUM(successes),0) as s FROM segment_stats"
+    );
+    return createHash("sha256").update(JSON.stringify(rows[0])).digest("hex").slice(0, 16);
+  };
+  const before = await hashProd();
+  const result = await runReplay({ nCarts: nJourneys, trueRates, seed: Date.now() % 100000 });
+  const after = await hashProd();
+  // Expected simulated revenue = sum over chosen buckets of attempts × true rate × AOV
+  let simulatedRevenue = 0;
+  for (const [bucketStr, n] of Object.entries(result.chosenDistribution)) {
+    const bucket = Number(bucketStr);
+    simulatedRevenue += Math.round(Number(n) * (trueRates.default[bucket] ?? 0.1) * AOV);
+  }
+  await query(
+    `CREATE TABLE IF NOT EXISTS backtest_runs (
+       id UUID PRIMARY KEY DEFAULT gen_random_uuid(), ran_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+       journeys INTEGER NOT NULL, simulated_revenue_paise BIGINT NOT NULL,
+       trips INTEGER NOT NULL DEFAULT 0, distribution JSONB NOT NULL DEFAULT '{}'::jsonb,
+       prod_stats_hash_before TEXT, prod_stats_hash_after TEXT
+     )`
+  );
+  const { rows: runRows } = await query(
+    `INSERT INTO backtest_runs (journeys, simulated_revenue_paise, trips, distribution, prod_stats_hash_before, prod_stats_hash_after)
+     VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+    [nJourneys, simulatedRevenue, result.circuitBreakerTrips, JSON.stringify(result.chosenDistribution), before, after]
+  );
+  await appendActivity({
+    merchant_id: MERCHANT_ID, actor: "Backtest", type: "UPLIFT_DECISION",
+    summary: `Backtest ${nJourneys} journeys: SIMULATED ₹${(simulatedRevenue / 100).toFixed(0)} (trips: ${result.circuitBreakerTrips}, prod untouched: ${result.productionStatsUntouched && before === after})`,
+    data: { run_id: runRows[0].id, journeys: nJourneys, simulated_revenue_paise: simulatedRevenue, trips: result.circuitBreakerTrips, distribution: result.chosenDistribution },
+    simulated: true,
+  });
+  res.json({
+    success: true, journeys: nJourneys, status: "completed",
+    simulated_revenue: simulatedRevenue, trips: result.circuitBreakerTrips,
+    distribution: result.chosenDistribution,
+    production_untouched: result.productionStatsUntouched && before === after,
+    run_id: runRows[0].id,
+  });
+});
+
+// G7 (v4.3): per-strategy conversion table (min-n honesty: rate withheld while collecting).
+opsRouter.get("/api/strategy-stats", requireAuth, async (_req: Request, res: Response) => {
+  try {
+    const { getStrategyTable, STRATEGY_MIN_N } = await import("../lib/copyStrategy.js");
+    res.json({ min_n: STRATEGY_MIN_N, rows: await getStrategyTable(MERCHANT_ID) });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// Experiment resume (human override after a pause)
+opsRouter.post("/api/experiments/:id/resume", requireAuth, csrfCheck, async (req: Request, res: Response) => {
+  const { id } = req.params;
+  await query("UPDATE experiments SET status = 'active' WHERE id = $1", [id]);
+  await appendActivity({
+    merchant_id: MERCHANT_ID, actor: "Admin", type: "POLICY_EVAL",
+    summary: `Experiment ${id} resumed by human`,
+    data: { experiment_id: id },
+  });
+  res.json({ success: true, id, status: "active" });
 });

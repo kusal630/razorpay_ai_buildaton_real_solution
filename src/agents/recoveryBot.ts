@@ -1,32 +1,55 @@
 import { query } from "../db.js";
-import { callLLM, parseLLMJson } from "../lib/llm.js";
 import { evaluateAction } from "../lib/policyEngine.js";
 import * as moneyBus from "../lib/moneyBus.js";
 import { pseudonymize } from "../lib/pseudonymize.js";
-import { createIntent, completeIntent, failIntent, markAwaitingGateway } from "../lib/intentExecutor.js";
+import {
+  createIntent,
+  completeIntent,
+  failIntent,
+  markAwaitingGateway,
+  deferIntent,
+} from "../lib/intentExecutor.js";
 import { assignToExperiment, getActiveExperiment } from "../lib/experiment.js";
-import { RecoveryProposalSchema, RECOVERY_SYSTEM_PROMPT } from "./sharedBrain.js";
 import { getConfig } from "../config.js";
 import { createLogger } from "../logger.js";
-import { checkTransactionalConsent } from "../lib/consent.js";
-import { upliftEv, selectBucket, CONSTANTS } from "../lib/economics.js";
-import { reserveBudget, releaseBudget, realizeBudget } from "../lib/budget.js";
+import { checkTransactionalConsent, checkMarketingConsent } from "../lib/consent.js";
+import { upliftEv, selectBucket, CONSTANTS, INCENTIVE_BUCKETS } from "../lib/economics.js";
+import { reserveBudget, releaseBudget } from "../lib/budget.js";
 import { anchorTransactional } from "../lib/consent.js";
+import { appendActivity } from "../lib/activity.js";
+import { checkQuietHours } from "../lib/policy2.js";
+import { callBrain, buildRecoveryContext } from "../lib/sharedBrain.js";
+import { finalizeCopy } from "../lib/claims.js";
+import { appendLedger } from "../lib/ledger.js";
+import { chooseMessageStrategy, recordStrategyAttempt } from "../lib/copyStrategy.js";
 
 const log = createLogger("RecoveryBot");
 
-// Thompson sampling buckets: 0, 50, 100, 150 rupees (in paise)
-const BUCKETS = [0, 5000, 10000, 15000];
+const BUCKETS = INCENTIVE_BUCKETS;
+const MERCHANT_ID = "5a3ac6ce-b2c7-4b1f-a9db-45296841f30b";
 
 function sampleBeta(alpha: number, beta: number): number {
-  const mean = alpha / (alpha + beta);
-  return mean + (Math.random() - 0.5) * 0.1;
+  return alpha / (alpha + beta);
 }
 
-export async function processAbandonedCart(cartId: string): Promise<void> {
-  const config = getConfig();
+/**
+ * N6/R1 (v4.2) two-touch recovery stages.
+ * - early: carts abandoned ≥1h and <24h, zero touches → plain ₹0 first touch.
+ * - 24h: the classic path (incentivized when consented + EV-positive).
+ * Stages ride separate intent action_types so each touch gets its own row.
+ */
+export type RecoveryStage = "early" | "24h";
 
-  // Fetch cart and customer data
+export async function processAbandonedCart(
+  cartId: string,
+  opts?: { stage?: RecoveryStage }
+): Promise<void> {
+  const config = getConfig();
+  const stage: RecoveryStage = opts?.stage || "24h";
+  const actionType = stage === "early" ? "recovery_early" : "recovery_24h";
+  const triggerLabel = stage === "early" ? "cart_abandoned_1h" : "cart_abandoned_24h";
+
+  // ── STEP 1: LOAD CART ──
   const { rows: cartRows } = await query(
     "SELECT * FROM carts WHERE id = $1 AND status = 'abandoned'",
     [cartId]
@@ -39,170 +62,485 @@ export async function processAbandonedCart(cartId: string): Promise<void> {
   const cart = cartRows[0];
   const customerId = cart.customer_id;
   const cartTotal = Number(cart.total_paise);
+  const cartMerchantId = cart.merchant_id;
 
-  // V1: Anonymous carts are never touchable (no anchor, no contact => no action)
-  if (!customerId) {
-    log.debug({ cartId }, "Anonymous cart, skipping (V1)");
-    await appendAuditSkip(cartId, "anonymous_cart");
+  // Remote schema: line items live in cart_items (no items_json on carts)
+  const { rows: lineRows } = await query(
+    `SELECT ci.product_id AS id, p.name, p.price_paise, ci.qty,
+            p.cost_paise
+     FROM cart_items ci
+     LEFT JOIN products p ON p.id = ci.product_id
+     WHERE ci.cart_id = $1`,
+    [cartId]
+  );
+  const itemsJson = lineRows.map((r: any) => ({
+    id: r.id,
+    name: r.name || "Product",
+    price_paise: Number(r.price_paise ?? r.unit_price_paise ?? 0),
+    price: Number(r.price_paise ?? 0),
+    qty: Number(r.qty || 1),
+    cost_paise: Number(r.cost_paise ?? 0),
+  }));
+
+  // ── STEP 2: TRIGGER DETECTED ──
+  await appendActivity({
+    merchant_id: MERCHANT_ID,
+    actor: "RecoveryBot",
+    type: "TRIGGER_DETECTED",
+    summary: `Abandoned cart detected: ${cartId} (₹${(cartTotal / 100).toFixed(0)}, stage=${stage})`,
+    amount_paise: cartTotal,
+    data: { cart_id: cartId, abandoned_at: cart.abandoned_at, total_paise: cartTotal, stage },
+  });
+
+  // ── PAID-SKIP: never chase a cart that already converted ──
+  const { rows: paidRows } = await query(
+    `SELECT 1 FROM payment_links WHERE cart_id = $1 AND status = 'paid'
+     UNION SELECT 1 FROM orders WHERE cart_id = $1::uuid AND status = 'paid' LIMIT 1`,
+    [cartId]
+  );
+  if (paidRows.length > 0) {
+    await appendActivity({
+      merchant_id: MERCHANT_ID,
+      actor: "RecoveryBot",
+      type: "DUPLICATE_SKIPPED",
+      summary: `Cart ${cartId} skipped — already paid`,
+      data: { cart_id: cartId, reason: "already_paid", stage },
+    });
+    log.debug({ cartId, stage }, "Cart already paid, skipping");
     return;
   }
 
-  // V3: Check transactional consent before any touch
+  // ── STEP 3: WRITE-AHEAD INTENT (crash guard) ──
+  if (!customerId) {
+    await appendActivity({
+      merchant_id: MERCHANT_ID,
+      actor: "RecoveryBot",
+      type: "SKIP_ANONYMOUS",
+      summary: `Cart ${cartId} skipped — no identity anchor`,
+      data: { cart_id: cartId, reason: "anonymous_cart" },
+    });
+    log.debug({ cartId }, "Anonymous cart, skipping");
+    return;
+  }
+
   const hasTransactional = await checkTransactionalConsent(customerId);
   if (!hasTransactional) {
-    log.debug({ cartId, customerId }, "No transactional consent, skipping");
-    await appendAuditSkip(cartId, "no_transactional_consent");
+    await appendActivity({
+      merchant_id: MERCHANT_ID,
+      actor: "RecoveryBot",
+      type: "DUPLICATE_SKIPPED",
+      summary: `Cart ${cartId} skipped — no transactional consent`,
+      data: { cart_id: cartId, reason: "no_transactional_consent" },
+    });
     return;
   }
 
-  // W5: Get identity token for assignment
   const { rows: custRows } = await query(
-    "SELECT segment, identity_token FROM customers WHERE id = $1",
+    "SELECT id, segment, identity_hash FROM customers WHERE id = $1",
     [customerId]
   );
   const segment = custRows[0]?.segment || "default";
-  const identityToken = custRows[0]?.identityToken || customerId;
+  const identityToken = custRows[0]?.identity_hash || customerId;
 
-  // Check touch frequency
   const today = new Date().toISOString().slice(0, 10);
   const { rows: touchRows } = await query(
     "SELECT count FROM touches WHERE customer_id = $1 AND day = $2",
     [customerId, today]
   );
-  const touchesToday = touchRows[0]?.count || 0;
+  const touchesToday = Number(touchRows[0]?.count || 0);
 
-  // W5: Compute margin from catalog
-  const { rows: marginRows } = await query(
-    `SELECT SUM((p.price_paise - p.cost_paise) * ci.qty) as margin_paise
-     FROM cart_items ci
-     JOIN products p ON p.id = ci.product_id
-     WHERE ci.cart_id = $1`,
-    [cartId]
+  // Total touch history across all days
+  const { rows: totalTouchRows } = await query(
+    "SELECT COALESCE(SUM(count), 0) as total_touches FROM touches WHERE customer_id = $1",
+    [customerId]
   );
-  const marginPaise = Number(marginRows[0]?.margin_paise || Math.floor(cartTotal * CONSTANTS.MARGIN_PERCENT));
+  const touchHistory = Number(totalTouchRows[0]?.total_touches || 0);
 
-  // W2: Write-ahead intent with identity token and target_id
+  // ── R1 (v4.2) early-stage guards: velocity 2/day governs the extra touch ──
+  if (stage === "early" && touchesToday >= 2) {
+    await appendActivity({
+      merchant_id: MERCHANT_ID,
+      actor: "RecoveryBot",
+      type: "ABSTAIN",
+      summary: `Early touch skipped — velocity cap (touches_today=${touchesToday})`,
+      data: { cart_id: cartId, reason: "velocity_early_cap", stage, touches_today: touchesToday },
+    });
+    log.debug({ cartId, touchesToday }, "Early touch velocity-capped");
+    return;
+  }
+
+  // ── STEP 4: MARGIN CALCULATION (from joined line items) ──
+  let marginPaise: number;
+  if (itemsJson.length > 0) {
+    marginPaise = itemsJson.reduce(
+      (sum: number, i: any) =>
+        sum + (Number(i.price_paise || 0) - Number(i.cost_paise || 0)) * Number(i.qty || 1),
+      0
+    );
+  } else {
+    marginPaise = Math.floor(cartTotal * CONSTANTS.MARGIN_PERCENT);
+  }
+  if (!marginPaise) marginPaise = Math.floor(cartTotal * CONSTANTS.MARGIN_PERCENT);
+
   const intent = await createIntent({
-    merchantId: cart.merchant_id,
+    merchantId: MERCHANT_ID,
     customerId,
     identityToken,
-    actionType: 'recovery_link',
+    actionType,
     targetId: cartId,
     marginPaise,
   });
 
   if (!intent.isNew) {
-    log.info({ cartId, intentId: intent.intentId }, "Duplicate intent, skipping");
+    await appendActivity({
+      merchant_id: MERCHANT_ID,
+      actor: "RecoveryBot",
+      type: "DUPLICATE_SKIPPED",
+      summary: `Duplicate intent for cart ${cartId} — already processed`,
+      data: { cart_id: cartId, reason: "duplicate_intent" },
+    });
     return;
   }
 
-  // Experiment assignment (W6: HMAC-based)
+  await appendActivity({
+    merchant_id: MERCHANT_ID,
+    actor: "RecoveryBot",
+    type: "INTENT",
+    summary: `Write-ahead intent created for cart ${cartId}`,
+    data: { intent_id: intent.intentId, cart_id: cartId, segment, margin_paise: marginPaise },
+  });
+
+  // ── STEP 5: EXPERIMENT ASSIGNMENT ──
   let experimentId: string | null = null;
-  let arm: 'treatment' | 'control' = 'treatment';
-  const experiment = await getActiveExperiment('cart_recovery');
+  let arm: "treatment" | "control" = "treatment";
+  const experiment = await getActiveExperiment("cart_recovery");
   if (experiment) {
     experimentId = experiment.id;
-    arm = await assignToExperiment(identityToken, experimentId);
-
-    // Control arm: plain link, Rs.0 incentive, neutral copy
-    if (arm === 'control') {
-      const policyResult = await evaluateAction("recovery_incentive", {
-        amount_paise: 0,
-        incentive_paise: 0,
-        margin_paise: 0,
-        cart_total_paise: cartTotal,
-        customerId,
-        isRecovery: true,
-        actionClass: "proactive_marketing_touch",
-      });
-
-      // W2: Mark as awaiting_gateway
-      await markAwaitingGateway(intent.intentId);
-
-      const { seq, result } = await moneyBus.execute(
-        "RecoveryBot",
-        {
-          type: "create_payment_link",
-          params: {
-            amount: cartTotal,
-            reference_id: "",
-            notes: { cart_id: cartId, experiment_id: experimentId, arm: 'control' },
-          },
-        },
-        policyResult,
-        {
-          trigger: "cart_abandoned_24h",
-          segment,
-          experiment_id: experimentId,
-          arm: 'control',
-          incentive_paise: 0,
-          evidence_ids: [cartId],
-        }
-      );
-
-      if (result && (result as any).id) {
-        await completeIntent(intent.intentId, seq);
-      }
-      return;
-    }
+    arm = await assignToExperiment(identityToken, experimentId, {
+      merchantId: cartMerchantId,
+      customerId,
+    });
   }
 
-  // Thompson sampling
+  // Control arm: plain ₹0 link, no brain needed
+  if (arm === "control") {
+    const policyResult = await evaluateAction("recovery_incentive", {
+      amount_paise: 0,
+      incentive_paise: 0,
+      margin_paise: marginPaise,
+      cart_total_paise: cartTotal,
+      customerId,
+      isRecovery: true,
+      actionClass: "proactive_marketing_touch",
+      customer_touches_today: touchesToday,
+    });
+
+    await appendActivity({
+      merchant_id: MERCHANT_ID,
+      actor: "RecoveryBot",
+      type: "AGENT_THOUGHT",
+      summary: `Control arm: plain ₹0 link (experiment ${experimentId})`,
+      data: {
+        mode: "rules",
+        strategy: "send_plain_link",
+        tone: "neutral",
+        reasoning: "Control arm — no incentive, no brain consultation",
+        experiment_id: experimentId,
+        arm: "control",
+        cart_id: cartId,
+      },
+    });
+
+    await appendActivity({
+      merchant_id: MERCHANT_ID,
+      actor: "RecoveryBot",
+      type: "POLICY_EVAL",
+      summary: `Policy: ${policyResult.decision}`,
+      data: { checks: policyResult.checks, reasons: policyResult.reasons },
+    });
+
+    await markAwaitingGateway(intent.intentId);
+
+    const { seq, data } = await moneyBus.execute(
+      "RecoveryBot",
+      {
+        type: "create_payment_link",
+        params: { amount: cartTotal, description: `Order recovery - ${cartId}` },
+      },
+      policyResult,
+      {
+        cart_id: cartId,
+        customer_id: customerId,
+        segment,
+        trigger: triggerLabel,
+        experiment_id: experimentId,
+        arm: "control",
+        incentive_paise: 0,
+        policy_checks: policyResult.checks,
+        intent_id: intent.intentId,
+        brain_mode: "rules",
+        brain_reasoning: "Control arm — no incentive",
+        // N1 (v4.2): control copy is fixed-neutral; the brain is never consulted.
+        copy_tone: "neutral",
+        message_copy: "Hi! You left something in your cart. Complete your purchase here.",
+      },
+      MERCHANT_ID
+    );
+
+    if (data && data.link_id) {
+      await completeIntent(intent.intentId);
+    }
+    return;
+  }
+
+  // ── STEP 6: FEASIBLE SET (policy determines the menu) ──
   const { rows: statsRows } = await query(
     "SELECT bucket, attempts, successes FROM segment_stats WHERE merchant_id = $1 AND segment = $2",
-    [cart.merchant_id, segment]
+    [MERCHANT_ID, segment]
   );
 
   const statsMap = new Map<number, { attempts: number; successes: number }>();
   for (const s of statsRows) {
-    statsMap.set(s.bucket, { attempts: s.attempts, successes: s.successes });
+    statsMap.set(s.bucket, { attempts: Number(s.attempts), successes: Number(s.successes) });
   }
 
-  const sampledTheta: Record<string, number> = {};
   const thetas: Record<number, number> = {};
+  const thetaEstimates: Record<string, number> = {};
 
   for (const bucket of BUCKETS) {
     const stats = statsMap.get(bucket) || { attempts: 0, successes: 0 };
-    const alpha = stats.successes + 1;
-    const beta = stats.attempts - stats.successes + 1;
-    const theta = sampleBeta(alpha, beta);
-    sampledTheta[String(bucket / 100)] = Math.round(theta * 100) / 100;
+    const theta = sampleBeta(stats.successes + 1, stats.attempts - stats.successes + 1);
     thetas[bucket] = theta;
+    thetaEstimates[String(bucket)] = Math.round(theta * 100) / 100;
   }
 
-  // W1: Uplift-aware EV bucket selection
   const theta_0 = thetas[0] || CONSTANTS.THETA_0_PRIOR;
-  const { bucket: bestBucket, decision } = selectBucket({
+
+  // Build feasible options based on consent + touch history
+  const hasMarketing = await checkMarketingConsent(customerId);
+  const feasibleOptions: { action: string; bucket_paise: number; ev_paise: number; theta: number }[] = [];
+
+  if (touchHistory === 0) {
+    // FIRST TOUCH: plain only, incentive NOT on the menu
+    feasibleOptions.push({ action: "send_plain_link", bucket_paise: 0, ev_paise: 0, theta: theta_0 });
+  } else if (!hasMarketing) {
+    // No marketing consent: plain only
+    feasibleOptions.push({ action: "send_plain_link", bucket_paise: 0, ev_paise: 0, theta: theta_0 });
+  } else {
+    // REPEAT TOUCH + marketing consent: all buckets on the menu
+    for (const bucket of BUCKETS) {
+      const { incEv, decision } = upliftEv({
+        theta_b: thetas[bucket],
+        theta_0,
+        marginPaise,
+        incentivePaise: bucket,
+      });
+      if (decision === "ACTION" || bucket === 0) {
+        feasibleOptions.push({
+          action: bucket > 0 ? "send_link_with_incentive" : "send_plain_link",
+          bucket_paise: bucket,
+          ev_paise: Math.round(incEv),
+          theta: thetas[bucket],
+        });
+      }
+    }
+  }
+
+  // D3: explicit consent clamp — EV-positive buckets exist for this repeat-touch
+  // customer, but marketing opt-out forces them off the menu (plain only).
+  if (touchHistory > 0 && !hasMarketing) {
+    const excluded = BUCKETS.filter((b) => b > 0 && (thetas[b] ?? 0) > theta_0);
+    if (excluded.length > 0) {
+      await appendActivity({
+        merchant_id: MERCHANT_ID,
+        actor: "RecoveryBot",
+        type: "CLAMPED",
+        summary: `Incentive CLAMPED to plain ₹0 — consent_marketing_missing (buckets ₹${excluded.map((b) => b / 100).join(", ₹")} off-menu)`,
+        data: {
+          reason: "consent_marketing_missing",
+          excluded_buckets_paise: excluded,
+          incentive_paise: 0,
+        },
+        severity: "warning",
+      });
+    }
+  }
+
+  if (feasibleOptions.length === 0) {
+    await appendActivity({
+      merchant_id: MERCHANT_ID,
+      actor: "RecoveryBot",
+      type: "ABSTAIN",
+      summary: "No feasible action for this customer",
+      data: { reason: "empty_feasible_set" },
+    });
+    await failIntent(intent.intentId, "skipped");
+    return;
+  }
+
+  // ── STEP 7: UPLIFT EV TABLE ──
+  const { bucket: bestBucket, decision: evDecision } = selectBucket({
     thetas,
     theta_0,
     marginPaise,
   });
 
-  // W1: Handle decisions
-  if (decision === "ABSTAIN") {
-    const seq = await appendAuditSkip(cartId, "ev_negative", {
-      best_ev_paise: 0,
-      reason: "all_options_ev_negative",
-      sampled_theta: sampledTheta,
+  await appendActivity({
+    merchant_id: MERCHANT_ID,
+    actor: "RecoveryBot",
+    type: "UPLIFT_DECISION",
+    summary: `Feasible: ${feasibleOptions.map(o => `₹${o.bucket_paise / 100}(EV:${o.ev_paise})`).join(", ")}`,
+    data: {
+      feasible: feasibleOptions,
+      best: feasibleOptions.find(o => o.bucket_paise === bestBucket),
+      segment,
+      margin_paise: marginPaise,
+      theta_0,
+    },
+  });
+
+  // ── STEP 8: THE LLM BRAIN (the intelligence layer) ──
+  const consentState = hasMarketing ? "marketing_opted_in" : "marketing_opted_out";
+
+  const brainContext = buildRecoveryContext({
+    customerId,
+    segment,
+    touchHistory,
+    consentState,
+    experimentArm: arm,
+    cartId,
+    cartItems: Array.isArray(itemsJson) ? itemsJson.map((i: any) => ({
+      id: i.id || "unknown",
+      name: i.name || "Product",
+      price_paise: i.price_paise || i.price || 0,
+    })) : [],
+    feasibleOptions,
+    maxIncentivePaise: config.DAILY_INCENTIVE_BUDGET_PAISE,
+    marginPaise,
+    thetaEstimates,
+  });
+
+  const brain = await callBrain("recovery", brainContext);
+
+  // ── STEP 8b: GROUND THE COPY (N28 v4.3 — pre-send claim resolution) ──
+  // Link TTL: incentivized 24h touches expire in 48h (offer truly ends T+72h);
+  // everything else keeps the 24h default. The exact ISO is threaded through
+  // grounding AND moneyBus so the stated deadline equals the stored one.
+  const linkTtlSeconds = stage === "24h" && (brain.incentive_bucket_paise || 0) > 0 ? 48 * 3600 : 24 * 3600;
+  const linkExpiryIso = new Date(Date.now() + linkTtlSeconds * 1000).toISOString();
+  const rulesTemplates: Record<number, string> = {
+    0: "Hi! You left something in your cart. Complete your purchase here.",
+    5000: "We noticed you didn't finish — here's ₹50 off to help you decide.",
+    7500: "Still thinking it over? Here's ₹75 off to make it easier.",
+    10000: "Your cart is waiting! We've added ₹100 off as a thank you for your interest.",
+    15000: "Great taste! We'd love to see you complete this order — here's ₹150 off.",
+  };
+  const groundFacts = {
+    incentive_paise: brain.incentive_bucket_paise || 0,
+    cart_total_paise: cartTotal,
+    items: itemsJson.map((i: any) => ({ id: i.id, name: i.name, price_paise: i.price_paise })),
+    link_expiry_iso: linkExpiryIso,
+  };
+  const finalized = brain.mode === "llm"
+    ? await finalizeCopy({
+      copy: brain.message_copy,
+      facts: groundFacts,
+      source: "llm",
+      fallbackTemplate: rulesTemplates[brain.incentive_bucket_paise || 0] || rulesTemplates[0],
+      ledger: { merchantId: MERCHANT_ID, actor: "RecoveryBot", action: "create_payment_link" },
+    })
+    : { copy: brain.message_copy, result: { copy: brain.message_copy, resolved: [], stripped: [], allowed_numbers: [], fallback: false, violations: [] } };
+  let messageCopy = finalized.copy;
+
+  // ── STEP 9: EMIT AGENT_THOUGHT prep — incentive first (endowment needs it) ──
+  const incentivePaise = brain.incentive_bucket_paise || 0;
+
+  // ── G7 (v4.3): copy-strategy — LLM picks, ε-exploration keeps arms measured ──
+  const { strategy: messageStrategy, explored: strategyExplored } = chooseMessageStrategy(
+    (brain.raw as any)?.message_strategy
+  );
+
+  // ── R1/G2 (v4.3) endowment frame: the early touch rides a REAL hold
+  // (the live link this run creates). Grounded on DB item names.
+  if (stage === "early" && itemsJson.length > 0) {
+    const names = itemsJson.map((i: any) => i.name).join(", ");
+    const framed = await finalizeCopy({
+      copy: `We've reserved your ${names}. ${messageCopy}`,
+      facts: {
+        incentive_paise: incentivePaise,
+        cart_total_paise: cartTotal,
+        items: itemsJson.map((i: any) => ({ id: i.id, name: i.name, price_paise: i.price_paise })),
+        link_expiry_iso: linkExpiryIso,
+      },
+      source: "code",
+      fallbackTemplate: messageCopy,
+      ledger: null,
     });
-    await failIntent(intent.intentId, 'skipped');
-    log.info({ cartId }, "RecoveryBot abstained: EV negative");
+    messageCopy = framed.copy;
+  }
+
+  // ── STEP 9: EMIT AGENT_THOUGHT (visible in feed — mode MUST appear) ──
+
+  await appendActivity({
+    merchant_id: MERCHANT_ID,
+    actor: "RecoveryBot",
+    type: "AGENT_THOUGHT",
+    summary: brain.mode === "llm"
+      ? `Brain: ${brain.strategy} (₹${incentivePaise / 100} incentive, ${brain.message_tone}) — ${brain.rationale.reasoning.slice(0, 120)}`
+      : `Rules: ${brain.strategy} (₹${incentivePaise / 100} incentive) — LLM unavailable`,
+    data: {
+      mode: brain.mode,
+      strategy: brain.strategy,
+      tone: brain.message_tone,
+      cart_id: cartId,
+      incentive_bucket_paise: incentivePaise,
+      reasoning: brain.rationale.reasoning,
+      evidence_ids: brain.rationale.evidence_ids,
+      message_copy: messageCopy,
+      claims_resolved: finalized.result.resolved,
+      claims_stripped: finalized.result.stripped,
+      message_strategy: messageStrategy,
+      strategy_explored: strategyExplored,
+    },
+  });
+
+  // ── STEP 10: BUILD THE PROPOSAL (code injects ALL real numbers) ──
+  const actionClass = "proactive_marketing_touch";
+
+  // ── STEP 11: BUDGET CHECK ──
+  if (incentivePaise > 0) {
+    const budgetResult = await reserveBudget(MERCHANT_ID, incentivePaise);
+    if (!budgetResult.reserved) {
+      await appendActivity({
+        merchant_id: MERCHANT_ID,
+        actor: "RecoveryBot",
+        type: "BLOCKED",
+        summary: `Budget exhausted for ₹${(incentivePaise / 100).toFixed(0)} incentive`,
+        data: { checks: { budget: "BLOCK" }, reasons: ["budget_exhausted"] },
+      });
+      await failIntent(intent.intentId, "skipped");
+      return;
+    }
+  }
+
+  // ── STEP 12: QUIET HOURS (early stage defers even plain — revalidated as built) ──
+  const quietHours = checkQuietHours();
+  if (quietHours.deferred && (incentivePaise > 0 || stage === "early")) {
+    await appendActivity({
+      merchant_id: MERCHANT_ID,
+      actor: "RecoveryBot",
+      type: "DEFERRED",
+      summary: `Quiet hours active, resume at ${quietHours.resumeAt?.toISOString()}`,
+      data: { checks: { quiet_hours: "DEFERRED" }, resume_at: quietHours.resumeAt },
+    });
+    await deferIntent(intent.intentId, quietHours.resumeAt!);
+    if (incentivePaise > 0) await releaseBudget(MERCHANT_ID, incentivePaise);
     return;
   }
 
-  const incentivePaise = decision === "PLAIN" ? 0 : bestBucket;
-  const customerRef = pseudonymize(customerId);
+  // ── STEP 13: FULL POLICY EVALUATION (the gate — runs REGARDLESS of brain mode) ──
+  const consentClass = incentivePaise > 0 ? "marketing" : "transactional";
 
-  // V11: Reserve budget before executing
-  const budgetResult = await reserveBudget(cart.merchant_id, incentivePaise);
-  if (!budgetResult.reserved) {
-    const seq = await appendAuditSkip(cartId, "budget_exhausted");
-    await failIntent(intent.intentId, 'skipped');
-    log.info({ cartId }, "RecoveryBot skipped: budget exhausted");
-    return;
-  }
-
-  // Policy evaluation with W4 action class
   const policyResult = await evaluateAction("recovery_incentive", {
     amount_paise: incentivePaise,
     incentive_paise: incentivePaise,
@@ -211,105 +549,378 @@ export async function processAbandonedCart(cartId: string): Promise<void> {
     customer_touches_today: touchesToday,
     customerId,
     isRecovery: true,
-    actionClass: "proactive_marketing_touch",
+    actionClass,
   });
 
-  // If policy blocks, release budget
+  if (incentivePaise > 0 && !hasMarketing) {
+    policyResult.decision = "BLOCK";
+    policyResult.reasons.push("consent_marketing_missing");
+    policyResult.checks.consent_marketing = "BLOCK";
+  }
+
+  await appendActivity({
+    merchant_id: MERCHANT_ID,
+    actor: "RecoveryBot",
+    type: "POLICY_EVAL",
+    summary: `Policy: ${policyResult.decision} — ${Object.entries(policyResult.checks).map(([k, v]) => `${k}=${v}`).join(", ")}`,
+    data: { checks: policyResult.checks, reasons: policyResult.reasons },
+  });
+
   if (policyResult.decision === "BLOCK") {
-    await releaseBudget(cart.merchant_id, incentivePaise);
-    await failIntent(intent.intentId, 'skipped');
-    log.info({ cartId, checks: policyResult.checks }, "RecoveryBot blocked by policy");
+    if (incentivePaise > 0) await releaseBudget(MERCHANT_ID, incentivePaise);
+    await failIntent(intent.intentId, "skipped");
     return;
   }
 
-  const rationale = {
-    trigger: "cart_abandoned_24h",
-    segment,
-    customer_ref: customerRef,
-    recovery_score: sampledTheta[String(bestBucket / 100)],
-    sampled_theta: sampledTheta,
-    chosen_bucket_paise: bestBucket / 100,
-    ev_paise: 0,
-    evidence_ids: [cartId, customerRef],
-    experiment_id: experimentId,
-    arm: 'treatment',
-    decision, // W1: ACTION or PLAIN
-  };
+  if (policyResult.decision === "ESCALATE") {
+    if (incentivePaise > 0) await releaseBudget(MERCHANT_ID, incentivePaise);
+    await failIntent(intent.intentId, "skipped");
+    return;
+  }
 
-  // W2: Mark as awaiting_gateway
+  // ── STEP 14: MONEY BUS (the only Razorpay door) ──
   await markAwaitingGateway(intent.intentId);
 
-  // Execute through money bus
-  const { seq, result } = await moneyBus.execute(
+  const { seq, data } = await moneyBus.execute(
     "RecoveryBot",
     {
       type: "create_payment_link",
       params: {
-        amount: cartTotal,
-        reference_id: "",
-        customer: customerId
-          ? { name: "placeholder", email: "placeholder", contact: "placeholder" }
-          : undefined,
-        notes: { cart_id: cartId },
+        // Customer is charged cart total MINUS the incentive (B10 invariant)
+        amount: cartTotal - incentivePaise,
+        incentive_paise: incentivePaise,
+        cart_total_paise: cartTotal,
+        cart_id: cartId,
+        // G2 (v4.3): exact expiry threaded from grounding — stated == stored.
+        ttl_seconds: linkTtlSeconds,
+        expire_by_iso: linkExpiryIso,
+        description: `Order recovery - ${cartId}`,
       },
     },
     policyResult,
-    rationale
+    {
+      cart_id: cartId,
+      customer_id: customerId,
+      segment,
+      trigger: triggerLabel,
+      experiment_id: experimentId,
+      arm,
+      incentive_paise: incentivePaise,
+      evidence_ids: brain.rationale.evidence_ids,
+      policy_checks: policyResult.checks,
+      sampled_theta: thetaEstimates,
+      ev_paise: feasibleOptions.find(o => o.bucket_paise === incentivePaise)?.ev_paise || 0,
+      intent_id: intent.intentId,
+      brain_mode: brain.mode,
+      brain_reasoning: brain.rationale.reasoning,
+      brain_tone: brain.message_tone,
+      message_copy: messageCopy,
+      claims_resolved: finalized.result.resolved,
+      claims_stripped: finalized.result.stripped,
+      message_strategy: messageStrategy,
+      strategy_explored: strategyExplored,
+    },
+    MERCHANT_ID
   );
 
-  // Update reference_id with audit seq
-  if (result && (result as any).id) {
-    await query(
-      "UPDATE audit_log SET outcome_detail_json = outcome_detail_json || $1 WHERE seq = $2",
-      [JSON.stringify({ reference_id: String(seq) }), seq]
-    );
-    await completeIntent(intent.intentId, seq);
-    await realizeBudget(cart.merchant_id, incentivePaise); // V11: realize on success
-  } else {
-    await failIntent(intent.intentId, 'pending');
-    await releaseBudget(cart.merchant_id, incentivePaise); // V11: release on failure
+  if (data && (data as any).resolved) {
+    // N2 (v4.2) cancel-race: prior link turned out paid and was resolved in-bus.
+    // Intent already marked done; release this run's unspent reservation.
+    if (incentivePaise > 0) await releaseBudget(MERCHANT_ID, incentivePaise);
+    await completeIntent(intent.intentId);
+    log.info({ cartId, orderId: (data as any).order_id }, "RecoveryBot cancel-race resolved, no new link");
+    return;
   }
 
-  // Record touch
+  if (data && data.link_id) {
+    await completeIntent(intent.intentId);
+  } else {
+    await failIntent(intent.intentId, "pending");
+    if (incentivePaise > 0) await releaseBudget(MERCHANT_ID, incentivePaise);
+  }
+
+  // ── STEP 15: POST-ACTION UPDATES ──
   await query(
-    `INSERT INTO touches (customer_id, day, count) VALUES ($1, $2, 1)
+    `INSERT INTO touches (merchant_id, customer_id, day, count) VALUES ($1, $2, $3, 1)
      ON CONFLICT (customer_id, day) DO UPDATE SET count = touches.count + 1`,
-    [customerId, today]
+    [cartMerchantId, customerId, today]
   );
 
-  // V3: Anchor transactional consent
   await anchorTransactional(customerId, cartId);
 
-  // Update segment stats (only for identity-bound customers)
   if (identityToken) {
+    // R1 (v4.2): feed the ACTUAL incentive bucket used — early plain touches
+    // land on bucket 0 even when selectBucket preferred a higher one.
     await query(
       `INSERT INTO segment_stats (merchant_id, segment, bucket, attempts, successes)
        VALUES ($1, $2, $3, 1, 0)
        ON CONFLICT (merchant_id, segment, bucket)
        DO UPDATE SET attempts = segment_stats.attempts + 1`,
-      [cart.merchant_id, segment, bestBucket]
+      [MERCHANT_ID, segment, incentivePaise]
     );
+    // G7 (v4.3): the send is also a strategy attempt.
+    try {
+      await recordStrategyAttempt(MERCHANT_ID, segment, messageStrategy);
+    } catch (stratErr: any) {
+      log.warn({ error: stratErr?.message }, "Strategy attempt recording skipped (non-critical)");
+    }
   }
 
-  log.info({ cartId, seq, incentivePaise, decision: policyResult.decision }, "RecoveryBot processed cart");
+  log.info(
+    { cartId, seq, incentivePaise, brainMode: brain.mode, decision: policyResult.decision },
+    "RecoveryBot processed cart"
+  );
 }
 
 /**
- * Append a skip/abstain entry to the audit log.
+ * G2 (v4.3) T+72h FINAL CALL — the ladder completion.
+ * Announces the REAL expiry of the 24h link (stated deadline === stored
+ * expire_by, enforced by U-DEADLINE). Re-uses the SAME incentive: no new
+ * budget reservation, 30-day cap unaffected. If the 24h link is still live
+ * it is pointed to; otherwise re-issued at the same amount via moneyBus
+ * (cancel-before-create governs). Plain carts get a plain final call.
+ * Gating: counts as a touch; velocity/quiet/fatigue govern; once per cart
+ * lifetime (recovery_final intent); control arm gets the plain variant.
  */
-async function appendAuditSkip(
-  cartId: string,
-  reason: string,
-  extra?: Record<string, unknown>
-): Promise<number> {
-  const { appendAudit } = await import("../lib/auditLedger.js");
-  return appendAudit({
-    actor: 'RecoveryBot',
-    action: 'skip_cart',
-    params_json: { cartId, reason, ...extra },
-    decision: reason === 'ev_negative' ? 'ABSTAIN' : 'BLOCK',
-    policy_checks_json: { skip_reason: reason },
-    rationale_json: { cartId, reason, ...extra },
-    outcome: reason === 'ev_negative' ? 'ABSTAIN' : 'SKIPPED',
+export async function processFinalCall(cartId: string): Promise<void> {
+  const { rows: cartRows } = await query("SELECT * FROM carts WHERE id = $1", [cartId]);
+  const cart = cartRows[0];
+  if (!cart || cart.status === "paid" || cart.status === "converted") {
+    log.debug({ cartId }, "Final call skipped — cart gone/converted");
+    return;
+  }
+  const customerId = cart.customer_id;
+  if (!customerId) return;
+  const cartTotal = Number(cart.total_paise);
+  const cartMerchantId = cart.merchant_id;
+  const today = new Date().toISOString().slice(0, 10);
+
+  await appendActivity({
+    merchant_id: MERCHANT_ID, actor: "RecoveryBot", type: "TRIGGER_DETECTED",
+    summary: `Final-call window for cart ${cartId}`,
+    amount_paise: cartTotal,
+    data: { cart_id: cartId, stage: "final" },
   });
+
+  // Once per cart lifetime.
+  const { rows: priorFinal } = await query(
+    `SELECT 1 FROM action_intents WHERE target_id = $1 AND action_type = 'recovery_final' LIMIT 1`,
+    [cartId]
+  );
+  if (priorFinal.length > 0) {
+    await appendActivity({
+      merchant_id: MERCHANT_ID, actor: "RecoveryBot", type: "DUPLICATE_SKIPPED",
+      summary: `Final call already sent for cart ${cartId}`,
+      data: { cart_id: cartId, reason: "final_once_per_lifetime" },
+    });
+    return;
+  }
+
+  // Paid-skip (same guard as the ladder touches).
+  const { rows: paidRows } = await query(
+    `SELECT 1 FROM payment_links WHERE cart_id = $1 AND status = 'paid'
+     UNION SELECT 1 FROM orders WHERE cart_id = $1::uuid AND status = 'paid' LIMIT 1`,
+    [cartId]
+  );
+  if (paidRows.length > 0) return;
+
+  // The 24h link we are completing: latest recovery link for this cart.
+  const { rows: linkRows } = await query(
+    `SELECT * FROM payment_links WHERE cart_id = $1 ORDER BY created_at DESC LIMIT 1`,
+    [cartId]
+  );
+  const prior = linkRows[0];
+  if (!prior) {
+    await appendActivity({
+      merchant_id: MERCHANT_ID, actor: "RecoveryBot", type: "ABSTAIN",
+      summary: `Final call skipped — no prior link for cart ${cartId}`,
+      data: { cart_id: cartId, reason: "no_prior_link" },
+    });
+    return;
+  }
+  const incentivePaise = Number(prior.incentive_paise || 0);
+  const deadlineIso = new Date(prior.expire_by).toISOString();
+
+  const hasTransactional = await checkTransactionalConsent(customerId);
+  if (!hasTransactional) return;
+  const hasMarketing = await checkMarketingConsent(customerId);
+
+  const { rows: custRows } = await query("SELECT segment, identity_hash FROM customers WHERE id = $1", [customerId]);
+  const segment = custRows[0]?.segment || "default";
+  const identityToken = custRows[0]?.identity_hash || customerId;
+  const { rows: touchRows } = await query("SELECT count FROM touches WHERE customer_id = $1 AND day = $2", [customerId, today]);
+  const touchesToday = Number(touchRows[0]?.count || 0);
+
+  // Control arm → plain final (N1); treatment reuses the prior incentive.
+  let experimentId: string | null = null;
+  let finalIncentive = incentivePaise;
+  const experiment = await getActiveExperiment("cart_recovery");
+  if (experiment) {
+    experimentId = experiment.id;
+    const arm = await assignToExperiment(identityToken, experimentId, { merchantId: cartMerchantId, customerId });
+    if (arm === "control") finalIncentive = 0;
+  }
+  if (finalIncentive > 0 && !hasMarketing) {
+    await appendActivity({
+      merchant_id: MERCHANT_ID, actor: "RecoveryBot", type: "ABSTAIN",
+      summary: `Final call skipped — consent revoked for cart ${cartId}`,
+      data: { cart_id: cartId, reason: "consent_marketing_missing" },
+    });
+    return;
+  }
+
+  const intent = await createIntent({
+    merchantId: MERCHANT_ID, customerId, identityToken,
+    actionType: "recovery_final", targetId: cartId,
+  });
+  if (!intent.isNew) return;
+
+  // Full policy gate (velocity 2/day, quiet hours, caps govern the final touch).
+  const policyResult = await evaluateAction("recovery_incentive", {
+    amount_paise: finalIncentive,
+    incentive_paise: finalIncentive,
+    margin_paise: Math.floor(cartTotal * CONSTANTS.MARGIN_PERCENT),
+    cart_total_paise: cartTotal,
+    customer_touches_today: touchesToday,
+    customerId,
+    isRecovery: true,
+    actionClass: "proactive_marketing_touch",
+  });
+  await appendActivity({
+    merchant_id: MERCHANT_ID, actor: "RecoveryBot", type: "POLICY_EVAL",
+    summary: `Final-call policy: ${policyResult.decision}`,
+    data: { checks: policyResult.checks, reasons: policyResult.reasons, stage: "final" },
+  });
+  if (policyResult.decision !== "ALLOW") {
+    await failIntent(intent.intentId, "skipped");
+    return;
+  }
+  const quietHours = checkQuietHours();
+  if (quietHours.deferred) {
+    await appendActivity({
+      merchant_id: MERCHANT_ID, actor: "RecoveryBot", type: "DEFERRED",
+      summary: `Final call deferred to ${quietHours.resumeAt?.toISOString()}`,
+      data: { resume_at: quietHours.resumeAt, stage: "final" },
+    });
+    await deferIntent(intent.intentId, quietHours.resumeAt!);
+    return;
+  }
+
+  // Live prior link → point to it. Else re-issue at the same amount,
+  // preserving the ORIGINAL deadline (deadline truth over link utility).
+  let shortUrl: string | null = null;
+  let seq: number | null = null;
+  if (prior.status === "live") {
+    shortUrl = prior.short_url;
+    const { seq: reuseSeq } = await appendLedger({
+      merchantId: MERCHANT_ID, actor: "RecoveryBot", action: "recovery_final",
+      params: { cart_id: cartId, reused_link_id: prior.razorpay_link_id, incentive_paise: finalIncentive },
+      decision: "ALLOW", policy_checks: policyResult.checks,
+      rationale: { reason: "final_call_reuse_live_link", expiry_iso: deadlineIso },
+      outcome: "SUCCESS",
+    });
+    seq = reuseSeq;
+  } else {
+    await markAwaitingGateway(intent.intentId);
+    try {
+      const result = await moneyBus.execute(
+        "RecoveryBot",
+        {
+          type: "create_payment_link",
+          params: {
+            amount: cartTotal - finalIncentive,
+            incentive_paise: finalIncentive,
+            cart_total_paise: cartTotal,
+            cart_id: cartId,
+            // Preserve the original deadline — the announced expiry never moves.
+            expire_by_iso: deadlineIso,
+            description: `Final call - ${cartId}`,
+          },
+        },
+        policyResult,
+        {
+          cart_id: cartId, customer_id: customerId, segment, trigger: "cart_abandoned_72h_final",
+          experiment_id: experimentId, incentive_paise: finalIncentive,
+          policy_checks: policyResult.checks, intent_id: intent.intentId,
+          brain_mode: "rules", brain_reasoning: "Final call — fixed play, deadline truth",
+          final_reissue_of: prior.razorpay_link_id,
+        },
+        MERCHANT_ID
+      );
+      // NOTE: no budget reservation on the final touch — the incentive was
+      // already accounted at the 24h touch; re-issue must not double-spend it.
+      seq = result.seq;
+      shortUrl = result.data?.short_url || null;
+      if (result.data?.link_id) {
+        await completeIntent(intent.intentId);
+        await query(
+          `INSERT INTO segment_stats (merchant_id, segment, bucket, attempts, successes)
+           VALUES ($1, $2, $3, 1, 0)
+           ON CONFLICT (merchant_id, segment, bucket)
+           DO UPDATE SET attempts = segment_stats.attempts + 1`,
+          [MERCHANT_ID, segment, finalIncentive]
+        );
+      } else {
+        await failIntent(intent.intentId, "pending");
+        return;
+      }
+    } catch (err: any) {
+      await failIntent(intent.intentId, "pending");
+      throw err;
+    }
+  }
+
+  // Code-built final copy over the REAL deadline, verified by the resolver.
+  const exp = renderExpiryParts(deadlineIso);
+  const amountTxt = finalIncentive > 0 ? `Your ₹${finalIncentive / 100} reservation releases ${exp.phrase}` : `Your cart is still reserved — it releases ${exp.phrase}`;
+  const rawCopy = `${amountTxt}. This is the final call.${shortUrl ? ` ${shortUrl}` : ""}`;
+  const grounded = await finalizeCopy({
+    copy: rawCopy,
+    facts: {
+      incentive_paise: finalIncentive,
+      cart_total_paise: cartTotal,
+      link_expiry_iso: deadlineIso,
+    },
+    source: "code",
+    fallbackTemplate: "This is the final call on your reserved cart.",
+    ledger: { merchantId: MERCHANT_ID, actor: "RecoveryBot", action: "recovery_final" },
+  });
+
+  await appendActivity({
+    merchant_id: MERCHANT_ID, actor: "RecoveryBot", type: "AGENT_THOUGHT",
+    summary: `Final call (${shortUrl ? "reused link" : "re-issued"}) — deadline ${deadlineIso}`,
+    data: {
+      mode: "rules", strategy: "send_final_call", tone: "neutral",
+      incentive_bucket_paise: finalIncentive,
+      reasoning: "Fixed ladder play: announce the enforced expiry, reuse the same incentive",
+      message_copy: grounded.copy,
+      stated_deadline_iso: deadlineIso,
+      claims_resolved: grounded.result.resolved,
+      claims_stripped: grounded.result.stripped,
+    },
+  });
+
+  await query(
+    `INSERT INTO touches (merchant_id, customer_id, day, count) VALUES ($1, $2, $3, 1)
+     ON CONFLICT (customer_id, day) DO UPDATE SET count = touches.count + 1`,
+    [cartMerchantId, customerId, today]
+  );
+  await completeIntent(intent.intentId);
+  log.info({ cartId, seq, finalIncentive }, "RecoveryBot final call sent");
+}
+
+/** IST clock parts for deadline phrasing ("tonight at 9 PM" / "12 Jun at 9 PM"). */
+function renderExpiryParts(iso: string): { phrase: string; hour12: number; hour24: number; day: number } {
+  const d = new Date(iso);
+  const ist = new Date(d.getTime() + 5.5 * 60 * 60 * 1000);
+  const hour24 = ist.getUTCHours();
+  const hour12 = hour24 % 12 === 0 ? 12 : hour24 % 12;
+  const suffix = hour24 < 12 ? "AM" : "PM";
+  const nowIst = new Date(Date.now() + 5.5 * 60 * 60 * 1000);
+  const sameDay = ist.toISOString().slice(0, 10) === nowIst.toISOString().slice(0, 10);
+  const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const phrase = sameDay
+    ? `tonight at ${hour12} ${suffix}`
+    : `${ist.getUTCDate()} ${months[ist.getUTCMonth()]} at ${hour12} ${suffix}`;
+  return { phrase, hour12, hour24, day: ist.getUTCDate() };
 }

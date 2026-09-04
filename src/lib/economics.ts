@@ -13,6 +13,24 @@ export const CONSTANTS = {
 };
 
 /**
+ * Canonical incentive buckets (paise). Single source of truth — recovery,
+ * chat-grant mapping, and stats all index this list. (v4.2 P7: 7500 added.)
+ */
+export const INCENTIVE_BUCKETS = [0, 5000, 7500, 10000, 15000];
+
+/**
+ * Map an arbitrary requested amount to the nearest bucket (ties go lower).
+ */
+export function nearestBucket(amountPaise: number, buckets: number[] = INCENTIVE_BUCKETS): number {
+  let best = buckets[0];
+  for (const b of buckets) {
+    if (Math.abs(b - amountPaise) < Math.abs(best - amountPaise)) best = b;
+    // ties keep the earlier (lower) bucket since list is ascending
+  }
+  return best;
+}
+
+/**
  * W1: Uplift-aware EV (N17):
  * inc_ev(b) = (theta_b - theta_0) * (margin_paise - fee_paise)
  *             - theta_b * incentive_b - delta_ai_cost

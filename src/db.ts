@@ -7,11 +7,18 @@ let pool: pg.Pool | null = null;
 
 export function getPool(): pg.Pool {
   if (!pool) {
+    const connectionString = getConfig().DATABASE_URL;
+    // Supabase (and other managed Postgres) requires SSL; the pooler cert
+    // chain fails Node's default verification, so skip chain validation.
+    const needsSSL =
+      connectionString.includes("supabase.co") ||
+      connectionString.includes("sslmode=require");
     pool = new Pool({
-      connectionString: getConfig().DATABASE_URL,
+      connectionString,
+      ...(needsSSL ? { ssl: { rejectUnauthorized: false } } : {}),
       max: 20,
       idleTimeoutMillis: 30000,
-      connectionTimeoutMillis: 5000,
+      connectionTimeoutMillis: 15000,
     });
     pool.on("error", (err) => {
       console.error("Unexpected pool error:", err);

@@ -1,5 +1,6 @@
+import crypto from "node:crypto";
 import { query, withTransaction } from "../db.js";
-import { appendAuditSerialized } from "./auditLedger2.js";
+import { appendLedger } from "./ledger.js";
 import { redactForPersist } from "./redact.js";
 import { createLogger } from "../logger.js";
 
@@ -11,113 +12,100 @@ export interface IntentParams {
   identityToken?: string;
   actionType: string;
   targetId: string; // cart_id | order_id | trigger_event_id
+  targetType?: string; // 'cart' | 'order' | 'trigger' — defaults to 'cart'
   marginPaise?: number;
   windowDay?: string; // YYYY-MM-DD, defaults to today (IST)
 }
 
 export interface IntentResult {
-  intentId: number;
+  intentId: string;
   isNew: boolean;
   auditSeq?: number;
 }
 
 /**
- * W2: Compute business window in IST.
+ * W2: Compute business window day in IST (YYYY-MM-DD).
+ * Remote schema stores window_day as TEXT.
  */
-function getBusinessWindowIST(windowDay?: string): { start: string; end: string } {
+function getBusinessDayIST(windowDay?: string): string {
+  if (windowDay) return windowDay;
   const now = new Date();
   const istOffset = 5.5 * 60 * 60 * 1000;
-  const istTime = new Date(now.getTime() + istOffset);
-
-  const day = windowDay || istTime.toISOString().slice(0, 10);
-  return {
-    start: `${day}T00:00:00+05:30`,
-    end: `${day}T23:59:59+05:30`,
-  };
+  return new Date(now.getTime() + istOffset).toISOString().slice(0, 10);
 }
 
 /**
  * W2: Generate dedupe key with identity token and target_id.
- * Format: {merchant}:{identity_token}:{target_id}:{action_type}:{business_window_IST}
+ * Format: {merchant}:{identity_token}:{target_id}:{action_type}:{business_day_IST}
  */
-function generateDedupeKey(params: IntentParams, businessWindow: { start: string; end: string }): string {
+function generateDedupeKey(params: IntentParams, businessDay: string): string {
   return [
     params.merchantId,
-    params.identityToken || params.customerId || 'anon',
+    params.identityToken || params.customerId || "anon",
     params.targetId,
     params.actionType,
-    businessWindow.start.slice(0, 10), // Just the date part
-  ].join(':');
+    businessDay,
+  ].join(":");
 }
+
+const MAX_ATTEMPTS = 3;
 
 /**
  * W2: Create a write-ahead intent with lease-based state machine.
+ * Remote shape: (id uuid, merchant_id, customer_id, target_type, target_id,
+ * action_type, window_day text, dedupe_key unique, status, attempt_count,
+ * resume_at, lease_expires_at, created_at).
  * Returns { isNew: true } if the intent was created,
  * { isNew: false } if a duplicate was detected (action should be skipped).
  */
 export async function createIntent(params: IntentParams): Promise<IntentResult> {
-  const businessWindow = getBusinessWindowIST(params.windowDay);
-  const dedupeKey = generateDedupeKey(params, businessWindow);
-
-  // Check idempotency hash if provided
-  if (params.identityToken) {
-    const idempotencyHash = crypto.createHash('sha256')
-      .update(`${dedupeKey}:${JSON.stringify(params)}`)
-      .digest('hex');
-
-    const { rows: existingHash } = await query(
-      "SELECT id FROM action_intents WHERE idempotency_hash = $1",
-      [idempotencyHash]
-    );
-
-    if (existingHash[0]) {
-      return { intentId: existingHash[0].id, isNew: false };
-    }
-  }
+  const businessDay = getBusinessDayIST(params.windowDay);
+  const dedupeKey = generateDedupeKey(params, businessDay);
+  const intentId = crypto.randomUUID();
 
   const result = await withTransaction(async (client) => {
-    // Attempt to insert intent
+    // Attempt to insert intent (dedupe_key UNIQUE handles idempotency)
     const { rows } = await client.query(
       `INSERT INTO action_intents (
-        merchant_id, customer_id, action_type, dedupe_key,
-        window_start, window_end, status, attempt_count, max_attempts,
-        margin_snapshot_paise, idempotency_hash
-      ) VALUES ($1, $2, $3, $4, $5, $6, 'pending', 0, 3, $7, $8)
-      ON CONFLICT (dedupe_key) DO NOTHING
-      RETURNING id`,
+         id, merchant_id, customer_id, target_type, target_id,
+         action_type, window_day, dedupe_key, status, attempt_count
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', 0)
+       ON CONFLICT (dedupe_key) DO NOTHING
+       RETURNING id`,
       [
+        intentId,
         params.merchantId,
         params.customerId,
+        params.targetType || "cart",
+        params.targetId,
         params.actionType,
+        businessDay,
         dedupeKey,
-        businessWindow.start,
-        businessWindow.end,
-        params.marginPaise || 0,
-        params.identityToken ? crypto.createHash('sha256').update(`${dedupeKey}:${JSON.stringify(params)}`).digest('hex') : null,
       ]
     );
 
     if (rows.length === 0) {
-      // Duplicate detected — log and skip using serialized append
-      const seq = await appendAuditSerialized({
-        actor: params.actionType.includes('recovery') ? 'RecoveryBot' : 'UpsellBot',
-        action: 'skip_duplicate_intent',
-        params_json: redactForPersist({ dedupeKey, customerId: params.customerId }),
-        decision: 'BLOCK',
-        policy_checks_json: { dedupe: 'CONFLICT' },
-        rationale_json: { reason: 'duplicate_intent', dedupeKey },
-        outcome: 'SKIPPED',
+      // Duplicate detected — ledger it (serialized append) and skip
+      const { seq } = await appendLedger({
+        merchantId: params.merchantId,
+        actor: params.actionType.includes("recovery") ? "RecoveryBot" : "UpsellBot",
+        action: "skip_duplicate_intent",
+        params: redactForPersist({ dedupeKey, customerId: params.customerId }) as Record<string, unknown>,
+        decision: "BLOCK",
+        policy_checks: { dedupe: "CONFLICT" },
+        rationale: { reason: "duplicate_intent", dedupeKey },
+        outcome: "SKIPPED",
       });
 
       log.debug({ dedupeKey }, "Duplicate intent detected, skipped");
-      return { intentId: 0, isNew: false, auditSeq: seq };
+      return { intentId: "", isNew: false, auditSeq: seq };
     }
 
     // Mark as executing with lease
     const leaseExpires = new Date(Date.now() + 5 * 60 * 1000); // 5 min lease
     await client.query(
-      `UPDATE action_intents SET status = 'executing', lease_owner = $1, lease_expires_at = $2 WHERE id = $3`,
-      ['intent-executor', leaseExpires, rows[0].id]
+      `UPDATE action_intents SET status = 'executing', lease_expires_at = $1 WHERE id = $2`,
+      [leaseExpires, rows[0].id]
     );
 
     return { intentId: rows[0].id, isNew: true };
@@ -129,9 +117,9 @@ export async function createIntent(params: IntentParams): Promise<IntentResult> 
 /**
  * W2: Mark intent as awaiting_gateway after Razorpay call dispatched.
  */
-export async function markAwaitingGateway(intentId: number): Promise<void> {
+export async function markAwaitingGateway(intentId: string): Promise<void> {
   await query(
-    "UPDATE action_intents SET status = 'awaiting_gateway', lease_owner = NULL, lease_expires_at = NULL WHERE id = $1",
+    "UPDATE action_intents SET status = 'awaiting_gateway', lease_expires_at = NULL WHERE id = $1",
     [intentId]
   );
   log.debug({ intentId }, "Intent awaiting gateway");
@@ -140,57 +128,40 @@ export async function markAwaitingGateway(intentId: number): Promise<void> {
 /**
  * Mark an intent as done after successful execution.
  */
-export async function completeIntent(intentId: number, auditSeq: number): Promise<void> {
-  await query(
-    "UPDATE action_intents SET status = 'done', audit_seq = $1, lease_owner = NULL, lease_expires_at = NULL WHERE id = $2",
-    [auditSeq, intentId]
-  );
-  log.debug({ intentId, auditSeq }, "Intent completed");
+export async function completeIntent(intentId: string): Promise<void> {
+  await query("UPDATE action_intents SET status = 'done', lease_expires_at = NULL WHERE id = $1", [
+    intentId,
+  ]);
+  log.debug({ intentId }, "Intent completed");
 }
 
 /**
- * W2: Mark intent as failed with retry logic.
+ * W2: Mark intent as failed with retry logic (max attempts = 3, constant).
  */
-export async function failIntent(intentId: number, status: 'pending' | 'skipped' | 'failed' = 'pending'): Promise<void> {
-  if (status === 'failed') {
-    // Increment attempt count and check max attempts
+export async function failIntent(
+  intentId: string,
+  status: "pending" | "skipped" | "failed" = "pending"
+): Promise<void> {
+  if (!intentId) return;
+  if (status === "failed") {
+    // Increment attempt count; dead-letter at MAX_ATTEMPTS
     const { rows } = await query(
-      "UPDATE action_intents SET attempt_count = attempt_count + 1, lease_owner = NULL, lease_expires_at = NULL WHERE id = $1 RETURNING attempt_count, max_attempts",
+      "UPDATE action_intents SET attempt_count = attempt_count + 1, lease_expires_at = NULL WHERE id = $1 RETURNING attempt_count",
       [intentId]
     );
 
-    if (rows[0] && rows[0].attempt_count >= rows[0].max_attempts) {
-      // Max attempts exceeded — dead letter
-      await query(
-        "UPDATE action_intents SET status = 'failed' WHERE id = $1",
-        [intentId]
-      );
-
-      await appendAuditSerialized({
-        actor: 'IntentJanitor',
-        action: 'max_attempts_exceeded',
-        params_json: { intentId },
-        decision: 'BLOCK',
-        policy_checks_json: {},
-        rationale_json: { intentId, reason: 'max_attempts_exceeded' },
-        outcome: 'FAILED',
-      });
-
+    if (rows[0] && Number(rows[0].attempt_count) >= MAX_ATTEMPTS) {
+      await query("UPDATE action_intents SET status = 'failed' WHERE id = $1", [intentId]);
       log.warn({ intentId }, "Intent failed: max attempts exceeded");
       return;
     }
 
-    // Set next retry time with exponential backoff
-    const backoffMs = Math.pow(2, rows[0].attempt_count) * 30000; // 30s, 60s, 120s
-    await query(
-      "UPDATE action_intents SET status = 'pending', next_retry_at = $1 WHERE id = $2",
-      [new Date(Date.now() + backoffMs), intentId]
-    );
+    await query("UPDATE action_intents SET status = 'pending' WHERE id = $1", [intentId]);
   } else {
-    await query(
-      "UPDATE action_intents SET status = $1, lease_owner = NULL, lease_expires_at = NULL WHERE id = $2",
-      [status, intentId]
-    );
+    await query("UPDATE action_intents SET status = $1, lease_expires_at = NULL WHERE id = $2", [
+      status,
+      intentId,
+    ]);
   }
 
   log.debug({ intentId, status }, "Intent failed");
@@ -199,9 +170,9 @@ export async function failIntent(intentId: number, status: 'pending' | 'skipped'
 /**
  * W2: Defer an intent (e.g., quiet hours).
  */
-export async function deferIntent(intentId: number, resumeAt: Date): Promise<void> {
+export async function deferIntent(intentId: string, resumeAt: Date): Promise<void> {
   await query(
-    "UPDATE action_intents SET status = 'deferred', resume_at = $1, lease_owner = NULL, lease_expires_at = NULL WHERE id = $2",
+    "UPDATE action_intents SET status = 'deferred', resume_at = $1, lease_expires_at = NULL WHERE id = $2",
     [resumeAt, intentId]
   );
   log.debug({ intentId, resumeAt }, "Intent deferred");
@@ -210,21 +181,16 @@ export async function deferIntent(intentId: number, resumeAt: Date): Promise<voi
 /**
  * W2: Expire an intent.
  */
-export async function expireIntent(intentId: number): Promise<void> {
-  await query(
-    "UPDATE action_intents SET status = 'expired', lease_owner = NULL, lease_expires_at = NULL WHERE id = $1",
-    [intentId]
-  );
+export async function expireIntent(intentId: string): Promise<void> {
+  await query("UPDATE action_intents SET status = 'expired' WHERE id = $1", [intentId]);
   log.debug({ intentId }, "Intent expired");
 }
 
 /**
- * W2: Janitor - handle all intent lifecycle states.
- * - Deferred with resume_at due
- * - Pending with next_retry_at due
- * - Failed after max_attempts (dead-letter + alert)
- * - Expired (cart converted / link expired)
- * - Stuck (awaiting_gateway timeout: 2x max observed gateway latency, min 90s)
+ * W2: Janitor - handle intent lifecycle states on the remote shape.
+ * - Deferred with resume_at due → pending
+ * - Stale awaiting_gateway (>90s) → pending (dedupe_key guard prevents double-links)
+ * - Old pending/deferred past their window_day → expired
  */
 export async function runJanitor(): Promise<number> {
   let resolved = 0;
@@ -237,73 +203,23 @@ export async function runJanitor(): Promise<number> {
   );
   resolved += deferred.length;
 
-  // 2. Retry pending intents with next_retry_at due
-  const { rows: retryable } = await query(
-    `UPDATE action_intents SET status = 'pending', next_retry_at = NULL
-     WHERE status = 'pending' AND next_retry_at <= NOW()
+  // 2. Reset stale awaiting_gateway intents (>90s, lease presumably lost)
+  const { rows: staleGateway } = await query(
+    `UPDATE action_intents SET status = 'pending', lease_expires_at = NULL
+     WHERE status = 'awaiting_gateway' AND created_at < NOW() - INTERVAL '90 seconds'
      RETURNING id`
   );
-  resolved += retryable.length;
+  resolved += staleGateway.length;
 
-  // 3. Expire stale awaiting_gateway intents (2x max observed latency, min 90s)
-  const { rows: staleGateway } = await query(
-    `UPDATE action_intents SET status = 'stuck'
-     WHERE status = 'awaiting_gateway' AND created_at < NOW() - INTERVAL '90 seconds'
-     RETURNING id, audit_seq`
-  );
-
-  for (const intent of staleGateway) {
-    if (intent.audit_seq) {
-      // Check if payment link exists
-      const { rows: auditRows } = await query(
-        "SELECT outcome FROM audit_log WHERE seq = $1 AND outcome = 'SUCCESS'",
-        [intent.audit_seq]
-      );
-
-      if (auditRows.length > 0) {
-        await query("UPDATE action_intents SET status = 'done' WHERE id = $1", [intent.id]);
-        resolved++;
-        continue;
-      }
-    }
-
-    // Reset to pending for retry
-    await query("UPDATE action_intents SET status = 'pending' WHERE id = $1", [intent.id]);
-    resolved++;
-  }
-
-  // 4. Dead-letter failed intents after max attempts
-  const { rows: maxFailed } = await query(
-    `SELECT id FROM action_intents
-     WHERE status = 'failed' AND attempt_count >= max_attempts
-     AND created_at < NOW() - INTERVAL '1 hour'`
-  );
-
-  for (const intent of maxFailed) {
-    await appendAuditSerialized({
-      actor: 'IntentJanitor',
-      action: 'dead_letter_intent',
-      params_json: { intentId: intent.id },
-      decision: 'BLOCK',
-      policy_checks_json: {},
-      rationale_json: { intentId: intent.id, reason: 'max_attempts_exceeded_dead_letter' },
-      outcome: 'FAILED',
-    });
-    resolved++;
-  }
-
-  // 5. Expire old pending intents (business window passed)
-  const { rows: expiredPending } = await query(
+  // 3. Expire intents past their business window
+  const { rows: expired } = await query(
     `UPDATE action_intents SET status = 'expired'
      WHERE status IN ('pending', 'deferred')
-     AND window_end < NOW()
+     AND window_day < TO_CHAR(NOW() AT TIME ZONE 'Asia/Kolkata', 'YYYY-MM-DD')
      RETURNING id`
   );
-  resolved += expiredPending.length;
+  resolved += expired.length;
 
-  log.info({ resolved }, "Janitor run complete");
+  if (resolved > 0) log.info({ resolved }, "Janitor run complete");
   return resolved;
 }
-
-// Import crypto at top level
-import crypto from "node:crypto";

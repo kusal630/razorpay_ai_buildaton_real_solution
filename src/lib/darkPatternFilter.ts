@@ -4,12 +4,18 @@ const log = createLogger("darkPatternFilter");
 
 // H4: Banned patterns for dark patterns
 const DARK_PATTERNS = [
-  /only\s+\d+\s+(?:left|remaining|available)/i, // Fabricated scarcity
+  /only\s+\d+\s+(?:left|remaining|available)/i, // Fabricated scarcity (grounded stock claims are redacted before this check)
   /(?:hurry|act\s+now|last\s+(?:chance|chance|chance))/i, // False urgency
   /(?:\d+\s+(?:min|hour|sec|seconds|minutes|hours)\s+(?:left|remaining))/i, // Fake countdown
   /(?:exclusive|special)\s+(?:offer|deal|discount)\s+(?:only|just)/i, // False exclusivity
   /(?:guaranteed|100%\s+(?:success|profit|return))/i, // False guarantees
   /(?:limited\s+time|ending\s+(?:soon|today))/i, // False time pressure
+  // G5 (v4.3): stored-instrument implications — there IS no stored instrument.
+  // "One tap to pay" stays allowed (no charge implication).
+  /one-tap\s+charge/i,
+  /instant\s+charge/i,
+  /instantcharge/i,
+  /everyone\s+is\s+buying/i, // False consensus
 ];
 
 // H4: Required disclosures for incentive offers

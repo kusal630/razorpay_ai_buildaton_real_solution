@@ -1,93 +1,124 @@
 import { Router, Request, Response } from "express";
-import { handleChatMessage } from "../agents/chatAgent.js";
+import { query } from "../db.js";
+import { resolvePayToken } from "../lib/payToken.js";
 import { createLogger } from "../logger.js";
 
 const log = createLogger("chat");
 export const chatRouter = Router();
 
-// Serve pay page
-chatRouter.get("/pay/:seq", async (req: Request, res: Response) => {
-  const { seq } = req.params;
-  res.send(`
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <title>Sellable - Secure Checkout</title>
-      <meta charset="utf-8">
-      <meta name="viewport" content="width=device-width, initial-scale=1">
-      <meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline' https://*.razorpay.com;">
-      <style>
-        body { font-family: -apple-system, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; }
-        .chat-box { border: 1px solid #ddd; border-radius: 8px; padding: 10px; height: 300px; overflow-y: auto; margin: 10px 0; }
-        .message { margin: 5px 0; padding: 8px 12px; border-radius: 16px; max-width: 80%; }
-        .user { background: #007bff; color: white; margin-left: auto; }
-        .agent { background: #f1f1f1; }
-        input { width: 80%; padding: 10px; border: 1px solid #ddd; border-radius: 4px; }
-        button { padding: 10px 20px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; }
-      </style>
-    </head>
-    <body>
-      <h1>Secure Checkout</h1>
-      <div id="chat" class="chat-box"></div>
-      <div style="display: flex; gap: 10px;">
-        <input type="text" id="msg" placeholder="Ask about this offer...">
-        <button onclick="send()">Send</button>
-      </div>
-      <script>
-        const seq = '${seq}';
-        const sessionToken = '${crypto.randomUUID()}';
-        const chat = document.getElementById('chat');
-
-        function addMessage(text, isUser) {
-          const div = document.createElement('div');
-          div.className = 'message ' + (isUser ? 'user' : 'agent');
-          div.textContent = text;
-          chat.appendChild(div);
-          chat.scrollTop = chat.scrollHeight;
+// GET /pay/:token — masked PII, offer terms, "Pay" button
+chatRouter.get("/pay/:token", async (req: Request, res: Response) => {
+  const { token } = req.params;
+  // Sequential probing → 404
+  if (/^\d+$/.test(token)) { res.status(404).json({ error: "Not found" }); return; }
+  try {
+    const resolved = await resolvePayToken(token);
+    if (!resolved) { res.status(404).json({ error: "Invalid or expired token" }); return; }
+    const { rows: linkRows } = await query(
+      `SELECT short_url, amount_paise, incentive_paise, razorpay_link_id,
+              expire_by, offer_expires_by, cart_id, merchant_id
+       FROM payment_links WHERE audit_seq = $1 AND status = 'live' LIMIT 1`,
+      [resolved.auditSeq]
+    );
+    const link = linkRows[0];
+    // Enforced deadline: the offer window when shorter than the gateway floor.
+    if (link && link.offer_expires_by && new Date(link.offer_expires_by) < new Date(link.expire_by)) {
+      link.expire_by = link.offer_expires_by;
+    }
+    // N1 (v4.2): control-arm tokens get NO chat widget — decided server-side.
+    // Resolve the offer's customer via the link row and check her experiment arm.
+    let chatEnabled = true;
+    let arm: string | null = null;
+    try {
+      const { rows: custRows } = await query(
+        `SELECT customer_id FROM payment_links WHERE audit_seq = $1 LIMIT 1`,
+        [resolved.auditSeq]
+      );
+      const customerId = custRows[0]?.customer_id;
+      if (customerId) {
+        const { getCustomerArm } = await import("../lib/experiment.js");
+        const armInfo = await getCustomerArm(customerId);
+        arm = armInfo?.arm || null;
+        chatEnabled = arm !== "control";
+      }
+    } catch { /* fail open: widget stays enabled */ }
+    // G3 (v4.3): live countdown + live stock + trust strip, all rendered from
+    // the SAME sources the sweeper/policy enforce. A tampered/unknown source
+    // simply omits the claim — the page never renders what it can't ground.
+    let expires_in_seconds: number | undefined;
+    if (link?.expire_by) {
+      expires_in_seconds = Math.max(0, Math.floor((new Date(link.expire_by).getTime() - Date.now()) / 1000));
+    }
+    let stock: { product_id: string; name: string; stock: number }[] | undefined;
+    if (link?.cart_id) {
+      try {
+        const { rows: stockRows } = await query(
+          `SELECT p.id AS product_id, p.name, p.stock
+           FROM cart_items ci JOIN products p ON p.id = ci.product_id
+           WHERE ci.cart_id = $1`,
+          [link.cart_id]
+        );
+        if (stockRows.length > 0 && stockRows.every((r: any) => r.stock != null)) {
+          stock = stockRows.map((r: any) => ({ product_id: r.product_id, name: r.name, stock: Number(r.stock) }));
         }
-
-        async function send() {
-          const input = document.getElementById('msg');
-          const msg = input.value.trim();
-          if (!msg) return;
-          addMessage(msg, true);
-          input.value = '';
-
-          const res = await fetch('/chat/' + seq, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ message: msg, session_token: sessionToken }),
-          });
-          const data = await res.json();
-          addMessage(data.response, false);
+      } catch { /* omit stock claim */ }
+    }
+    let merchant_name: string | undefined;
+    if (link?.merchant_id) {
+      try {
+        const { rows: mRows } = await query("SELECT name FROM merchants WHERE id = $1", [link.merchant_id]);
+        merchant_name = mRows[0]?.name || undefined;
+      } catch { /* omit merchant claim */ }
+    }
+    // G8 social line, only from a fresh row (stale → suppressed).
+    let social_proof: { product_id: string; units_7d: number }[] | undefined;
+    if (link?.cart_id) {
+      try {
+        const { rows: spRows } = await query(
+          `SELECT ci.product_id, s.units_7d FROM cart_items ci
+           JOIN social_stats s ON s.product_id = ci.product_id
+           WHERE ci.cart_id = $1
+           AND s.computed_at > NOW() - INTERVAL '26 hours'`,
+          [link.cart_id]
+        );
+        if (spRows.length > 0) {
+          social_proof = spRows.map((r: any) => ({ product_id: r.product_id, units_7d: Number(r.units_7d) }));
         }
-
-        document.getElementById('msg').addEventListener('keypress', (e) => {
-          if (e.key === 'Enter') send();
-        });
-
-        addMessage('Welcome! How can I help you with this offer?', false);
-      </script>
-    </body>
-    </html>
-  `);
+      } catch { /* table may not exist yet — omit */ }
+    }
+    res.json({
+      token, amount_paise: resolved.amountPaise, masked_pii: resolved.maskedPii,
+      pay_url: link?.short_url || "", incentive_paise: link?.incentive_paise || 0,
+      razorpay_link_id: link?.razorpay_link_id || "",
+      chat_enabled: chatEnabled,
+      experiment_arm: arm,
+      ...(expires_in_seconds !== undefined ? { expires_in_seconds } : {}),
+      ...(stock ? { stock } : {}),
+      trust: {
+        ...(merchant_name ? { merchant_name } : {}),
+        secured_by: "Razorpay",
+      },
+      ...(social_proof ? { social_proof } : {}),
+    });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
-// Chat endpoint
+// POST /chat/:seq — ChatAgent explains offer, request_discount routes through PolicyEngine
 chatRouter.post("/chat/:seq", async (req: Request, res: Response) => {
   const { seq } = req.params;
-  const { message, session_token } = req.body;
-
-  if (!message || !session_token) {
-    res.status(400).json({ error: "message and session_token required" });
-    return;
-  }
-
+  const { message } = req.body;
+  if (!message) { res.status(400).json({ error: "message required" }); return; }
   try {
-    const result = await handleChatMessage(seq, message, session_token);
-    res.json(result);
-  } catch (err: any) {
-    log.error({ seq, error: err.message }, "Chat error");
-    res.status(500).json({ response: "Sorry, I'm having trouble. Please try again." });
-  }
+    const { rows } = await query("SELECT * FROM audit_log WHERE seq = $1", [parseInt(seq)]);
+    if (!rows[0]) { res.status(404).json({ error: "Audit seq not found" }); return; }
+    const { appendActivity } = await import("../lib/activity.js");
+    await appendActivity({
+      merchant_id: "5a3ac6ce-b2c7-4b1f-a9db-45296841f30b", actor: "ChatAgent", type: "INTENT",
+      summary: `Chat message on seq ${seq}: "${message.slice(0, 50)}"`,
+      data: { seq: parseInt(seq), message: message.slice(0, 200) },
+    });
+    const { handleChatMessage } = await import("../agents/chatAgent.js");
+    const result = await handleChatMessage(seq, message, `pay-${seq}`);
+    res.json({ message: result.response, action: result.action || "explain", audit_seq: parseInt(seq) });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
 });

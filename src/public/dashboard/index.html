@@ -1,119 +1,324 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <title>Sellable Dashboard</title>
+  <title>Sellable Ops Console</title>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
-    body { font-family: -apple-system, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }
-    .container { max-width: 1200px; margin: 0 auto; }
-    .card { background: white; border-radius: 8px; padding: 20px; margin: 10px 0; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
-    h1 { color: #333; }
-    h2 { color: #555; border-bottom: 2px solid #007bff; padding-bottom: 5px; }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0d1117; color: #c9d1d9; }
+    .footer-mode { background: #1a1a2e; color: #f0ad4e; text-align: center; padding: 6px; font-size: 12px; border-bottom: 1px solid #333; }
+    #login-page { max-width: 400px; margin: 80px auto; background: #161b22; border-radius: 8px; padding: 30px; border: 1px solid #30363d; }
+    #login-page h2 { color: #58a6ff; margin-bottom: 20px; }
+    #login-page input { width: 100%; padding: 10px; margin: 8px 0; background: #0d1117; border: 1px solid #30363d; color: #c9d1d9; border-radius: 4px; font-size: 14px; }
+    #login-page button { width: 100%; padding: 10px; background: #238636; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; font-weight: 600; }
+    #login-page button:hover { background: #2ea043; }
+    .hidden { display: none !important; }
+    .tabs { display: flex; background: #161b22; border-bottom: 1px solid #30363d; padding: 0 20px; }
+    .tab { padding: 12px 20px; cursor: pointer; color: #8b949e; border-bottom: 2px solid transparent; font-size: 13px; font-weight: 500; }
+    .tab:hover { color: #c9d1d9; }
+    .tab.active { color: #58a6ff; border-bottom-color: #58a6ff; }
+    .panel { display: none; padding: 20px; }
+    .panel.active { display: block; }
+    .card { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 16px; margin: 10px 0; }
+    .card h3 { color: #58a6ff; font-size: 14px; margin-bottom: 12px; text-transform: uppercase; letter-spacing: 0.5px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 12px; }
+    .stat { background: #0d1117; border: 1px solid #30363d; border-radius: 4px; padding: 16px; text-align: center; }
+    .stat .value { font-size: 28px; font-weight: 700; color: #f0f6fc; }
+    .stat .label { font-size: 11px; color: #8b949e; text-transform: uppercase; margin-top: 4px; }
+    .stat.green .value { color: #3fb950; }
+    .stat.gray .value { color: #8b949e; }
+    .btn { padding: 8px 16px; background: #21262d; color: #c9d1d9; border: 1px solid #30363d; border-radius: 4px; cursor: pointer; font-size: 12px; margin: 4px; }
+    .btn:hover { background: #30363d; }
+    .btn-primary { background: #238636; border-color: #238636; color: white; }
+    .btn-danger { background: #da3633; border-color: #da3633; color: white; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: 600; }
+    .badge-green { background: #238636; color: white; }
+    .badge-red { background: #da3633; color: white; }
+    .badge-yellow { background: #9e6a03; color: white; }
+    .badge-blue { background: #1f6feb; color: white; }
+    .badge-gray { background: #484f58; color: white; }
+    #feed { max-height: 600px; overflow-y: auto; font-family: 'JetBrains Mono', 'Fira Code', monospace; font-size: 12px; }
+    .feed-row { padding: 8px 12px; border-bottom: 1px solid #21262d; display: flex; align-items: center; gap: 12px; }
+    .feed-row:hover { background: #161b22; }
+    .feed-ts { color: #484f58; min-width: 80px; font-size: 11px; }
+    .feed-actor { min-width: 90px; font-weight: 600; }
+    .feed-type { min-width: 130px; }
+    .feed-summary { flex: 1; color: #8b949e; }
+    .feed-amount { min-width: 80px; text-align: right; color: #3fb950; }
     table { width: 100%; border-collapse: collapse; }
-    th, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid #eee; }
-    th { background: #f8f9fa; }
-    .status-ok { color: green; }
-    .status-error { color: red; }
-    .btn { padding: 8px 16px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; margin: 5px; }
-    .btn-danger { background: #dc3545; }
-    .btn-success { background: #28a745; }
-    #login { max-width: 400px; margin: 100px auto; }
-    .hidden { display: none; }
+    th, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid #21262d; font-size: 13px; }
+    th { color: #8b949e; font-weight: 500; background: #0d1117; }
+    td { color: #c9d1d9; }
+    .doctor-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 8px; }
+    .doctor-item { display: flex; align-items: center; gap: 8px; padding: 8px; background: #0d1117; border-radius: 4px; }
+    .doctor-dot { width: 10px; height: 10px; border-radius: 50%; }
+    .doctor-dot.green { background: #3fb950; }
+    .doctor-dot.red { background: #da3633; }
+    .doctor-dot.yellow { background: #d29922; }
+    #chain-result { margin-top: 10px; padding: 10px; border-radius: 4px; font-family: monospace; font-size: 13px; }
+    .chain-pass { background: #0d2818; border: 1px solid #238636; color: #3fb950; }
+    .chain-fail { background: #2d0d0d; border: 1px solid #da3633; color: #f85149; }
   </style>
 </head>
 <body>
-  <div class="container">
-    <div id="login" class="card">
-      <h2>Login</h2>
-      <form id="loginForm">
-        <input type="email" id="email" placeholder="Email" style="width:100%;padding:8px;margin:5px 0;">
-        <input type="password" id="password" placeholder="Password" style="width:100%;padding:8px;margin:5px 0;">
-        <button type="submit" class="btn" style="width:100%">Login</button>
-      </form>
+  <div class="footer-mode">TEST ENVIRONMENT — Razorpay test mode; notifications are not delivered; links are the delivery path. Ledger entries are recorded, pre-settlement.</div>
+
+  <div id="login-page" class="card">
+    <h2>Sellable Ops Console</h2>
+    <form id="loginForm">
+      <input type="email" id="email" placeholder="Email" value="admin@sellable.dev">
+      <input type="password" id="password" placeholder="Password" value="admin123">
+      <button type="submit">Login</button>
+    </form>
+  </div>
+
+  <div id="app" class="hidden">
+    <div class="tabs">
+      <div class="tab active" data-tab="overview">Overview</div>
+      <div class="tab" data-tab="feed">Live Agent Console</div>
+      <div class="tab" data-tab="ledger">Ledger</div>
+      <div class="tab" data-tab="approvals">Approvals</div>
+      <div class="tab" data-tab="qa">Buyers & QA</div>
     </div>
 
-    <div id="dashboard" class="hidden">
-      <h1>Sellable Dashboard</h1>
-      <div class="card">
-        <h2>Revenue Attribution</h2>
-        <div id="revenue"></div>
+    <div id="tab-overview" class="panel active">
+      <div id="alert-banner" style="display:none"></div>
+      <div class="card" id="doctor-card">
+        <h3>System Health</h3>
+        <div class="doctor-grid" id="doctor-grid"></div>
+      </div>
+      <div class="grid">
+        <div class="stat green"><div class="value" id="revenue-real">₹0</div><div class="label">REAL Revenue</div></div>
+        <div class="stat gray"><div class="value" id="revenue-sim">₹0</div><div class="label">SIMULATED Revenue</div></div>
+        <div class="stat"><div class="value" id="orders-count">0</div><div class="label">Orders</div></div>
+        <div class="stat"><div class="value" id="budget-gauge">0 / 0</div><div class="label">Budget (reserved/cap)</div></div>
       </div>
       <div class="card">
-        <h2>Audit Trail</h2>
-        <div id="audit"></div>
-        <button class="btn" onclick="verifyChain()">Verify Chain</button>
-        <button class="btn" onclick="createCheckpoint()">Create Checkpoint</button>
+        <h3>Kill Switch</h3>
+        <button class="btn" id="kill-toggle" onclick="toggleKill()">Toggle Kill Switch</button>
+        <span id="kill-status" style="margin-left:12px"></span>
       </div>
       <div class="card">
-        <h2>Approvals</h2>
-        <div id="approvals"></div>
+        <h3>Copy Strategy — which psychology pays (min-n honest)</h3>
+        <div style="margin-top:12px">
+          <table id="strategy-table">
+            <thead><tr><th>Strategy</th><th>n</th><th>Successes</th><th>Rate</th><th>State</th></tr></thead>
+            <tbody id="strategy-body"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div id="tab-feed" class="panel">
+      <div class="card">
+        <h3>Live Agent Console <span class="badge badge-blue" id="feed-count">0</span></h3>
+        <div id="feed"></div>
+      </div>
+    </div>
+
+    <div id="tab-ledger" class="panel">
+      <div class="card">
+        <h3>Audit Ledger</h3>
+        <button class="btn btn-primary" onclick="verifyChain()">Verify Chain</button>
+        <button class="btn" onclick="createCheckpoint()">Checkpoint Now</button>
+        <div id="chain-result"></div>
+        <div style="margin-top:12px">
+          <table id="ledger-table">
+            <thead><tr><th>Seq</th><th>Actor</th><th>Action</th><th>Decision</th><th>Outcome</th><th>Time</th></tr></thead>
+            <tbody id="ledger-body"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div id="tab-approvals" class="panel">
+      <div class="card">
+        <h3>Pending Escalations</h3>
+        <div id="approvals-list"></div>
+      </div>
+    </div>
+
+    <div id="tab-qa" class="panel">
+      <div class="card">
+        <h3>QA Tools</h3>
+        <button class="btn" onclick="qaInjectAbandoned()">Inject Abandoned Cart</button>
+        <button class="btn" onclick="qaInjectFailure()">Inject Payment Failure</button>
+        <button class="btn" onclick="qaPolicyDrill()">Policy Drill (20%→15%)</button>
+        <button class="btn" onclick="qaFastForward()">Fast-Forward Deferred</button>
       </div>
       <div class="card">
-        <h2>System Status</h2>
-        <div id="status"></div>
+        <h3>Reconcile</h3>
+        <button class="btn btn-primary" onclick="reconcile()">Run Reconcile</button>
+        <div id="reconcile-result" style="margin-top:10px"></div>
       </div>
     </div>
   </div>
 
   <script>
     let csrfToken = '';
+    let eventSource = null;
+    const feedRows = [];
 
     document.getElementById('loginForm').addEventListener('submit', async (e) => {
       e.preventDefault();
       const res = await fetch('/ops/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          email: document.getElementById('email').value,
-          password: document.getElementById('password').value,
-        }),
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: document.getElementById('email').value, password: document.getElementById('password').value }),
       });
-      if (res.ok) {
-        const data = await res.json();
-        csrfToken = data.csrfToken;
-        document.getElementById('login').classList.add('hidden');
-        document.getElementById('dashboard').classList.remove('hidden');
-        loadDashboard();
-      } else {
-        alert('Login failed');
-      }
+      if (res.ok) { const data = await res.json(); csrfToken = data.csrfToken; document.getElementById('login-page').classList.add('hidden'); document.getElementById('app').classList.remove('hidden'); init(); }
+      else alert('Login failed');
     });
 
-    async function loadDashboard() {
-      const res = await fetch('/ops/dashboard');
-      const data = await res.json();
+    document.querySelectorAll('.tab').forEach(tab => {
+      tab.addEventListener('click', () => {
+        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+        document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+        tab.classList.add('active');
+        document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
+      });
+    });
 
-      document.getElementById('revenue').innerHTML = '<table><tr><th>Source</th><th>Count</th><th>Total</th></tr>' +
-        data.revenue.map(r => `<tr><td>${r.source}</td><td>${r.count}</td><td>₹${(r.total/100).toFixed(2)}</td></tr>`).join('') +
-        '</table>';
+    async function init() { loadState(); startSSE(); loadLedger(); loadApprovals(); loadStrategies(); }
+    async function loadStrategies() {
+      try {
+        const res = await fetch('/api/strategy-stats');
+        const d = await res.json();
+        document.getElementById('strategy-body').innerHTML = (d.rows || []).map(r =>
+          `<tr><td>${r.strategy}</td><td>${r.attempts}</td><td>${r.successes}</td><td>${r.rate == null ? '—' : (r.rate * 100).toFixed(1) + '%'}</td><td>${r.state === 'ready' ? 'ready' : `collecting — n/${d.min_n}`}</td></tr>`
+        ).join('') || `<tr><td colspan="5">No strategy data yet — collecting.</td></tr>`;
+      } catch {}
+    }
 
-      document.getElementById('audit').innerHTML = '<table><tr><th>Outcome</th><th>Count</th></tr>' +
-        data.audit.map(a => `<tr><td>${a.outcome}</td><td>${a.count}</td></tr>`).join('') +
-        '</table>';
+    async function loadState() {
+      const res = await fetch('/api/state');
+      if (!res.ok) return;
+      const s = await res.json();
+      document.getElementById('revenue-real').textContent = '₹' + ((s.revenue?.real || 0) / 100).toFixed(0);
+      document.getElementById('revenue-sim').textContent = '₹' + ((s.revenue?.sim || 0) / 100).toFixed(0);
+      document.getElementById('orders-count').textContent = s.revenue?.orders || 0;
+      document.getElementById('budget-gauge').textContent = `${(s.budget?.reserved_paise || 0) / 100} / ${(s.budget?.cap_paise || 0) / 100}`;
+      document.getElementById('kill-status').innerHTML = s.kill_switch ? '<span class="badge badge-red">KILLED</span>' : '<span class="badge badge-green">ACTIVE</span>';
 
-      document.getElementById('approvals').innerHTML = '<table><tr><th>Status</th><th>Count</th></tr>' +
-        data.approvals.map(a => `<tr><td>${a.status}</td><td>${a.count}</td></tr>`).join('') +
-        '</table>';
+      // S4 (v4.2): refund-anomaly banner (alarm only)
+      const bannerEl = document.getElementById('alert-banner');
+      const refundAlert = (s.alerts || []).find(a => a.banner === 'refund_anomaly');
+      if (refundAlert) {
+        const p = refundAlert.payload || {};
+        bannerEl.style.display = 'block';
+        bannerEl.innerHTML = `<div class="card" style="border-left:4px solid #f0b429"><h3>⚠ refund_anomaly</h3><div>Refunds last hour: ${p.hour_count || 0} (₹${((p.hour_paise || 0) / 100).toFixed(0)}) on ${p.scope || '?'}. Alarm only — no auto-block.</div></div>`;
+      } else {
+        bannerEl.style.display = 'none';
+        bannerEl.innerHTML = '';
+      }
+
+      if (s.doctor) {
+        const g = document.getElementById('doctor-grid');
+        g.innerHTML = Object.entries(s.doctor).map(([k, v]) => `<div class="doctor-item"><div class="doctor-dot ${v}"></div><span>${k}: ${v}</span></div>`).join('');
+      }
+    }
+
+    function startSSE() {
+      if (eventSource) eventSource.close();
+      eventSource = new EventSource('/api/feed');
+      eventSource.onmessage = (e) => {
+        try {
+          const d = JSON.parse(e.data);
+          if (d.type === 'connected') return;
+          feedRows.unshift(d);
+          if (feedRows.length > 500) feedRows.pop();
+          renderFeed();
+        } catch {}
+      };
+      eventSource.onerror = () => { setTimeout(() => { if (!eventSource || eventSource.readyState === 2) startSSE(); }, 3000); };
+    }
+
+    function renderFeed() {
+      const el = document.getElementById('feed');
+      document.getElementById('feed-count').textContent = feedRows.length;
+      el.innerHTML = feedRows.slice(0, 200).map(r => {
+        const ts = new Date(r.ts || r.created_at || Date.now()).toLocaleTimeString();
+        const actor = r.actor || '';
+        const type = r.type || r.action || '';
+        const summary = r.summary || r.message || '';
+        const amount = r.amount_paise ? '₹' + (r.amount_paise / 100).toFixed(0) : '';
+        const actorColor = actor === 'RecoveryBot' ? '#58a6ff' : actor === 'UpsellBot' ? '#a371f7' : actor === 'MoneyBus' ? '#3fb950' : actor === 'Admin' ? '#f0ad4e' : '#8b949e';
+        const badge = r.simulated ? '<span class="badge badge-gray">SIMULATED</span>' : '';
+        const blocked = (r.severity === 'warning') ? '<span class="badge badge-red">BLOCKED</span>' : '';
+        const dataStr = r.data ? JSON.stringify(r.data).slice(0, 120) : '';
+        return `<div class="feed-row"><span class="feed-ts">${ts}</span><span class="feed-actor" style="color:${actorColor}">${actor}</span><span class="feed-type">${type} ${badge} ${blocked}</span><span class="feed-summary">${summary}</span><span class="feed-amount">${amount}</span></div>`;
+      }).join('');
+    }
+
+    async function loadLedger() {
+      const res = await fetch('/api/ledger?limit=50');
+      const rows = await res.json();
+      document.getElementById('ledger-body').innerHTML = rows.map(r => `<tr><td>${r.seq}</td><td>${r.actor}</td><td>${r.action}</td><td>${r.decision}</td><td><span class="badge ${r.outcome==='SUCCESS'||r.outcome==='LINK_CREATED'?'badge-green':r.outcome==='BLOCKED'?'badge-red':'badge-yellow'}">${r.outcome}</span></td><td>${new Date(r.ts).toLocaleTimeString()}</td></tr>`).join('');
+    }
+
+    async function loadApprovals() {
+      const res = await fetch('/api/approvals');
+      const rows = await res.json();
+      document.getElementById('approvals-list').innerHTML = rows.length === 0 ? '<p style="color:#8b949e">No pending escalations</p>' : rows.map(r => `<div class="card" style="margin:8px 0"><p>${r.action || 'escalation'} — audit_seq ${r.audit_seq || 'N/A'}</p><button class="btn btn-primary" onclick="decideApproval('${r.id}','approved')">Approve</button><button class="btn btn-danger" onclick="decideApproval('${r.id}','denied')">Deny</button></div>`).join('');
+    }
+
+    async function decideApproval(id, decision) {
+      await fetch('/api/approvals/' + id, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken }, body: JSON.stringify({ decision }) });
+      loadApprovals();
     }
 
     async function verifyChain() {
-      const res = await fetch('/ops/verify-chain', {
-        method: 'POST',
-        headers: { 'X-CSRF-Token': csrfToken },
-      });
-      const data = await res.json();
-      alert(data.valid ? 'Chain valid!' : `Chain broken at seq ${data.brokenAt}`);
+      const res = await fetch('/api/ledger/verify');
+      const d = await res.json();
+      const el = document.getElementById('chain-result');
+      el.className = d.valid ? 'chain-pass' : 'chain-fail';
+      el.textContent = d.valid ? `PASS — head_hash: ${d.head_hash?.slice(0, 16)}... (seq ${d.head_seq})` : `FAIL — broken at seq ${d.brokenAt}`;
     }
 
     async function createCheckpoint() {
-      const res = await fetch('/ops/checkpoint', {
-        method: 'POST',
-        headers: { 'X-CSRF-Token': csrfToken },
-      });
-      const data = await res.json();
-      alert(`Checkpoint created: ${data.id}`);
+      const res = await fetch('/api/checkpoint', { method: 'POST', headers: { 'X-CSRF-Token': csrfToken } });
+      const d = await res.json();
+      alert(d.id ? `Checkpoint: ${d.id} → ${d.file}` : 'No audit rows');
     }
+
+    async function toggleKill() {
+      const res = await fetch('/api/state');
+      const s = await res.json();
+      const newEnabled = !s.kill_switch;
+      await fetch('/api/kill-switch', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken }, body: JSON.stringify({ enabled: newEnabled }) });
+      loadState();
+    }
+
+    async function qaInjectAbandoned() {
+      await fetch('/api/qa/inject-abandoned', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken }, body: JSON.stringify({}) });
+      alert('Abandoned cart injected — watch the Live Agent Console');
+    }
+
+    async function qaInjectFailure() {
+      await fetch('/api/qa/inject-payment-failure', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken }, body: JSON.stringify({}) });
+      alert('Payment failure injected');
+    }
+
+    async function qaPolicyDrill() {
+      await fetch('/api/qa/policy-drill', { method: 'POST', headers: { 'X-CSRF-Token': csrfToken } });
+      alert('Policy drill executed — 20% BLOCKED, 15% fallback');
+    }
+
+    async function qaFastForward() {
+      await fetch('/api/qa/fast-forward', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken }, body: JSON.stringify({}) });
+      alert('Deferred intents fast-forwarded');
+    }
+
+    async function reconcile() {
+      const el = document.getElementById('reconcile-result');
+      el.textContent = 'Reconciling...';
+      const res = await fetch('/api/reconcile', { method: 'POST', headers: { 'X-CSRF-Token': csrfToken } });
+      const d = await res.json();
+      el.textContent = `Matched: ${d.matched}, Mismatches: ${d.mismatches}, Total: ${d.total}`;
+    }
+
+    // Auto-refresh overview every 15s
+    setInterval(() => { if (!document.getElementById('app').classList.contains('hidden')) loadState(); }, 15000);
   </script>
 </body>
 </html>

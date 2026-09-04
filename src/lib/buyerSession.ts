@@ -176,18 +176,19 @@ export async function purchaseIntent(
   }
 
   // Execute through money bus with snapshotted amount
-  const { seq, result } = await moneyBus.execute(
+  const { seq, data } = await moneyBus.execute(
     "BuyerAgent",
     {
       type: "create_payment_link",
       params: {
-        amount: amountPaise, // V6: charges ONLY the snapshotted total
+        amount: amountPaise,
         reference_id: "",
         notes: { session_id: sessionId, price_version: session.price_version },
       },
     },
     policyResult,
-    { sessionId, amountPaise, paymentMethodHint }
+    { sessionId, amountPaise, paymentMethodHint },
+    session.merchant_id || "5a3ac6ce-b2c7-4b1f-a9db-45296841f30b"
   );
 
   // V6: Check if still in intent status (single conditional update)
@@ -197,8 +198,8 @@ export async function purchaseIntent(
   );
 
   return {
-    orderId: (result as any)?.id,
-    paymentUrl: (result as any)?.short_url,
+    orderId: data?.order_id,
+    paymentUrl: data?.short_url,
     status: 'paid',
     auditSeq: seq,
   };

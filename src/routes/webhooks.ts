@@ -1,47 +1,72 @@
 import { Router, Request, Response } from "express";
 import crypto from "node:crypto";
 import { getConfig } from "../config.js";
-import { webhookQueue } from "../jobs/queue.js";
+import { query } from "../db.js";
+import { resolvePayment, fetchPaymentLink } from "../lib/moneyBus.js";
+import { appendActivity } from "../lib/activity.js";
 import { createLogger } from "../logger.js";
 
 const log = createLogger("webhook");
 export const webhookRouter = Router();
+const MERCHANT_ID = "5a3ac6ce-b2c7-4b1f-a9db-45296841f30b";
 
+// I6: express.raw mounted BEFORE JSON parsers (in server.ts), HMAC-SHA256 over raw body, constant-time compare
 webhookRouter.post("/webhooks/razorpay", async (req: Request, res: Response) => {
   const config = getConfig();
-
-  // Get raw body (express.raw middleware should have captured it)
   const body = req.body;
   const rawBody = Buffer.isBuffer(body) ? body : Buffer.from(JSON.stringify(body));
 
-  // Verify signature
   const signature = req.headers["x-razorpay-signature"] as string;
-  if (!signature) {
-    res.status(400).json({ error: "Missing signature" });
-    return;
-  }
+  if (!signature) { res.status(400).json({ error: "Missing signature" }); return; }
 
-  const expected = crypto
-    .createHmac("sha256", config.RAZORPAY_WEBHOOK_SECRET)
-    .update(rawBody)
-    .digest("hex");
-
+  const expected = crypto.createHmac("sha256", config.RAZORPAY_WEBHOOK_SECRET).update(rawBody).digest("hex");
   if (!crypto.timingSafeEqual(Buffer.from(expected, "hex"), Buffer.from(signature, "hex"))) {
     log.warn("Invalid webhook signature");
     res.status(401).json({ error: "Invalid signature" });
     return;
   }
 
-  // Parse and extract event
   const event = JSON.parse(rawBody.toString());
-  const eventId = event.payload?.payment?.entity?.id || event.payload?.payment_link?.entity?.id || crypto.randomUUID();
+  const eventType = event.event;
 
-  // Enqueue for async processing
-  await webhookQueue.add("process", {
-    event_id: eventId,
-    payload: rawBody.toString(),
+  // I6: event-id dedupe table
+  const eventId = event.payload?.payment_link?.entity?.id || event.payload?.payment?.entity?.id || crypto.randomUUID();
+  const { rows: existing } = await query("SELECT 1 FROM idempotency WHERE key = $1", [`webhook:${eventId}`]);
+  if (existing[0]) { log.debug({ eventId }, "Duplicate webhook, skipping"); res.json({ status: "ok" }); return; }
+  await query("INSERT INTO idempotency (key, request_hash, response_json) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING", [`webhook:${eventId}`, "", JSON.stringify({ received: true })]);
+
+  log.info({ eventId, type: eventType }, "Webhook received");
+
+  // Process payment_link events
+  if (eventType === "payment_link.paid") {
+    const linkId = event.payload?.payment_link?.entity?.id;
+    if (linkId) {
+      const { rows: links } = await query(
+        "SELECT id, razorpay_link_id, merchant_id, cart_id, customer_id, amount_paise, incentive_paise, audit_seq FROM payment_links WHERE razorpay_link_id = $1 AND status = 'live'",
+        [linkId]
+      );
+      if (links[0]) {
+        await resolvePayment({
+          id: links[0].id, merchant_id: links[0].merchant_id || MERCHANT_ID,
+          razorpay_link_id: linkId, audit_seq: links[0].audit_seq,
+          amount_paise: links[0].amount_paise, incentive_paise: links[0].incentive_paise,
+          cart_id: links[0].cart_id, customer_id: links[0].customer_id,
+        });
+      }
+    }
+  } else if (eventType === "payment_link.cancelled" || eventType === "payment_link.expired") {
+    const linkId = event.payload?.payment_link?.entity?.id;
+    if (linkId) {
+      const newStatus = eventType === "payment_link.expired" ? "expired" : "cancelled";
+      await query("UPDATE payment_links SET status = $1 WHERE razorpay_link_id = $2", [newStatus, linkId]);
+    }
+  }
+
+  await appendActivity({
+    merchant_id: MERCHANT_ID, actor: "Webhook", type: "INTENT",
+    summary: `Webhook: ${eventType} for ${eventId}`,
+    data: { event_type: eventType, event_id: eventId },
   });
 
-  log.info({ eventId, type: event.event }, "Webhook received, enqueued");
   res.json({ status: "ok" });
 });

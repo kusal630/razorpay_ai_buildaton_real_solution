@@ -1,5 +1,5 @@
 import { query } from "../db.js";
-import { checkQuietHours, checkIncentiveCap30d, getMaxIncentiveForFirstTouch } from "./policy2.js";
+import { checkQuietHours, checkIncentiveCap30d, checkIncentiveLifetime, getMaxIncentiveForFirstTouch } from "./policy2.js";
 import { checkTransactionalConsent, checkMarketingConsent } from "./consent.js";
 
 interface PolicyRule {
@@ -172,6 +172,32 @@ export async function evaluateAction(
       reasons.push(`customer already received incentive in last 30 days`);
     } else {
       checks.incentive_30d = "PASS";
+    }
+
+    // N3 (v4.2): lifetime incentive cap per identity — same suite, same trigger.
+    // Plain (₹0) proposals skip both caps.
+    const lifetime = await checkIncentiveLifetime(context.customerId);
+    if (lifetime.capped) {
+      checks.lifetime_incentive_cap = "BLOCK";
+      reasons.push(`lifetime_incentive_cap: identity used ${lifetime.count} incentives totaling ₹${(lifetime.totalPaise / 100).toFixed(0)} (max 3 / ₹300)`);
+    } else {
+      checks.lifetime_incentive_cap = "PASS";
+    }
+  }
+
+  // G9 (v4.3): engagement-fatigue — logged in policy_checks, enforced at the
+  // scheduler (spacing), never a hard BLOCK here (the ladder's designed
+  // sequence must still evaluate; the scan skips only doubled-window cases).
+  if (actionClass === "proactive_marketing_touch" && context.customerId) {
+    try {
+      const { getFatigueState } = await import("./fatigue.js");
+      const fatigue = await getFatigueState(context.customerId);
+      checks.fatigue = fatigue.multiplier === 2 ? "DOUBLE_SPACING" : "PASS";
+      if (fatigue.multiplier === 2) {
+        reasons.push(`fatigue: ${fatigue.consecutive_misses} unengaged touches, spacing doubled`);
+      }
+    } catch {
+      checks.fatigue = "PASS";
     }
   }
 

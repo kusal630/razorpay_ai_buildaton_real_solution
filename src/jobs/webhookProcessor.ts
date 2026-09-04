@@ -3,7 +3,7 @@ import { createWorker, webhookQueue } from "./queue.js";
 import { query } from "../db.js";
 import { updateAuditOutcome } from "../lib/auditLedger.js";
 import { processAbandonedCart } from "../agents/recoveryBot.js";
-import { processUpsell } from "../agents/upsellBot.js";
+import { processPaidOrder } from "../agents/upsellBot.js";
 import { createLogger } from "../logger.js";
 import { redactForPersist } from "../lib/redact.js";
 import { handleOverpayment, registerLink } from "../lib/linkLifecycle.js";
@@ -110,16 +110,21 @@ export const webhookProcessorWorker = createWorker("webhook-processing", async (
             await updateAuditOutcome(auditRows[0].seq, "SUCCESS", { order_id: orderId, status: "paid" });
           }
           // Trigger upsell
-          await processUpsell(orderId);
+          await processPaidOrder({ id: orderId, cart_id: null, customer_id: null, amount_paise: 0 });
         }
         break;
       }
       case "payment.failed": {
         const orderId = payloadData.order_id;
         if (orderId) {
+          // G4 (v4.3): record method + failure time for the retry bot (columns ensured, best effort).
+          try {
+            await query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_method TEXT");
+            await query("ALTER TABLE orders ADD COLUMN IF NOT EXISTS failed_at TIMESTAMPTZ");
+          } catch { /* already there */ }
           await query(
-            "UPDATE orders SET status = 'failed' WHERE id = $1",
-            [orderId]
+            "UPDATE orders SET status = 'failed', payment_method = COALESCE($2, payment_method), failed_at = NOW() WHERE id = $1",
+            [orderId, payloadData.method || payloadData.payment_method || null]
           );
           const { rows: auditRows } = await query(
             "SELECT seq FROM audit_log WHERE outcome_detail_json->>'result' LIKE $1 ORDER BY seq DESC LIMIT 1",

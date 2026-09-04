@@ -33,21 +33,90 @@ export function assignArm(identityToken: string, experimentId: string): 'treatme
 
 /**
  * W6: Assign a customer to an experiment arm and record it.
- * Uses identity_token, not cart_id (V5).
+ * Supports both the legacy shape (cart_id, experiment_id TEXT) and the
+ * Supabase shape (merchant_id, customer_id uuid, experiment_id uuid,
+ * PK(customer_id, experiment_id)). Uses identity_token, not cart_id (V5).
  */
-export async function assignToExperiment(identityToken: string, experimentId: string): Promise<'treatment' | 'control'> {
+export async function assignToExperiment(
+  identityToken: string,
+  experimentId: string,
+  opts?: { merchantId?: string; customerId?: string }
+): Promise<'treatment' | 'control'> {
   const arm = assignArm(identityToken, experimentId);
 
   // Store once per identity+experiment
-  await query(
-    `INSERT INTO cohort_assignments (cart_id, experiment_id, arm)
-     VALUES ($1, $2, $3)
-     ON CONFLICT (cart_id, experiment_id) DO NOTHING`,
-    [identityToken, experimentId, arm]
-  );
+  if (opts?.merchantId && opts?.customerId) {
+    await query(
+      `INSERT INTO cohort_assignments (merchant_id, customer_id, experiment_id, arm)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (customer_id, experiment_id) DO NOTHING`,
+      [opts.merchantId, opts.customerId, experimentId, arm]
+    );
+  } else {
+    await query(
+      `INSERT INTO cohort_assignments (cart_id, experiment_id, arm)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (cart_id, experiment_id) DO NOTHING`,
+      [identityToken, experimentId, arm]
+    );
+  }
 
   log.debug({ identityToken: identityToken.slice(0, 8), experimentId, arm }, "Identity assigned to cohort");
   return arm;
+}
+
+/**
+ * N1 (v4.2): statuses that count as a RUNNING experiment for arm-gating.
+ * Legacy shape uses 'approved'/'running'; Supabase shape uses 'active'.
+ * Paused/completed experiments do NOT gate proactive touches.
+ */
+const RUNNING_STATUSES = ["running", "active", "approved"];
+
+export function isExperimentRunning(status: string | null | undefined): boolean {
+  return !!status && RUNNING_STATUSES.includes(status);
+}
+
+/**
+ * N1 (v4.2): read a customer's arm for an experiment.
+ * Prefers the stored cohort row; falls back to the deterministic derivation
+ * from identity_hash (same function that wrote the row, so identical result).
+ * Returns null when the customer or identity is unknown.
+ */
+export async function getArm(
+  customerId: string,
+  experimentId: string
+): Promise<'treatment' | 'control' | null> {
+  if (!customerId || !experimentId) return null;
+  const { rows } = await query(
+    `SELECT arm FROM cohort_assignments WHERE customer_id = $1 AND experiment_id = $2`,
+    [customerId, experimentId]
+  );
+  if (rows[0]?.arm === "treatment" || rows[0]?.arm === "control") {
+    return rows[0].arm;
+  }
+  const { rows: custRows } = await query(
+    "SELECT identity_hash FROM customers WHERE id = $1",
+    [customerId]
+  );
+  const identityToken = custRows[0]?.identity_hash;
+  if (!identityToken) return null;
+  return assignArm(identityToken, experimentId);
+}
+
+/**
+ * N1 (v4.2): the running experiment covering a customer (cart_recovery holdout),
+ * plus her arm. Returns null when no running experiment applies — in which
+ * case nothing is arm-gated.
+ */
+export async function getCustomerArm(
+  customerId: string
+): Promise<{ experimentId: string; arm: 'treatment' | 'control' } | null> {
+  if (!customerId) return null;
+  const experiment = await getActiveExperiment("cart_recovery");
+  if (!experiment || !isExperimentRunning(experiment.status)) return null;
+  const arm = await getArm(customerId, experiment.id);
+  if (!arm) return null;
+  return { experimentId: experiment.id, arm };
 }
 
 /**
@@ -84,13 +153,37 @@ export async function checkArmImbalance(experimentId: string): Promise<{
 
 /**
  * Get active experiment for a workflow.
+ * Supports the legacy shape (workflow TEXT, status 'approved') and the
+ * Supabase shape (charter JSONB, status 'active').
  */
 export async function getActiveExperiment(workflow: string): Promise<Experiment | null> {
-  const { rows } = await query(
-    "SELECT * FROM experiments WHERE workflow = $1 AND status = 'approved' LIMIT 1",
-    [workflow]
-  );
-  return rows[0] || null;
+  try {
+    const { rows } = await query(
+      "SELECT * FROM experiments WHERE workflow = $1 AND status = 'approved' LIMIT 1",
+      [workflow]
+    );
+    return rows[0] || null;
+  } catch (err: any) {
+    // Supabase shape: no workflow column — fall back to active experiments
+    if (!/column .* does not exist|undefined column/i.test(err.message)) throw err;
+    const { rows } = await query(
+      "SELECT * FROM experiments WHERE status = 'active' ORDER BY created_at DESC LIMIT 1"
+    );
+    const row = rows[0];
+    if (!row) return null;
+    const charter = row.charter || {};
+    return {
+      id: row.id,
+      merchant_id: row.merchant_id,
+      workflow,
+      baseline_json: charter.baseline || { aov_paise: 149800, gross_margin_percent: 0.4 },
+      target_json: charter.target || {},
+      owner: charter.owner || "product-team",
+      limits_json: charter.limits || {},
+      stop_rules_json: charter.stop_rules || {},
+      status: row.status,
+    };
+  }
 }
 
 /**
@@ -238,11 +331,11 @@ export async function pauseExperiment(experimentId: string, reason: string): Pro
     [experimentId]
   );
 
-  // Cancel pending deferred intents for this experiment
+  // Cancel pending deferred intents for this experiment (dedupe_key carries the experiment id)
   await query(
     `UPDATE action_intents SET status = 'expired'
      WHERE status = 'deferred'
-     AND rationale_json->>'experiment_id' = $1`,
+     AND dedupe_key LIKE '%' || $1 || '%'`,
     [experimentId]
   );
 

@@ -14,6 +14,8 @@ export function getRazorpay(): any {
   return instance;
 }
 
+export const razorpay = getRazorpay;
+
 export async function createOrder(params: {
   amount: number;
   currency?: string;
@@ -71,5 +73,6 @@ export async function fetchPayments(params: {
   skip?: number;
 }): Promise<any> {
   const rp = getRazorpay();
-  return rp.payments.fetch(params);
+  // NB: payments.fetch takes a payment ID; listing requires .all().
+  return rp.payments.all(params);
 }

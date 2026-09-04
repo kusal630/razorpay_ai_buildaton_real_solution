@@ -133,7 +133,20 @@ These optimize for growth and reliability.
 
 ---
 
-## TOTAL: 58 items across 4 phases
+## v4.3 Persuasion-Layer Roadmap (NOT building — folded per patch prompt)
+
+| ID | Item | Why later |
+|----|------|-----------|
+| R1 | Shipping-threshold engine | Needs fulfillment/shipping data not held |
+| R2 | Payday scheduling | Needs salary-cycle data not held |
+| R3 | Referral engine | New product surface, new trust boundary |
+| R4 | Festival calendar | Calendar-driven copy needs a content-ops owner first |
+| R5 | Vernacular copy | Translator review pipeline required before customer-facing text |
+| R6 | Full copy×bucket Thompson bandit | Cold-start explosion; runs after G7 strategy arms collect data |
+
+---
+
+## TOTAL: 64 items across 4 phases + 6 v4.3 persuasion-layer roadmap items above
 
 **Phase 1 (Launch Blockers):** 10 items
 **Phase 2 (Pre-GA):** 20 items

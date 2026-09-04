@@ -164,7 +164,7 @@ export async function verifyTrackKey(key: string): Promise<{
   // Check daily rate limit for public keys
   if (rows[0].key_type === "public_site") {
     const { rows: rateRows } = await query(
-      "SELECT event_count FROM track_rate_limits WHERE key_id = $1 AND day = CURRENT_DATE",
+      "SELECT event_count FROM track_rate_limits WHERE key_id = $1 AND day = TO_CHAR(CURRENT_DATE, 'YYYY-MM-DD')",
       [rows[0].id]
     );
 
@@ -173,10 +173,10 @@ export async function verifyTrackKey(key: string): Promise<{
       return { valid: false };
     }
 
-    // Increment counter
+    // Increment counter (day stored as TEXT 'YYYY-MM-DD' on this schema)
     await query(
       `INSERT INTO track_rate_limits (key_id, day, event_count)
-       VALUES ($1, CURRENT_DATE, 1)
+       VALUES ($1, TO_CHAR(CURRENT_DATE, 'YYYY-MM-DD'), 1)
        ON CONFLICT (key_id, day) DO UPDATE SET event_count = track_rate_limits.event_count + 1`,
       [rows[0].id]
     );

@@ -9,6 +9,9 @@ const log = createLogger("claimsLinter");
  */
 
 // C6: BANNED in linter-scanned files
+// G10 (v4.3): stored-instrument implications, false consensus, nagging.
+// Fabricated numbers have no static pattern by design — U-GROUND enforces
+// mechanically that every number in copy traces to a resolved token.
 const BANNED_PATTERNS = [
   /\bguaranteed\b/i,
   /\bno side door exists\b/i,
@@ -16,15 +19,22 @@ const BANNED_PATTERNS = [
   /\bwe process payments\b/i,
   /\bcannot fail\b/i,
   /\bdouble-spend\b/i,
+  /\bone-tap charge\b/i,
+  /\binstant charge\b/i,
+  /\binstantcharge\b/i,
+  /\beveryone is buying\b/i,
+  /\bhurry\b/i,
 ];
 
 // C6: REQUIRED phrases (at least one must appear in scanned files)
+// G10 (v4.3): any impact figure in docs must carry the "modeled" label.
 const REQUIRED_PATTERNS = [
   /at-most-once.*with.*reconciliation.*detecting.*anomalies/i,
   /append-only.*access-controlled.*tamper-evident/i,
   /transactional consent covers payment-status and failure recovery without incentives/i,
   /incentivized recovery and upsell require marketing consent/i,
   /estimated until reconciliation/i,
+  /modeled/i,
 ];
 
 // C6: Allowlist file
