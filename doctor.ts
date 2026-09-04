@@ -41,11 +41,17 @@ async function doctor() {
     results.llm = { status: "yellow", detail: "RULES mode (LLM unreachable)" };
   }
 
-  // Migrations
+  // Schema: required tables exist (what setup actually guarantees — the
+  // version table is vestigial across migration runners).
   try {
-    const { rows } = await pool.query("SELECT COUNT(*) as cnt FROM schema_migrations");
+    const required = ["audit_log", "customers", "orders", "payment_links", "merchant_config",
+      "reviews", "credit_ledger", "action_intents", "policy_rules", "segment_stats"];
+    const { rows } = await pool.query(
+      "SELECT COUNT(*) as cnt FROM pg_tables WHERE schemaname = 'public' AND tablename = ANY($1)",
+      [required]
+    );
     const cnt = Number(rows[0]?.cnt || 0);
-    results.migrations = { status: cnt >= 8 ? "green" : "red", detail: `${cnt} migrations applied` };
+    results.migrations = { status: cnt >= required.length ? "green" : "red", detail: `${cnt}/${required.length} required tables present` };
   } catch (err: any) {
     results.migrations = { status: "red", detail: err.message };
   }
