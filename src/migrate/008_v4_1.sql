@@ -14,8 +14,16 @@ CREATE TABLE IF NOT EXISTS consent_events (
   recorded_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- C2: Index for consent evidence lookups
-CREATE INDEX IF NOT EXISTS idx_consent_events_customer ON consent_events (customer_id, consent_type, recorded_at DESC);
+-- C2: Index for consent evidence lookups (whichever shape this database
+-- carries: canonical class/created_at, or legacy consent_type/recorded_at).
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'consent_events' AND column_name = 'class') THEN
+    CREATE INDEX IF NOT EXISTS idx_consent_events_customer ON consent_events (customer_id, class, created_at DESC);
+  ELSE
+    CREATE INDEX IF NOT EXISTS idx_consent_events_customer ON consent_events (customer_id, consent_type, recorded_at DESC);
+  END IF;
+END $$;
 
 -- C3: External reference mapping (HMAC-based, one-way)
 CREATE TABLE IF NOT EXISTS ext_ref_map (
