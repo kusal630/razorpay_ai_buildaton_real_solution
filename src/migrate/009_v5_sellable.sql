@@ -73,7 +73,7 @@ CREATE TABLE IF NOT EXISTS incentive_reservations (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   merchant_id UUID,
   cart_id TEXT,
-  intent_id BIGINT,
+  intent_id UUID,
   budget_day DATE NOT NULL DEFAULT CURRENT_DATE,
   amount_paise BIGINT NOT NULL,
   status TEXT NOT NULL DEFAULT 'reserved' CHECK (status IN ('reserved','settled','released','expired')),

@@ -30,7 +30,7 @@ ALTER TABLE action_intents ADD CONSTRAINT action_intents_status_check
 -- W2: Notification outbox
 CREATE TABLE IF NOT EXISTS notification_outbox (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  intent_id BIGINT NOT NULL REFERENCES action_intents(id),
+  intent_id UUID NOT NULL REFERENCES action_intents(id),
   channel TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','sent','failed')),
   payload_hash TEXT NOT NULL,
