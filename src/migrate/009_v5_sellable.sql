@@ -89,10 +89,20 @@ CREATE TABLE IF NOT EXISTS kill_switch_state (
 );
 INSERT INTO kill_switch_state (id, enabled) VALUES (true, false) ON CONFLICT DO NOTHING;
 
--- Insert default merchant + admin + track keys if missing
-INSERT INTO merchants (id, name, track_key_hash)
-VALUES ('5a3ac6ce-b2c7-4b1f-a9db-45296841f30b', 'Demo Store', 'default')
-ON CONFLICT DO NOTHING;
+-- Insert default merchant if missing (tolerates both the legacy shape with
+-- deprecated track_key_hash and newer shapes without it).
+DO $$
+BEGIN
+  BEGIN
+    INSERT INTO merchants (id, name, track_key_hash)
+    VALUES ('5a3ac6ce-b2c7-4b1f-a9db-45296841f30b', 'Demo Store', 'default')
+    ON CONFLICT DO NOTHING;
+  EXCEPTION WHEN undefined_column THEN
+    INSERT INTO merchants (id, name)
+    VALUES ('5a3ac6ce-b2c7-4b1f-a9db-45296841f30b', 'Demo Store')
+    ON CONFLICT DO NOTHING;
+  END;
+END $$;
 
 -- Ensure today's budget exists
 INSERT INTO daily_budget (day, merchant_id, cap_paise)
