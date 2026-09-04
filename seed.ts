@@ -166,15 +166,22 @@ async function seed() {
     await client.query("INSERT INTO cart_items (cart_id, product_id, qty, unit_price_paise) VALUES ($1, $2, 1, 120000)", [failCartId, P.coffee]);
     const { rows: failRows } = await client.query(
       `INSERT INTO orders (merchant_id, source, cart_id, customer_id, amount_paise, incentive_paise, margin_paise, status, created_at, failed_at, fee_basis)
-       VALUES ($1, 'recovery', $2, $3, 120000, 0, 48000, 'failed', $4, $4, 'modeled') RETURNING id`,
+       SELECT $1, 'recovery', $2, $3, 120000, 0, 48000, 'failed', $4, $4, 'modeled'
+       WHERE NOT EXISTS (SELECT 1 FROM orders WHERE cart_id = $2 AND status = 'failed')
+       RETURNING id`,
       [MERCHANT_ID, failCartId, riyaId, failTime]
     );
-    console.log(`  Failed order: ${failRows[0].id}`);
+    console.log(`  Failed order: ${failRows[0]?.id || "(already seeded)"}`);
 
     // A real paid order (10 days ago, its OWN historical cart — never the live
     // abandoned carts) with a genuine ledger row — anchors review badges.
+    // Skipped entirely on re-seed (sample order already present).
     const paidAt = new Date(Date.now() - 10 * 86400e3);
     const paidCartId = "c0c0c0c0-0000-4000-a000-000000000090";
+    const { rows: paidExists } = await client.query(
+      "SELECT id FROM orders WHERE cart_id = $1 AND status = 'paid' LIMIT 1", [paidCartId]);
+    let paidOrderId: string | undefined;
+    if (paidExists.length === 0) {
     await client.query(
       `INSERT INTO carts (id, merchant_id, customer_id, total_paise, status, abandoned_at, updated_at)
        VALUES ($1, $2, $3, 159800, 'converted', $4, $4) ON CONFLICT (id) DO NOTHING`,
@@ -191,10 +198,11 @@ async function seed() {
     });
     const { rows: paidRows } = await client.query(
       `INSERT INTO orders (merchant_id, source, cart_id, customer_id, amount_paise, incentive_paise, margin_paise, fee_paise, fee_basis, status, audit_seq, paid_at)
-       VALUES ($1, 'recovery', $2, $3, 159800, 0, 63920, 3196, 'entity', 'paid', $4, $5) RETURNING id`,
+       VALUES ($1, 'recovery', $2, $3, 159800, 0, 63920, 3196, 'entity', 'paid', $4, $5)
+       RETURNING id`,
       [MERCHANT_ID, paidCartId, riyaId, seedSeq, paidAt]
     );
-    const paidOrderId = paidRows[0].id;
+    const paidOrderId: string | undefined = paidRows[0]?.id;
 
     // Sample reviews, mixed ratings (negatives included — the distribution needs them).
     const reviews = [
@@ -214,6 +222,9 @@ async function seed() {
       );
     }
     console.log(`  Paid order ${String(paidOrderId).slice(0, 8)} (seq ${seedSeq}) + 5 reviews (5,5,4,5,2)`);
+    } else {
+      console.log("  Paid order + reviews already seeded");
+    }
 
     // Segment priors + checkout_started seeded priors (labeled in-console).
     const statsData = [
