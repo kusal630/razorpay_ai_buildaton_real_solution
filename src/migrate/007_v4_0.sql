@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS open_links (
   cancelled_at TIMESTAMPTZ
 );
 
-CREATE INDEX idx_open_links_cart ON open_links(cart_id, status);
+CREATE INDEX IF NOT EXISTS idx_open_links_cart ON open_links(cart_id, status);
 
 -- H1: Overpayment tracking
 CREATE TABLE IF NOT EXISTS overpayments (
@@ -49,7 +49,7 @@ CREATE TABLE IF NOT EXISTS pay_tokens (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE INDEX idx_pay_tokens_audit_seq ON pay_tokens(audit_seq);
+CREATE INDEX IF NOT EXISTS idx_pay_tokens_audit_seq ON pay_tokens(audit_seq);
 
 -- H3: Per-token rate limiting
 CREATE TABLE IF NOT EXISTS pay_token_rate_limits (
