@@ -14,8 +14,8 @@ CREATE TABLE IF NOT EXISTS action_intents (
   action_type TEXT NOT NULL,
   window_day TEXT NOT NULL DEFAULT to_char(CURRENT_DATE, 'YYYY-MM-DD'),
   status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN (
-    'pending', 'deferred', 'executing', 'awaiting_gateway', 'done',
-    'skipped', 'blocked', 'failed', 'expired', 'cancelled')),
+    'proposed', 'deferred', 'pending', 'executing', 'awaiting_gateway', 'done',
+    'skipped', 'blocked', 'failed', 'expired', 'stuck', 'cancelled')),
   attempt_count INTEGER NOT NULL DEFAULT 0,
   resume_at TIMESTAMPTZ,
   lease_expires_at TIMESTAMPTZ,

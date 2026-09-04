@@ -24,8 +24,10 @@ ALTER TABLE action_intents ADD COLUMN IF NOT EXISTS idempotency_hash TEXT;
 
 -- W2: Expand status check constraint
 ALTER TABLE action_intents DROP CONSTRAINT IF EXISTS action_intents_status_check;
+-- Canonical lifecycle set (union of all writers: scheduler, janitor,
+-- revocation). Later files must not narrow this list.
 ALTER TABLE action_intents ADD CONSTRAINT action_intents_status_check
-  CHECK (status IN ('proposed','deferred','pending','executing','awaiting_gateway','done','skipped','blocked','failed','expired','stuck'));
+  CHECK (status IN ('proposed','deferred','pending','executing','awaiting_gateway','done','skipped','blocked','failed','expired','stuck','cancelled'));
 
 -- W2: Notification outbox
 CREATE TABLE IF NOT EXISTS notification_outbox (
