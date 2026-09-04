@@ -16,7 +16,9 @@ const log = createLogger("claims");
  * stripped; bare numbers that match no grounded value reject the copy.
  */
 
-export const TOKEN_RE = /\[claim:(stock|expiry|social_proof|saved_amount):([^\]]*)\]/g;
+export const TOKEN_RE = /\[claim:(stock|expiry|social_proof|saved_amount|all_in_total|threshold_gap|offer|price):([^\]]*)\]/g;
+/** M19/M20-V1: inline LLM emission form {{type:ref}} — same types, same grounding. */
+export const INLINE_TOKEN_RE = /\{\{(stock|expiry|social_proof|saved_amount|all_in_total|threshold_gap|offer|price):([^}]*)\}\}/g;
 export const SOCIAL_STATS_FRESH_HOURS = 26;
 
 export interface ClaimFact {
@@ -30,6 +32,11 @@ export interface ClaimFact {
   order_paid?: boolean;
   /** Extra grounded numbers (e.g. a discount percent the policy already fixed). */
   extra_numbers?: number[];
+  /** M7/M13: components for the all-in total + threshold gap (server-computed). */
+  shipping_paise?: number;
+  threshold_gap_paise?: number | null;
+  /** M14: live bank offers the copy may reference (resolver checks live=true). */
+  live_offers?: { bank: string; description: string }[];
 }
 
 export interface ResolvedClaim {
@@ -108,6 +115,31 @@ async function resolveToken(
     if (!facts.order_paid || v <= 0) return { unresolvable: "no paid incentive to report" };
     return { rendered: rupees(v), value: v };
   }
+  // M7: all-in total — server-computed items − incentive + shipping.
+  if (type === "all_in_total") {
+    const base = Number(facts.cart_total_paise || 0);
+    if (!(base > 0)) return { unresolvable: "no cart total source" };
+    const total = base - Number(facts.incentive_paise || 0) + Number(facts.shipping_paise || 0);
+    return { rendered: rupees(total), value: total };
+  }
+  // M13: threshold gap — grounded free-shipping distance, suppressed at/above threshold.
+  if (type === "threshold_gap") {
+    const gap = Number(facts.threshold_gap_paise ?? NaN);
+    if (!Number.isFinite(gap) || gap <= 0) return { unresolvable: "no threshold gap (at/above free shipping)" };
+    return { rendered: rupees(gap), value: gap };
+  }
+  // M14: bank offer — only when the merchant config lists it live.
+  if (type === "offer") {
+    const hit = (facts.live_offers || []).find((o) => o.bank.toLowerCase() === String(ref).toLowerCase());
+    if (!hit) return { unresolvable: `offer not live for ${ref}` };
+    return { rendered: hit.description, value: hit.description };
+  }
+  // Price token — only for items already in facts (anchoring, real numbers).
+  if (type === "price") {
+    const item = (facts.items || []).find((i) => i.id === ref);
+    if (!item) return { unresolvable: `no price source for ${ref}` };
+    return { rendered: rupees(Number(item.price_paise)), value: Number(item.price_paise) };
+  }
   return { unresolvable: `unknown claim type ${type}` };
 }
 
@@ -169,12 +201,22 @@ export async function groundCopy(
   const stripped: { type: string; ref: string; reason: string }[] = [];
   const violations: string[] = [];
 
+  // M19: accept the inline {{type:ref}} emission form by normalizing it to
+  // the canonical [claim:type:ref] form — identical grounding either way.
+  copy = copy.replace(INLINE_TOKEN_RE, (_m, t, r) => `[claim:${t}:${r}]`);
+  INLINE_TOKEN_RE.lastIndex = 0;
+
   // Malformed/unknown token types fail fast (validation step 4.5 input).
   const loose = copy.match(/\[claim:([^\]:]*):?([^\]]*)\]/g) || [];
   for (const tok of loose) {
     if (!tok.match(TOKEN_RE)) violations.push(`malformed_claim_token: ${tok.slice(0, 40)}`);
   }
+  const looseInline = copy.match(/\{\{[^}]*\}\}/g) || [];
+  for (const tok of looseInline) {
+    if (!tok.match(INLINE_TOKEN_RE)) violations.push(`malformed_claim_token: ${tok.slice(0, 40)}`);
+  }
   TOKEN_RE.lastIndex = 0;
+  INLINE_TOKEN_RE.lastIndex = 0;
 
   let working = copy;
   let m: RegExpExecArray | null;
@@ -213,7 +255,11 @@ export async function groundCopy(
   if (facts.order_incentive_paise) allowed.push(facts.order_incentive_paise, facts.order_incentive_paise / 100);
   for (const n of facts.extra_numbers || []) allowed.push(Number(n));
   for (const r of resolved) {
-    if (typeof r.value === "number") allowed.push(r.value);
+    if (typeof r.value === "number") {
+      allowed.push(r.value);
+      // Convention (mirrors facts): both paise and whole-rupee forms are allowed.
+      if (r.value >= 100 && r.value % 100 === 0) allowed.push(r.value / 100);
+    }
     if (typeof r.value === "string" && !isNaN(Date.parse(r.value))) {
       const e = renderExpiryShort(r.value);
       allowed.push(e.hour12, e.hour24, e.day);

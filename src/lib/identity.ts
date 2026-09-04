@@ -1,11 +1,9 @@
-import crypto from "node:crypto";
 import { query } from "../db.js";
 import { encrypt } from "./crypto.js";
 import { createLogger } from "../logger.js";
+import { identityTokenV2, identityTokenLegacy, matchIdentityHash } from "./v5keys.js";
 
 const log = createLogger("identity");
-
-const IDENTITY_SECRET = process.env.IDENTITY_SECRET || "sellable-identity-secret-v1";
 
 /**
  * W5: Normalize contact for identity token.
@@ -35,16 +33,24 @@ export function normalizeContact(contact: {
 }
 
 /**
- * W5: Generate identity token using HMAC-SHA256.
- * identity_token = HMAC(secret, normalize(contact))
- * Stored in customers.identity_hash on the remote schema.
+ * W5: Generate identity token using HKDF-derived identity key (M1).
+ * New rows carry the "v2:" prefix (key_version 1); legacy rows have raw hex.
  */
 export function generateIdentityToken(contact: {
   email?: string;
   phone?: string;
 }): string {
   const { normalized } = normalizeContact(contact);
-  return crypto.createHmac("sha256", IDENTITY_SECRET).update(normalized).digest("hex");
+  return identityTokenV2(normalized);
+}
+
+/** Legacy token form (pre-M1 fixtures). Used only for dual-verify lookup. */
+export function generateLegacyIdentityToken(contact: {
+  email?: string;
+  phone?: string;
+}): string {
+  const { normalized } = normalizeContact(contact);
+  return identityTokenLegacy(normalized);
 }
 
 /**
@@ -63,14 +69,18 @@ export async function findOrCreateCustomer(
 ): Promise<{ customerId: string; isNew: boolean; identityToken: string }> {
   const identityToken = generateIdentityToken(contact);
 
-  // Check existing by identity hash
+  // M1 transition: dual-verify — check v2 hash first, then legacy hash.
+  const { normalized } = normalizeContact(contact);
+  const legacyToken = identityTokenLegacy(normalized);
   const { rows: existing } = await query(
-    "SELECT id FROM customers WHERE merchant_id = $1 AND identity_hash = $2",
-    [merchantId, identityToken]
+    "SELECT id, identity_hash FROM customers WHERE merchant_id = $1 AND identity_hash IN ($2, $3)",
+    [merchantId, identityToken, legacyToken]
   );
 
   if (existing[0]) {
-    return { customerId: existing[0].id, isNew: false, identityToken };
+    // Background re-key opportunity: legacy row resolves; caller may upgrade.
+    const form = matchIdentityHash(existing[0].identity_hash, normalized);
+    return { customerId: existing[0].id, isNew: false, identityToken: existing[0].identity_hash, keyForm: form } as any;
   }
 
   // Create new customer (contact stored encrypted at rest)

@@ -32,12 +32,13 @@ describe("Razorpay Service (nock fixtures)", () => {
         short_url: "https://rzp.io/test123",
       });
 
-    const { createPaymentLink } = await import("../src/lib/razorpayService.js");
+    const { createPaymentLink, initMoneyBus } = await import("../src/lib/razorpayService.js");
+    // M26: mutating helpers require the moneyBus capability (bus path works).
     const result = await createPaymentLink({
       amount: 100000,
       reference_id: "1001",
       customer: { name: "Test", email: "test@test.com", contact: "9999999999" },
-    });
+    }, initMoneyBus());
 
     expect(result.id).toBe("plink_test123");
     expect(result.amount).toBe(100000);

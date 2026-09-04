@@ -1,17 +1,14 @@
 import crypto from "node:crypto";
-import { getConfig } from "../config.js";
 import { query } from "../db.js";
+import { opaqueExtRef } from "./v5keys.js";
 
 /**
  * C3: Generate an opaque external reference for a ledger seq.
- * ext_ref = base64url(HMAC(APP_SECRET, seq)). Never the raw seq.
+ * ext_ref = base64url(HMAC(extref-key, seq)) — M1: derived key, never raw APP_SECRET.
  * Is one-way, salted, and stable per seq.
  */
 export function generateExtRef(seq: number): string {
-  const mac = crypto.createHmac("sha256", getConfig().APP_SECRET)
-    .update(String(seq))
-    .digest("base64url");
-  return mac.slice(0, 40); // Razorpay reference_id max 40 chars
+  return opaqueExtRef(seq);
 }
 
 export function generateToken(bytes = 16): string {

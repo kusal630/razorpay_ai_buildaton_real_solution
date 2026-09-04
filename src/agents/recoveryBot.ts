@@ -420,6 +420,26 @@ export async function processAbandonedCart(
     thetaEstimates,
   });
 
+  // ── M18/M21 (v5): feature-aware extension — case_type, token whitelist,
+  // copy constraints, secondary-CTA availability. All pseudonymized.
+  const shippingCfg = await query(
+    "SELECT value_jsonb FROM merchant_config WHERE merchant_id = $1 AND key = 'shipping'", [MERCHANT_ID]
+  ).catch(() => ({ rows: [] as any[] }));
+  const ship = shippingCfg.rows[0]?.value_jsonb || null;
+  const shippingPaise = ship ? Number(ship.flat_fee_paise || 0) : 0;
+  const freeThreshold = ship?.free_threshold_paise ?? null;
+  const gapPaise = freeThreshold != null && cartTotal < freeThreshold ? freeThreshold - cartTotal : null;
+  (brainContext as any).case_type = "recovery";
+  (brainContext as any).copy_constraints = { max_length: 320 };
+  (brainContext as any).available_tokens = [
+    `all_in_total:${cartId}`,
+    ...(gapPaise != null ? [`threshold_gap:${cartId}`] : []),
+    `expiry:${cartId}`,
+  ];
+  // Reminder choice offered from the 2nd touch on; save-for-later on the 3rd.
+  (brainContext as any).allow_reminder_choice = touchHistory >= 1;
+  (brainContext as any).allow_save_for_later = touchHistory >= 2;
+
   const brain = await callBrain("recovery", brainContext);
 
   // ── STEP 8b: GROUND THE COPY (N28 v4.3 — pre-send claim resolution) ──
@@ -440,6 +460,9 @@ export async function processAbandonedCart(
     cart_total_paise: cartTotal,
     items: itemsJson.map((i: any) => ({ id: i.id, name: i.name, price_paise: i.price_paise })),
     link_expiry_iso: linkExpiryIso,
+    // M7/M13: live shipping arithmetic — pay page and copy share these facts.
+    shipping_paise: shippingPaise,
+    threshold_gap_paise: gapPaise,
   };
   const finalized = brain.mode === "llm"
     ? await finalizeCopy({
@@ -454,6 +477,15 @@ export async function processAbandonedCart(
 
   // ── STEP 9: EMIT AGENT_THOUGHT prep — incentive first (endowment needs it) ──
   const incentivePaise = brain.incentive_bucket_paise || 0;
+  // M21: new brain-decision surfaces (brain chooses; code enforces availability).
+  const rawOut: any = (brain as any).raw || {};
+  const allowReminder = (brainContext as any).allow_reminder_choice === true;
+  const allowSave = (brainContext as any).allow_save_for_later === true;
+  const secondaryCta: string =
+    rawOut.secondary_cta === "reminder_choice" && allowReminder ? "reminder_choice"
+    : rawOut.secondary_cta === "save_for_later" && allowSave ? "save_for_later" : "none";
+  const incentiveToken = rawOut.incentive_token
+    ?? (incentivePaise > 0 ? { type: "cash", ref: "" } : null);
 
   // ── G7 (v4.3): copy-strategy — LLM picks, ε-exploration keeps arms measured ──
   const { strategy: messageStrategy, explored: strategyExplored } = chooseMessageStrategy(
@@ -499,8 +531,14 @@ export async function processAbandonedCart(
       message_copy: messageCopy,
       claims_resolved: finalized.result.resolved,
       claims_stripped: finalized.result.stripped,
+      resolved_tokens: (finalized.result.resolved || []).map((r: any) => `${r.type}:${r.ref}`),
+      stripped: (finalized.result.stripped || []).map((s: any) => `${s.type}:${s.ref}`),
       message_strategy: messageStrategy,
       strategy_explored: strategyExplored,
+      // M21: brain-decision surfaces on the feed's expanded row.
+      secondary_cta: secondaryCta,
+      incentive_token: incentiveToken,
+      case_type: "recovery",
     },
   });
 
@@ -617,8 +655,15 @@ export async function processAbandonedCart(
       message_copy: messageCopy,
       claims_resolved: finalized.result.resolved,
       claims_stripped: finalized.result.stripped,
+      resolved_tokens: (finalized.result.resolved || []).map((r: any) => `${r.type}:${r.ref}`),
       message_strategy: messageStrategy,
       strategy_explored: strategyExplored,
+      // M21 + M33: decision surfaces + prompt provenance on the ledger row.
+      secondary_cta: secondaryCta,
+      incentive_token: incentiveToken,
+      case_type: "recovery",
+      prompt_version: "v5.0",
+      model: getConfig().LLM_MODEL || "rules",
     },
     MERCHANT_ID
   );

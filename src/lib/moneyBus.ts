@@ -1,7 +1,10 @@
 import crypto from "node:crypto";
 import { getConfig } from "../config.js";
 import { query, withTransaction } from "../db.js";
-import { razorpay as rzp } from "./razorpayService.js";
+import { getRazorpay, initMoneyBus } from "./razorpayService.js";
+// M26: moneyBus is the SOLE holder of the Razorpay mutation capability.
+const BUS_CAP = initMoneyBus();
+const rzp = (): any => getRazorpay(BUS_CAP);
 import { appendLedger, resolveLedger } from "./ledger.js";
 import { appendActivity } from "./activity.js";
 import { generateExtRef, storeExtRef, generateToken } from "./extRef.js";
@@ -668,6 +671,17 @@ export async function resolvePayment(pl: {
          ON CONFLICT (customer_id, day) DO UPDATE SET count = touches.count + 1`,
         [pl.merchant_id, pl.customer_id, today]
       );
+      // M22: engagement event (pay = strongest signal) for per-identity send-time.
+      try {
+        const { rows: ih } = await client.query("SELECT identity_hash FROM customers WHERE id = $1", [pl.customer_id]);
+        if (ih[0]?.identity_hash) {
+          const istH = Math.floor(((Date.now() + 5.5 * 3600e3) / 3600e3) % 24);
+          await client.query(
+            "INSERT INTO engagement_events (merchant_id, identity_hash, hour_ist) VALUES ($1, $2, $3)",
+            [pl.merchant_id, ih[0].identity_hash, istH]
+          );
+        }
+      } catch { /* measurement only — never blocks resolution */ }
     }
 
     // Sibling link cancellation (all other live links for the cart)

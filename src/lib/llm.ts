@@ -74,13 +74,21 @@ export async function callLLM(messages: LLMMessage[]): Promise<LLMResponse> {
       };
     } catch (err: any) {
       lastError = err;
+      // M32: only transport errors (timeout/5xx/network) count toward the
+      // breaker. 4xx validation-style errors fail the call without tripping.
+      const status = Number(err?.status);
+      const isTransport = err?.name === "TimeoutError" || err?.name === "AbortError"
+        || err?.code === "ECONNREFUSED" || err?.code === "ENOTFOUND" || err?.code === "EAI_AGAIN"
+        || (Number.isFinite(status) && status >= 500) || !Number.isFinite(status);
+      (lastError as any).__transport = isTransport;
       if (attempt < maxRetries - 1) {
         await new Promise((r) => setTimeout(r, Math.pow(2, attempt) * 1000));
       }
     }
   }
 
-  recordFailure();
+  // M32: breaker increments ONLY on transport errors.
+  if ((lastError as any)?.__transport !== false) recordFailure();
   throw lastError || new Error("LLM call failed");
 }
 

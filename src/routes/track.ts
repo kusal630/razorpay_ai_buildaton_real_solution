@@ -85,12 +85,14 @@ trackRouter.post("/api/track/bind-customer", async (req: Request, res: Response)
     const { customerId, identityToken, isNew } = await findOrCreateCustomer(merchantId, { email, name, phone });
     await query("UPDATE carts SET customer_id = $1 WHERE id = $2", [customerId, cart_id]);
     // Record consent event (remote shape: class / evidence_ref)
+    // M29: carries text_version, channel, ip_hash, ua_hash.
     if (email || phone) {
-      await query(
-        `INSERT INTO consent_events (merchant_id, customer_id, class, opt_in, source, evidence_ref)
-         VALUES ($1, $2, 'transactional', true, 'merchant_server', $3)`,
-        [merchantId, customerId, `bind:${cart_id}`]
-      );
+      const { recordConsentEvidence } = await import("../lib/v5privacy.js");
+      await recordConsentEvidence(query, {
+        merchantId, customerId, klass: "transactional", optIn: true,
+        source: "merchant_server", evidenceRef: `bind:${cart_id}`,
+        channel: "server_api", ip: req.ip || "", ua: String(req.headers["user-agent"] || ""),
+      });
     }
     log.debug({ cart_id, customerId, isNew }, "Customer bound to cart");
     res.json({ success: true, customerId, identityToken, isNew });
@@ -102,11 +104,22 @@ trackRouter.post("/api/track/consent", async (req: Request, res: Response) => {
   const { customer_id, consent_type, opt_in, source, evidence_reference } = req.body;
   if (!customer_id || !consent_type) { res.status(400).json({ error: "customer_id and consent_type required" }); return; }
   try {
-    await query(
-      `INSERT INTO consent_events (merchant_id, customer_id, class, opt_in, source, evidence_ref)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
-      [MERCHANT_ID, customer_id, consent_type, opt_in !== false, source || "api", evidence_reference || null]
-    );
+    // M29: evidence fields on every consent event.
+    const { recordConsentEvidence, revokeConsent } = await import("../lib/v5privacy.js");
+    const optIn = opt_in !== false;
+    const evidence = {
+      merchantId: MERCHANT_ID, customerId: customer_id, klass: consent_type,
+      source: source || "api", evidenceRef: evidence_reference || null,
+      channel: "web", ip: req.ip || "", ua: String(req.headers["user-agent"] || ""),
+    };
+    if (!optIn) {
+      // M29 REVOCATION SLA: opt-out records + cancels pending/deferred intents
+      // synchronously (within one dispatch cycle); scheduler sweep is the backstop.
+      const { intentsCancelled } = await revokeConsent(query, evidence);
+      log.info({ customer_id, intentsCancelled }, "Revocation applied (SLA: in-request)");
+    } else {
+      await recordConsentEvidence(query, { ...evidence, optIn });
+    }
     // Update customer consent flags
     if (consent_type === "marketing") {
       await query(
@@ -131,7 +144,8 @@ trackRouter.post("/api/track/checkout-start", async (req: Request, res: Response
     await query(
       `INSERT INTO carts (id, merchant_id, total_paise, status, updated_at)
        VALUES ($1, $2, 0, 'active', NOW())
-       ON CONFLICT (id) DO UPDATE SET updated_at = NOW()`,
+       ON CONFLICT (id) DO UPDATE SET updated_at = NOW(),
+         checkout_started_at = COALESCE(carts.checkout_started_at, NOW())`,
       [cart_id, MERCHANT_ID]
     );
     res.json({ success: true });

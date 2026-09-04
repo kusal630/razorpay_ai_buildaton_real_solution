@@ -26,7 +26,24 @@ CREATE TABLE IF NOT EXISTS track_keys (
   rotated_at TIMESTAMPTZ
 );
 
--- Insert default keys for the single merchant
+-- Insert default keys for the single merchant (merchant row first: later
+-- files must not assume seed order; older 001 lacks the newer columns, while
+-- out-of-band schemas may lack the deprecated track_key_hash — DO block
+-- covers both).
+ALTER TABLE merchants ADD COLUMN IF NOT EXISTS rzp_key_ref TEXT;
+ALTER TABLE merchants ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active';
+DO $$
+BEGIN
+  BEGIN
+    INSERT INTO merchants (id, name, track_key_hash)
+    VALUES ('5a3ac6ce-b2c7-4b1f-a9db-45296841f30b', 'Electronics Hub', 'deprecated')
+    ON CONFLICT (id) DO UPDATE SET name = 'Electronics Hub';
+  EXCEPTION WHEN undefined_column THEN
+    INSERT INTO merchants (id, name)
+    VALUES ('5a3ac6ce-b2c7-4b1f-a9db-45296841f30b', 'Electronics Hub')
+    ON CONFLICT (id) DO UPDATE SET name = 'Electronics Hub';
+  END;
+END $$;
 INSERT INTO track_keys (merchant_id, key_type, key_hash) VALUES
   ('5a3ac6ce-b2c7-4b1f-a9db-45296841f30b', 'public_site', 'sellable_pub_default'),
   ('5a3ac6ce-b2c7-4b1f-a9db-45296841f30b', 'secret_server', 'sellable_secret_default')

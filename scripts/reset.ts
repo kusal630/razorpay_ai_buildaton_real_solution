@@ -10,6 +10,11 @@ const TABLES = [
   "dead_letters", "policy_audit", "experiment_metrics", "cohort_assignments",
   "buyer_sessions", "buyer_key_caps", "buyer_api_keys", "admin_audit",
   "sibling_links", "incentive_reservations", "reconcile_runs", "ledger_checkpoints",
+  // v5.0 tables (010)
+  "credit_ledger", "reviews", "approval_patterns", "mandate_jtis", "reminders",
+  "price_watches", "merchant_config", "ndr_cases", "cod_orders",
+  "engagement_events", "policy_pending_edits", "identity_edges",
+  "fee_audit_runs", "upsell_blocked_daily", "backtest_runs",
 ];
 
 const MERCHANT_ID = "5a3ac6ce-b2c7-4b1f-a9db-45296841f30b";
@@ -18,7 +23,13 @@ async function main() {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
+    // Truncate only tables that exist (schema evolves; reset must not fail).
+    const { rows: existing } = await client.query(
+      "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
+    );
+    const have = new Set(existing.map((r: any) => r.tablename));
     for (const t of TABLES) {
+      if (!have.has(t)) { console.log(`  skip ${t} (absent)`); continue; }
       await client.query(`TRUNCATE TABLE ${t} CASCADE`);
     }
     await client.query("DELETE FROM customers WHERE merchant_id = $1", [MERCHANT_ID]);

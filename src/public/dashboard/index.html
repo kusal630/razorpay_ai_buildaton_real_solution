@@ -80,6 +80,7 @@
       <div class="tab" data-tab="ledger">Ledger</div>
       <div class="tab" data-tab="approvals">Approvals</div>
       <div class="tab" data-tab="qa">Buyers & QA</div>
+      <div class="tab" data-tab="settings">Settings</div>
     </div>
 
     <div id="tab-overview" class="panel active">
@@ -107,6 +108,17 @@
             <tbody id="strategy-body"></tbody>
           </table>
         </div>
+        <p class="muted">Decision priors are seeded, not measured: checkout_started θ (0: 0.15, ₹100: 0.40), cart_only θ (0: 0.10). Measured outcomes replace seeds as traffic arrives.</p>
+      </div>
+      <div class="card">
+        <h3>Merchant Patterns — observations, not permissions</h3>
+        <div style="margin-top:12px">
+          <table id="patterns-table">
+            <thead><tr><th>Dimension</th><th>Value</th><th>Seen</th><th>Approved</th><th>Rejected</th></tr></thead>
+            <tbody id="patterns-body"></tbody>
+          </table>
+        </div>
+        <p class="muted">The learner pre-filters proposals; it never edits policy. <button class="btn" onclick="resetPatterns()">Reset patterns</button></p>
       </div>
     </div>
 
@@ -153,6 +165,23 @@
         <div id="reconcile-result" style="margin-top:10px"></div>
       </div>
     </div>
+
+    <div id="tab-settings" class="panel">
+      <div class="card">
+        <h3>Shipping</h3>
+        <label>Flat fee (paise) <input type="number" id="ship-fee" value="0" min="0"></label>
+        <label>Free-shipping threshold (paise, empty = none) <input type="number" id="ship-threshold" value="200000" min="0"></label>
+        <label>ETA (days) <input type="number" id="ship-eta" value="5" min="1"></label>
+        <button class="btn btn-primary" onclick="saveShipping()">Save shipping</button>
+        <span id="ship-status" style="margin-left:12px"></span>
+        <p class="muted">Every change writes an admin-audit row and a ledger row. The pay page all-in total updates live.</p>
+      </div>
+      <div class="card">
+        <h3>Platform Ceilings (merchant cannot exceed)</h3>
+        <div id="ceilings-list"></div>
+        <p class="muted">Lowering a mapped cap applies immediately; raising needs 1h cooldown + step-up.</p>
+      </div>
+    </div>
   </div>
 
   <script>
@@ -179,7 +208,46 @@
       });
     });
 
-    async function init() { loadState(); startSSE(); loadLedger(); loadApprovals(); loadStrategies(); }
+    async function init() { loadState(); startSSE(); loadLedger(); loadApprovals(); loadStrategies(); loadPatterns(); loadSettings(); }
+    async function loadPatterns() {
+      try {
+        const res = await fetch('/api/patterns');
+        const d = await res.json();
+        document.getElementById('patterns-body').innerHTML = ((d.patterns || []).map(r =>
+          `<tr><td>${r.dimension}</td><td>${r.value}</td><td>${r.seen}</td><td>${r.approved}</td><td>${r.rejected}</td></tr>`
+        ).join('')) || `<tr><td colspan="5">No merchant patterns yet — collecting.</td></tr>`;
+      } catch {}
+    }
+    async function resetPatterns() {
+      await fetch('/api/patterns/reset', { method: 'POST' });
+      loadPatterns();
+    }
+    async function loadSettings() {
+      try {
+        const res = await fetch('/api/config/shipping');
+        const d = await res.json();
+        const v = d.value_jsonb || {};
+        if (v.flat_fee_paise != null) document.getElementById('ship-fee').value = v.flat_fee_paise;
+        if (v.free_threshold_paise != null) document.getElementById('ship-threshold').value = v.free_threshold_paise;
+        if (v.eta_days != null) document.getElementById('ship-eta').value = v.eta_days;
+      } catch {}
+      try {
+        const res = await fetch('/api/policy/ceilings');
+        const rows = await res.json();
+        document.getElementById('ceilings-list').innerHTML = (rows || []).map(r =>
+          `<div>${r.key}: ${(Number(r.value_paise) / 100).toFixed(r.key.includes('pct') ? 0 : 0)}</div>`
+        ).join('');
+      } catch {}
+    }
+    async function saveShipping() {
+      const body = { value: {
+        flat_fee_paise: Number(document.getElementById('ship-fee').value || 0),
+        free_threshold_paise: Number(document.getElementById('ship-threshold').value || 0) || null,
+        eta_days: Number(document.getElementById('ship-eta').value || 5),
+      }};
+      const res = await fetch('/api/config/shipping', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      document.getElementById('ship-status').textContent = res.ok ? 'Saved (audited + ledgered).' : 'Save failed.';
+    }
     async function loadStrategies() {
       try {
         const res = await fetch('/api/strategy-stats');

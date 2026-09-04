@@ -1,9 +1,28 @@
 import Razorpay from "razorpay";
 import { getConfig } from "../config.js";
 
+/**
+ * M26 — money-bus structural single-caller. The module holds a private
+ * capability symbol; moneyBus alone receives it via initMoneyBus() and passes
+ * it to getRazorpay(cap) for the full (mutating) client. Any other importer
+ * gets a READ-ONLY facade: fetch paths work (doctor/reconcile), while
+ * create/refund/cancel/invoices throw BUS_CAP_REQUIRED.
+ */
+const BUS_CAP = Symbol("moneyBus");
+let busInitialized = false;
+
+export function initMoneyBus(): symbol {
+  busInitialized = true;
+  return BUS_CAP;
+}
+
+function isBusCap(cap: unknown): boolean {
+  return busInitialized && cap === BUS_CAP;
+}
+
 let instance: any = null;
 
-export function getRazorpay(): any {
+function fullClient(): any {
   if (!instance) {
     const config = getConfig();
     instance = new Razorpay({
@@ -14,15 +33,59 @@ export function getRazorpay(): any {
   return instance;
 }
 
+const READ_METHODS = new Set(["fetch", "all", "fetchAll", "fetchMultiple"]);
+function isReadMethod(prop: string): boolean {
+  return READ_METHODS.has(prop) || prop.startsWith("fetch");
+}
+
+/**
+ * Lazy capability proxy. No config/network touched until a read method is
+ * actually invoked:
+ * - rp.paymentLink.fetch(...) → real client instantiated on first call.
+ * - rp.paymentLink.create(...) without the bus cap → BUS_CAP_REQUIRED.
+ */
+function lazyClient(): any {
+  const at = (ns: string): any => new Proxy(function () {}, {
+    get(_t, prop) {
+      if (prop === "__busCapReadOnly") return true;
+      if (prop === Symbol.toPrimitive || prop === "then") return undefined;
+      if (typeof prop !== "string") return undefined;
+      if (isReadMethod(prop)) {
+        return (...args: any[]) => (fullClient() as any)[ns][prop](...args);
+      }
+      return () => { throw new Error("BUS_CAP_REQUIRED: mutating Razorpay access is moneyBus-only"); };
+    },
+    apply() {
+      throw new Error("BUS_CAP_REQUIRED: call a namespaced Razorpay method");
+    },
+  });
+  return new Proxy({}, {
+    get(_t, prop) {
+      if (prop === "__busCapReadOnly") return true;
+      if (typeof prop !== "string") return undefined;
+      return at(prop);
+    },
+  });
+}
+export function getRazorpay(cap?: symbol): any {
+  if (isBusCap(cap)) return fullClient();
+  return lazyClient();
+}
+
 export const razorpay = getRazorpay;
 
+/**
+ * Named helpers. Mutating helpers (createOrder/createPaymentLink) require the
+ * moneyBus capability — without it they throw BUS_CAP_REQUIRED. Read helpers
+ * work for any importer (doctor/reconcile/poller paths).
+ */
 export async function createOrder(params: {
   amount: number;
   currency?: string;
   receipt?: string;
   notes?: Record<string, string>;
-}): Promise<{ id: string; amount: number; currency: string; receipt?: string }> {
-  const rp = getRazorpay();
+}, cap?: symbol): Promise<{ id: string; amount: number; currency: string; receipt?: string }> {
+  const rp = getRazorpay(cap);
   const order = await rp.orders.create({
     amount: params.amount,
     currency: params.currency || "INR",
@@ -41,8 +104,8 @@ export async function createPaymentLink(params: {
   reminder_enable?: boolean;
   expire_by?: number;
   notes?: Record<string, string>;
-}): Promise<{ id: string; short_url: string; amount: number }> {
-  const rp = getRazorpay();
+}, cap?: symbol): Promise<{ id: string; short_url: string; amount: number }> {
+  const rp = getRazorpay(cap);
   const link = await rp.paymentLink.create({
     amount: params.amount,
     currency: params.currency || "INR",

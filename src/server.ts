@@ -14,6 +14,7 @@ import { protocolRouter } from "./routes/protocol.js";
 import { trackRouter } from "./routes/track.js";
 import { webhookRouter } from "./routes/webhooks.js";
 import { chatRouter } from "./routes/chat.js";
+import { v5Router } from "./routes/v5.js";
 import { subscribeActivityFeed } from "./lib/activity.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -83,6 +84,7 @@ async function main() {
   app.use(webhookRouter);
   app.use(chatRouter);
   app.use(opsRouter);
+  app.use(v5Router);
 
   app.use("/public", express.static(path.join(__dirname, "..", "src", "public")));
 
@@ -313,6 +315,14 @@ function startScheduler() {
         await sweepExpiredLinks();
       } catch (err: any) {
         log.error({ error: err.message }, "Sweeper error");
+      }
+
+      // v5.0 dispatch: revocation backstop, reminders, price watches, reviews.
+      try {
+        const { runV5Dispatch } = await import("./jobs/v5dispatch.js");
+        await runV5Dispatch();
+      } catch (err: any) {
+        log.error({ error: err.message }, "v5 dispatch error");
       }
 
       // Poll payment links

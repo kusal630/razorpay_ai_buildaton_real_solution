@@ -10,6 +10,8 @@ const log = createLogger("claimsLinter");
 
 // C6: BANNED in linter-scanned files
 // G10 (v4.3): stored-instrument implications, false consensus, nagging.
+// M24/M33 (v5): ungrounded pressure strings, guilt/confirm-shaming, stale
+// production claims ("env change only"), unqualified "tamper-proof".
 // Fabricated numbers have no static pattern by design — U-GROUND enforces
 // mechanically that every number in copy traces to a resolved token.
 const BANNED_PATTERNS = [
@@ -24,10 +26,24 @@ const BANNED_PATTERNS = [
   /\binstantcharge\b/i,
   /\beveryone is buying\b/i,
   /\bhurry\b/i,
+  /\btotal at checkout\b/i,
+  /\bfees may apply\b/i,
+  /\bact now\b/i,
+  /\blast chance\b/i,
+  /\bmissing out\b/i,
+  /\bdon't miss\b/i,
+  /\bare you sure\?/i,
+  /\benv change only\b/i,
+  /\bphysically cannot\b/i,
+  /(?<!externally anchored, never )(?<!with external anchoring.{0,80})\btamper-proof\b/i,
+  /\b0 mismatches\b/i,
 ];
 
 // C6: REQUIRED phrases (at least one must appear in scanned files)
 // G10 (v4.3): any impact figure in docs must carry the "modeled" label.
+// M33 (v5): adopted claims language — production flip requires a go-live
+// gate; tamper-evident with external anchoring; reconciliation target zero
+// unresolved critical exceptions.
 const REQUIRED_PATTERNS = [
   /at-most-once.*with.*reconciliation.*detecting.*anomalies/i,
   /append-only.*access-controlled.*tamper-evident/i,
@@ -35,6 +51,9 @@ const REQUIRED_PATTERNS = [
   /incentivized recovery and upsell require marketing consent/i,
   /estimated until reconciliation/i,
   /modeled/i,
+  /go-live gate/i,
+  /externally anchored/i,
+  /zero unresolved critical exceptions/i,
 ];
 
 // C6: Allowlist file

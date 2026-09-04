@@ -154,3 +154,54 @@ These optimize for growth and reliability.
 **Phase 4 (Scale):** 6 items
 
 **All items have gates. No item starts now.**
+
+---
+
+# v5.0 TERMINAL ROADMAP (M24 — the feature roadmap is CLOSED at this point)
+
+Every item: {status, gate, prerequisite}. Production flip requires a go-live gate.
+Ledger claims are tamper-evident with external anchoring (checkpoints + merchant
+email), never the bare unqualified variant. Contact semantics: exactly-once happy path;
+at-most-once contact per window under crash. Reconciliation target: zero
+unresolved critical exceptions (dashboard: matched / pending(age) /
+exceptions(critical|warn)). All lift figures are expected incremental EV —
+modeled until real traffic; industry numbers are priors, the holdout is the truth.
+The LLM cannot directly set amounts, but guards are still required against bad
+upstream data (validation runs after every brain call; policy gates always last).
+
+## INTEGRATION-GATED (machinery live, needs external signal)
+
+| Item | Status | Gate | Prerequisite |
+|------|--------|------|--------------|
+| COD-Save live | machinery shipped (M16), QA-triggerable | U-COD | Merchant order webhook w/ COD flag + delivery-day trigger + dynamic QR API verification |
+| NDR auto-trigger | manual-first shipped (M15) | U-NDR | Courier status webhook (replaces manual button) |
+| Full settlement reconciliation | lite fee auditor shipped (M5) | U-FEEAUDIT | Settlements API wiring |
+
+## COMPLIANCE-GATED
+
+| Item | Status | Gate | Prerequisite |
+|------|--------|------|--------------|
+| Subscriptions / UPI Autopay | documented | RBI e-mandate ≤₹15k compliance | Counsel + RBI e-mandate flow approval |
+| WhatsApp channel | documented | BSP + DLT registration | Buy BSP, DLT template registration |
+
+## POST-GA (breadth, on measured demand only)
+
+Referral, gifting calendar, tracking page (buy courier aggregation), price-drop
+alerts beyond save-for-later, replenishment (when catalog gains consumables).
+
+## CLOSED (one-line reasons — they stay dead)
+
+| Item | Reason |
+|------|--------|
+| Endowed progress | No true progress exists — dark pattern |
+| x402 | Wrong rails for this merchant |
+| Loyalty program | Rewards counterfactual purchases |
+| Dynamic pricing | Trust-destroying |
+| Fabricated scarcity | CCPA exposure |
+| Urgency stacking | Cognitive load, pressure stacking banned |
+| Consent defaults | DPDP violation |
+
+**FREEZE:** after v5.0, this codebase accepts ONLY bug fixes, test additions,
+measurement improvements, and integration wiring for the integration-gated
+items. Any new feature idea → ROADMAP.md with the MIT-filter question: "which
+lever, what evidence tier, what falsification plan, what gate?"
