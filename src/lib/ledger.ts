@@ -168,6 +168,8 @@ export async function resolveLedger(
   outcome: string,
   detail: Record<string, unknown>
 ): Promise<void> {
+  // Post-commit fan-out row, captured inside the txn, broadcast after it.
+  let pendingBroadcast: Record<string, unknown> | null = null;
   await withTransaction(async (client) => {
     const { rows: lockRows } = await client.query("SELECT merchant_id FROM audit_log WHERE seq = $1", [seq]);
     if (lockRows[0]?.merchant_id) {
@@ -201,14 +203,31 @@ export async function resolveLedger(
     // (overlapping append windows) so the chain stays continuous.
     await cascadeRelink(client, r.hash, hash);
 
-    await client.query(
+    const { rows: actRows } = await client.query(
       `INSERT INTO activity (merchant_id, actor, type, summary, data, simulated, severity)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, ts`,
       [r.merchant_id, r.actor, `LEDGER_${outcome}`,
        `${r.actor} ${r.action} → ${outcome}`,
        JSON.stringify({ seq, outcome, detail }), r.simulated, "info"]
     );
+    if (actRows[0]) {
+      pendingBroadcast = {
+        id: actRows[0].id, ts: actRows[0].ts,
+        merchant_id: r.merchant_id, actor: r.actor, type: `LEDGER_${outcome}`,
+        summary: `${r.actor} ${r.action} → ${outcome}`,
+        data: { seq, outcome },
+        simulated: r.simulated, severity: "info",
+      };
+    }
   });
+  // Post-commit: the LEDGER_* row above must reach the live feed (raw SQL
+  // writes bypass appendActivity's broadcast — that gap hid resolutions).
+  if (pendingBroadcast) {
+    try {
+      const { broadcastActivity } = await import("./activity.js");
+      broadcastActivity(pendingBroadcast);
+    } catch { /* feed fan-out never fails resolution */ }
+  }
 }
 
 /**

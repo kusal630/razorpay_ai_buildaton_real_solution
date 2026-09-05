@@ -93,6 +93,15 @@ function broadcast(payload: Record<string, unknown>): void {
   }
 }
 
+/**
+ * Push a DB row (e.g. written by a raw-SQL path inside a transaction) to
+ * live SSE subscribers. Call POST-commit only — never inside the txn.
+ * Rows written this way must include source_tag (else 'system').
+ */
+export function broadcastActivity(row: Record<string, unknown>): void {
+  broadcast({ ts: new Date().toISOString(), source_tag: "system", ...row });
+}
+
 export function subscribeActivityFeed(res: any): () => void {
   sseListeners.add(res);
 

@@ -627,18 +627,38 @@ export async function resolvePayment(pl: {
       await cascadeRelink(client, r.hash, newHash);
     }
 
-    // Activity rows
+    // Activity rows (broadcast post-commit — raw SQL bypasses appendActivity).
     const rupees = formatINR(pl.amount_paise);
-    await client.query(
+    const pendingFeed: Record<string, unknown>[] = [];
+    const { rows: paidAct } = await client.query(
       `INSERT INTO activity (merchant_id, actor, type, summary, amount_paise, data, simulated, severity)
-       VALUES ($1, 'MoneyBus', 'PAYMENT_PAID', $2, $3, $4, false, 'info')`,
+       VALUES ($1, 'MoneyBus', 'PAYMENT_PAID', $2, $3, $4, false, 'info') RETURNING id, ts`,
       [pl.merchant_id, `Payment of ${rupees} marked paid (REAL)`, pl.amount_paise, JSON.stringify({ order_id: orderId })]
     );
-    await client.query(
+    if (paidAct[0]) {
+      pendingFeed.push({
+        id: paidAct[0].id, ts: paidAct[0].ts, merchant_id: pl.merchant_id,
+        actor: "MoneyBus", type: "PAYMENT_PAID",
+        summary: `Payment of ${rupees} marked paid (REAL)`,
+        amount_paise: pl.amount_paise, data: { order_id: orderId },
+        simulated: false, severity: "info",
+      });
+    }
+    const { rows: tickAct } = await client.query(
       `INSERT INTO activity (merchant_id, actor, type, summary, amount_paise, data, simulated, severity)
-       VALUES ($1, 'MoneyBus', 'REVENUE_TICK', $2, $3, $4, false, 'info')`,
+       VALUES ($1, 'MoneyBus', 'REVENUE_TICK', $2, $3, $4, false, 'info') RETURNING id, ts`,
       [pl.merchant_id, `REAL revenue +${rupees}`, pl.amount_paise, JSON.stringify({ order_id: orderId, simulated: false })]
     );
+    if (tickAct[0]) {
+      pendingFeed.push({
+        id: tickAct[0].id, ts: tickAct[0].ts, merchant_id: pl.merchant_id,
+        actor: "MoneyBus", type: "REVENUE_TICK",
+        summary: `REAL revenue +${rupees}`,
+        amount_paise: pl.amount_paise, data: { order_id: orderId, simulated: false },
+        simulated: false, severity: "info",
+      });
+    }
+    (pl as any).__pendingFeed = pendingFeed;
 
     // Segment stats update
     if (pl.customer_id) {
@@ -749,6 +769,18 @@ export async function resolvePayment(pl: {
       );
     }
   });
+
+  // Post-commit: the PAYMENT_PAID / REVENUE_TICK rows above must reach the
+  // live feed (raw SQL writes bypass appendActivity's broadcast — that gap
+  // hid every payment resolution from the console until refresh).
+  try {
+    const pending = (pl as any).__pendingFeed as Record<string, unknown>[] | undefined;
+    delete (pl as any).__pendingFeed;
+    if (pending && pending.length > 0) {
+      const { broadcastActivity } = await import("./activity.js");
+      for (const row of pending) broadcastActivity(row);
+    }
+  } catch { /* feed fan-out never fails resolution */ }
 
   // Post-commit: trigger UpsellBot (outside the transaction)
   try {

@@ -296,6 +296,12 @@
         document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
         tab.classList.add('active');
         document.getElementById('tab-' + tab.dataset.tab).classList.add('active');
+        // Tabs never show stale data: the ledger/approvals lists reload on
+        // every visit (previously they loaded once at login).
+        try {
+          if (tab.dataset.tab === 'ledger' && typeof loadLedger === 'function') loadLedger();
+          if (tab.dataset.tab === 'approvals' && typeof loadApprovals === 'function') loadApprovals();
+        } catch {}
       });
     });
 
@@ -497,7 +503,14 @@
     let feedPaused = localStorage.getItem('feedPaused') === '1';
     let pausedBuffer = [];
     let pausedDropped = 0;
-    let feedFilters = JSON.parse(localStorage.getItem('feedFilters') || '{"actors":[],"types":[],"special":[]}');
+    let feedFilters;
+    try {
+      feedFilters = JSON.parse(localStorage.getItem('feedFilters') || '{"actors":[],"types":[],"special":[]}');
+      if (!feedFilters || typeof feedFilters !== 'object') feedFilters = { actors: [], types: [], special: [] };
+      feedFilters.actors = feedFilters.actors || [];
+      feedFilters.types = feedFilters.types || [];
+      feedFilters.special = feedFilters.special || [];
+    } catch { feedFilters = { actors: [], types: [], special: [] }; }
     let lastVisible = [];
     let feedAtBottom = true;
     let awayCount = 0;
@@ -566,16 +579,22 @@
       renderChips();
       renderFeed();
     }
+    // Chips render via data-attributes + one delegated listener: chip values
+    // contain double quotes (mode:"llm" only) which break inline onclick="".
     function renderChips() {
       const groups = [['actors', 'chips-actor', ACTOR_CHIPS], ['types', 'chips-type', TYPE_CHIPS], ['special', 'chips-special', SPECIAL_CHIPS]];
       for (const [group, elId, chips] of groups) {
         const el = document.getElementById(elId);
         const label = el.querySelector('.chip-label').outerHTML;
         el.innerHTML = label + chips.map((c) =>
-          `<span class="chip ${((feedFilters[group] || []).includes(c)) ? 'active' : ''}" onclick="toggleChip('${group}','${c}')">${c}</span>`
+          `<span class="chip ${((feedFilters[group] || []).includes(c)) ? 'active' : ''}" data-group="${group}" data-value="${escHtml(c)}">${escHtml(c)}</span>`
         ).join('');
       }
     }
+    document.addEventListener('click', (e) => {
+      const chip = e.target && e.target.closest ? e.target.closest('.chip[data-group]') : null;
+      if (chip) toggleChip(chip.getAttribute('data-group'), chip.getAttribute('data-value'));
+    });
     function togglePause() {
       feedPaused = !feedPaused;
       localStorage.setItem('feedPaused', feedPaused ? '1' : '0');
@@ -694,11 +713,15 @@
 
     function renderFeed() {
       const el = document.getElementById('feed');
-      document.getElementById('feed-count').textContent = feedRows.length;
       // Auto-scroll only when already at the bottom (within 3 rows).
       const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
       if (nearBottom) feedAtBottom = true;
       lastVisible = feedRows.filter((r) => (clearedBeforeId == null || (r.id != null && r.id > clearedBeforeId)) && rowMatches(r)).slice(0, 200);
+      // The badge counts what the viewport actually shows (filters + clear
+      // aware); the buffered total rides in the tooltip.
+      const countEl = document.getElementById('feed-count');
+      countEl.textContent = String(lastVisible.length);
+      countEl.title = `${feedRows.length} events in view buffer${feedPaused ? ` · ${pausedBuffer.length + pausedDropped} buffered while paused` : ''}`;
       const markerHtml = clearedMarker
         ? `<div class="feed-row" style="color:#484f58; font-style:italic; cursor:default">${clearedMarker}</div>`
         : '';
@@ -765,12 +788,20 @@
     async function setDataMode(mode) {
       if (mode === 'live' && !confirm('Live mode adds continuous traffic — console will stay busy. Switch?')) return;
       const el = document.getElementById('mode-status');
+      const btns = [document.getElementById('mode-demo'), document.getElementById('mode-live')];
+      btns.forEach((b) => { if (b) b.disabled = true; });
       el.textContent = 'Switching...';
-      const res = await fetch('/api/data-mode', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken }, body: JSON.stringify({ mode }) });
-      const d = await res.json();
-      if (!res.ok) { el.textContent = `Switch failed: ${d.error || res.status}`; return; }
-      el.textContent = mode === 'live' ? 'LIVE — trickle on' : 'DEMO — simulator off';
-      syncModeUI(d.mode, d.demo_bg_enabled);
+      try {
+        const res = await fetch('/api/data-mode', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken }, body: JSON.stringify({ mode }) });
+        const d = await res.json();
+        if (!res.ok) { el.textContent = `Switch failed: ${d.error || res.status}`; return; }
+        el.textContent = mode === 'live' ? 'LIVE — trickle on' : 'DEMO — simulator off';
+        syncModeUI(d.mode, d.demo_bg_enabled);
+      } catch (err) {
+        el.textContent = `Switch failed: ${(err && err.message) || err}`;
+      } finally {
+        btns.forEach((b) => { if (b) b.disabled = false; });
+      }
     }
     async function setDemoBg(enabled) {
       const el = document.getElementById('mode-status');

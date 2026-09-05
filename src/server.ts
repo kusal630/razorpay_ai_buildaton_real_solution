@@ -202,21 +202,34 @@ function startScheduler() {
 
       // Demo-bg sub-toggle: silenced background carts are invisible to all
       // scans (in-flight intents drain; no NEW chains start for them).
+      // Demo quarantine: in DEMO mode the scheduler additionally ignores
+      // 'live'-tagged carts — simulator output belongs to live mode, and
+      // demo must go quiet after its 12 stories fire (U-DEMOQUIET).
       let bgClause = "";
+      let liveClause = "";
+      let liveClauseC = "";
       try {
         const { getDataMode } = await import("./lib/dataMode.js");
-        if (!(await getDataMode()).demo_bg_enabled) bgClause = "AND COALESCE(source_tag,'demo') <> 'demo-bg' ";
+        const dm = await getDataMode();
+        if (!dm.demo_bg_enabled) bgClause = "AND COALESCE(source_tag,'demo') <> 'demo-bg' ";
+        if (dm.mode === "demo") {
+          liveClause = "AND COALESCE(source_tag,'demo') <> 'live' ";
+          liveClauseC = "AND COALESCE(c.source_tag,'demo') <> 'live' ";
+        }
       } catch { /* fail open: scans run unfiltered */ }
       const bgClauseC = bgClause ? "AND COALESCE(c.source_tag,'demo') <> 'demo-bg' " : "";
+      const demoClause = liveClause;
+      const demoClauseC = liveClauseC;
 
       // Find abandoned carts
       const abandonMinutes = config.ABANDON_MINUTES;
       const { rows: carts } = await query(
-        `UPDATE carts SET status = 'abandoned', abandoned_at = COALESCE(abandoned_at, NOW())
-         WHERE status = 'active'
-         AND updated_at < NOW() - INTERVAL '${abandonMinutes} minutes'
-         ${bgClause}
-         RETURNING id`
+         `UPDATE carts SET status = 'abandoned', abandoned_at = COALESCE(abandoned_at, NOW())
+          WHERE status = 'active'
+          AND updated_at < NOW() - INTERVAL '${abandonMinutes} minutes'
+          ${bgClause}
+          ${demoClause}
+          RETURNING id`
       );
 
       if (carts.length > 0) {
@@ -241,13 +254,14 @@ function startScheduler() {
          AND c.abandoned_at > NOW() - INTERVAL '24 hours'
          AND c.customer_id IS NOT NULL
          AND NOT EXISTS (SELECT 1 FROM touches t WHERE t.customer_id = c.customer_id)
-         AND NOT EXISTS (
-           SELECT 1 FROM action_intents ai
-           WHERE ai.dedupe_key LIKE '%:recovery_early:%'
-           AND ai.dedupe_key LIKE '%' || c.id::text || '%'
-         )
-         ${bgClauseC}
-         LIMIT 10`
+          AND NOT EXISTS (
+            SELECT 1 FROM action_intents ai
+            WHERE ai.dedupe_key LIKE '%:recovery_early:%'
+            AND ai.dedupe_key LIKE '%' || c.id::text || '%'
+          )
+          ${bgClauseC}
+          ${demoClauseC}
+          LIMIT 10`
       );
       if (earlyCarts.length > 0) {
         log.info({ count: earlyCarts.length }, "Early-window carts found");
@@ -273,12 +287,13 @@ function startScheduler() {
       const { rows: unprocessed } = await query(
         `SELECT c.id, c.customer_id FROM carts c
          WHERE c.status = 'abandoned' AND c.abandoned_at < NOW() - INTERVAL '1 minute'
-         AND NOT EXISTS (
-           SELECT 1 FROM action_intents ai
-           WHERE ai.dedupe_key LIKE '%' || c.id::text || '%'
-         )
-         ${bgClauseC}
-         LIMIT 10`
+          AND NOT EXISTS (
+            SELECT 1 FROM action_intents ai
+            WHERE ai.dedupe_key LIKE '%' || c.id::text || '%'
+          )
+          ${bgClauseC}
+          ${demoClauseC}
+          LIMIT 10`
       );
       if (unprocessed.length > 0) {
         const { processAbandonedCart } = await import("./agents/recoveryBot.js");
@@ -319,12 +334,13 @@ function startScheduler() {
            SELECT 1 FROM payment_links pl2
            WHERE pl2.cart_id::text = c.id::text AND pl2.status = 'paid'
          )
-         AND NOT EXISTS (
-           SELECT 1 FROM orders o
-           WHERE o.cart_id = c.id AND o.status = 'paid'
-         )
-         ${bgClauseC}
-         LIMIT 10`
+          AND NOT EXISTS (
+            SELECT 1 FROM orders o
+            WHERE o.cart_id = c.id AND o.status = 'paid'
+          )
+          ${bgClauseC}
+          ${demoClauseC}
+          LIMIT 10`
       );
       if (finalCarts.length > 0) {
         log.info({ count: finalCarts.length }, "Final-call carts found");

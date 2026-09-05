@@ -308,10 +308,31 @@ opsRouter.post("/api/reconcile", requireAuth, async (_req: Request, res: Respons
       const ageMin = link.created_at
         ? Math.max(0, Math.round((Date.now() - new Date(link.created_at).getTime()) / 60000))
         : 0;
-      try {
+      // Sequential test-API fetches 429 often — back off and retry with the
+      // identical read before calling anything unreachable (else every
+      // rate-limit becomes a warn exception).
+      const fetchRemote = async (): Promise<any> => {
         const rp = (await import("../lib/razorpayService.js")).getRazorpay();
-        const rpLink = await rp.paymentLink.fetch(link.razorpay_link_id);
-        if (rpLink.status === link.status || (rpLink.status === "paid" && link.status === "paid")) {
+        for (let attempt = 0; ; attempt++) {
+          try {
+            return await rp.paymentLink.fetch(link.razorpay_link_id);
+          } catch (err: any) {
+            const status = err?.statusCode ?? err?.status;
+            if (status === 429 && attempt < 2) {
+              await new Promise((r) => setTimeout(r, attempt === 0 ? 2000 : 5000));
+              continue;
+            }
+            throw err;
+          }
+        }
+      };
+      try {
+        const rpLink = await fetchRemote();
+        // Vocabulary-normalized compare: local 'live' == remote 'created' /
+        // 'partially_paid' (both mean awaiting payment) — not a divergence.
+        const { classifyLink } = await import("../lib/reconcile.js");
+        const verdict = classifyLink(link.status, rpLink.status, false);
+        if (verdict.matched) {
           matched++;
         } else {
           exceptions.push({
@@ -320,9 +341,12 @@ opsRouter.post("/api/reconcile", requireAuth, async (_req: Request, res: Respons
           });
         }
       } catch {
+        // Gateway unreachable proves nothing either way — warn, never critical.
+        const { classifyLink } = await import("../lib/reconcile.js");
+        const verdict = classifyLink(link.status, null, true);
         exceptions.push({
           razorpay_link_id: link.razorpay_link_id, status_local: link.status,
-          status_remote: "unreachable", age_min: ageMin, severity: "critical",
+          status_remote: verdict.status_remote, age_min: ageMin, severity: verdict.severity,
         });
       }
     }
