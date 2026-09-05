@@ -235,6 +235,24 @@ export async function sendLinkFailureNudge(
   if (!customerId) return;
   const method = payment?.method || payment?.payment_method || null;
 
+  // Never tell a customer who already paid that their payment failed
+  // (a later attempt can fail after an earlier one succeeded).
+  if (link.cart_id) {
+    const { rows: paidRows } = await query(
+      `SELECT 1 FROM payment_links WHERE cart_id = $1 AND status = 'paid'
+       UNION SELECT 1 FROM orders WHERE cart_id = $1::uuid AND status = 'paid' LIMIT 1`,
+      [link.cart_id]
+    ).catch(() => ({ rows: [] as any[] }));
+    if (paidRows.length > 0) {
+      await appendActivity({
+        merchant_id: MERCHANT_ID, actor: "FailureRetryBot", type: "DUPLICATE_SKIPPED",
+        summary: `Link-failure nudge skipped — cart already paid (link ${link.razorpay_link_id})`,
+        data: { razorpay_link_id: link.razorpay_link_id, reason: "already_paid" },
+      });
+      return;
+    }
+  }
+
   // The attempt itself anchors transactional consent (same as the retry path).
   await anchorTransactional(customerId, link.cart_id || `link:${link.id}`);
   const hasTransactional = await checkTransactionalConsent(customerId);

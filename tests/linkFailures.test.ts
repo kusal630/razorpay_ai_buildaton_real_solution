@@ -16,6 +16,7 @@ import {
   isFailedAttempt,
   extractFailedAttempts,
   recordLinkPaymentFailure,
+  matchFailedToLink,
 } from "../src/lib/linkFailures.js";
 
 describe("reconcile simulated bucket (zero-critical target)", () => {
@@ -53,6 +54,32 @@ describe("link failure classification (pure)", () => {
     expect(extractFailedAttempts(link).map((p: any) => p.id)).toEqual(["a"]);
     expect(extractFailedAttempts({})).toEqual([]);
     expect(extractFailedAttempts(null)).toEqual([]);
+  });
+});
+
+describe("gateway payment → link matching (pure)", () => {
+  const links: any[] = [
+    { id: "l1", razorpay_link_id: "plink_AAA", merchant_id: "m", cart_id: "cart-1", customer_id: "c1", amount_paise: 189900, ext_ref: "ext-1", short_url: "https://rzp.io/l/aaa" },
+    { id: "l2", razorpay_link_id: "plink_BBB", merchant_id: "m", cart_id: "cart-2", customer_id: "c2", amount_paise: 99900, ext_ref: "ext-2", short_url: "https://rzp.io/l/bbb" },
+  ];
+  it("matches on notes.ext_ref exactly", () => {
+    const hit = matchFailedToLink({ id: "pay_1", status: "failed", notes: { ext_ref: "ext-2" } }, links);
+    expect(hit?.id).toBe("l2");
+  });
+  it("falls back to notes.cart_id", () => {
+    const hit = matchFailedToLink({ id: "pay_2", status: "failed", notes: { cart_id: "cart-1" } }, links);
+    expect(hit?.id).toBe("l1");
+  });
+  it("falls back to the link fragment in description", () => {
+    const hit = matchFailedToLink({ id: "pay_3", status: "failed", description: "#TYKWZ6FyGZiBVK" }, [
+      { ...links[0], razorpay_link_id: "plink_TYKWZ6FyGZiBVK" },
+    ]);
+    expect(hit?.id).toBe("l1");
+  });
+  it("returns null when nothing matches (no false attribution)", () => {
+    expect(matchFailedToLink({ id: "pay_4", status: "failed", notes: {} }, links)).toBe(null);
+    expect(matchFailedToLink({ id: "pay_5", status: "failed" }, links)).toBe(null);
+    expect(matchFailedToLink(null, links)).toBe(null);
   });
 });
 

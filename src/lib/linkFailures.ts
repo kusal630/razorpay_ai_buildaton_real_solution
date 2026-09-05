@@ -61,6 +61,51 @@ export function extractFailedAttempts(linkPayload: any): any[] {
   return payments.filter(isFailedAttempt);
 }
 
+export interface LinkRef {
+  id: string;
+  razorpay_link_id: string;
+  merchant_id: string;
+  cart_id: string | null;
+  customer_id: string | null;
+  amount_paise: number;
+  short_url?: string | null;
+  ext_ref?: string | null;
+}
+
+/**
+ * Pure: match a gateway payment entity to one of our live links.
+ * A failed link attempt carries OUR notes (cart_id/ext_ref/audit_seq —
+ * verified live: the entity inherits them) plus the link id in
+ * `description` (#<linkId…>). ext_ref is exact; cart falls back to a
+ * live link for that cart.
+ */
+export function matchFailedToLink(
+  payment: any,
+  links: LinkRef[]
+): LinkRef | null {
+  if (!payment || typeof payment !== "object" || links.length === 0) return null;
+  const notes = payment.notes || {};
+  const extRef = notes.ext_ref || notes.extRef || null;
+  if (extRef) {
+    const hit = links.find((l) => l.ext_ref === extRef);
+    if (hit) return hit;
+  }
+  const cartId = notes.cart_id || notes.cartId || null;
+  if (cartId) {
+    const hit = links.find((l) => l.cart_id === cartId);
+    if (hit) return hit;
+  }
+  const desc = String(payment.description || "");
+  const m = desc.match(/#([A-Za-z0-9]+)/);
+  if (m) {
+    const hit = links.find((l) =>
+      l.razorpay_link_id.includes(m[1]) || (l.short_url || "").includes(m[1])
+    );
+    if (hit) return hit;
+  }
+  return null;
+}
+
 export interface LinkRow {
   id: string;
   merchant_id: string;

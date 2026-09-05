@@ -76,17 +76,29 @@ webhookRouter.post("/webhooks/razorpay", async (req: Request, res: Response) => 
       let links: any[] = [];
       if (linkId) {
         ({ rows: links } = await query(
-          `SELECT id, razorpay_link_id, merchant_id, cart_id, customer_id, amount_paise, short_url
+          `SELECT id, razorpay_link_id, merchant_id, cart_id, customer_id, amount_paise, short_url, ext_ref
            FROM payment_links WHERE razorpay_link_id = $1 AND status = 'live'`,
           [linkId]
         ));
       }
       if (links.length === 0 && rpOrderId) {
         ({ rows: links } = await query(
-          `SELECT id, razorpay_link_id, merchant_id, cart_id, customer_id, amount_paise, short_url
+          `SELECT id, razorpay_link_id, merchant_id, cart_id, customer_id, amount_paise, short_url, ext_ref
            FROM payment_links WHERE razorpay_order_id = $1 AND status = 'live'`,
           [rpOrderId]
         ));
+      }
+      if (links.length === 0) {
+        // Notes-based match: failed link attempts inherit our notes
+        // (cart_id/ext_ref) on the payment entity — verified live.
+        const { rows: live } = await query(
+          `SELECT id, razorpay_link_id, merchant_id, cart_id, customer_id, amount_paise, short_url, ext_ref
+           FROM payment_links WHERE status = 'live' AND razorpay_link_id IS NOT NULL
+           AND created_at > NOW() - INTERVAL '25 hours' LIMIT 50`
+        );
+        const { matchFailedToLink } = await import("../lib/linkFailures.js");
+        const hit = matchFailedToLink(entity, live);
+        if (hit) links = [hit];
       }
       if (links[0]) {
         const { ensureLinkAttemptsTable, recordLinkPaymentFailure } = await import("../lib/linkFailures.js");

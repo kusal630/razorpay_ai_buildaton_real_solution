@@ -205,6 +205,12 @@ function startScheduler() {
   log.info("Starting 15s scheduler loop");
   let tickSeq = 0;
   let tickInFlight = 0;
+  // Poller rotation: 42 live links × fetch each pass keeps every tick over
+  // 15s (chronic skip-spiral). Each pass polls ONE slice (~12 links, ~4s);
+  // full coverage rotates every ~1min. Webhooks stay the instant path;
+  // resolvePayment is idempotent, so slice boundaries are harmless.
+  let pollSlice = 0;
+  const POLL_SLICE_SIZE = 12;
   setInterval(async () => {
     const tickId = ++tickSeq;
     // Single-flight: a tick that overruns its 15s window must NOT overlap
@@ -486,18 +492,63 @@ function startScheduler() {
       // Poll payment links
       const { rows: liveLinks } = await query(
         `SELECT id, razorpay_link_id, merchant_id, cart_id, customer_id,
-                amount_paise, incentive_paise, short_url, audit_seq
+                amount_paise, incentive_paise, short_url, audit_seq, ext_ref
          FROM payment_links
          WHERE status = 'live' AND razorpay_link_id IS NOT NULL
          AND created_at > NOW() - INTERVAL '25 hours'
-         LIMIT 50`
+         ORDER BY id LIMIT 50`
       );
       if (liveLinks.length > 0) {
-        const { fetchPaymentLink, resolvePayment } = await import("./lib/moneyBus.js");
+        const { fetchPaymentLink, resolvePayment, fetchPaymentsList } = await import("./lib/moneyBus.js");
         const { withTimeout, GATEWAY_TIMEOUT_MS } = await import("./lib/timeout.js");
         const { appendActivity } = await import("./lib/activity.js");
+        const { sendLinkFailureNudge } = await import("./agents/failureRetryBot.js");
+        const {
+          extractFailedAttempts, recordLinkPaymentFailure, ensureLinkAttemptsTable,
+          matchFailedToLink,
+        } = await import("./lib/linkFailures.js");
+        await ensureLinkAttemptsTable().catch(() => {});
+
+        // Shared handler for ONE failed attempt, whatever the source
+        // (per-link payments[] or the gateway-wide sweep below). Records
+        // truth always; nudges only first-sighting AND unpaid carts (never
+        // tell a customer who already paid that their payment failed).
+        const handleFailedAttempt = async (link: any, payment: any, source: string): Promise<void> => {
+          const rec = await recordLinkPaymentFailure(undefined, link, payment);
+          if (!rec.isNew) return;
+          let paid = false;
+          if (link.cart_id) {
+            try {
+              const { rows: paidRows } = await query(
+                `SELECT 1 FROM payment_links WHERE cart_id = $1 AND status = 'paid'
+                 UNION SELECT 1 FROM orders WHERE cart_id = $1::uuid AND status = 'paid' LIMIT 1`,
+                [link.cart_id]
+              );
+              paid = paidRows.length > 0;
+            } catch { /* check failed → nudge anyway, truth over silence */ }
+          }
+          await appendActivity({
+            merchant_id: link.merchant_id || "5a3ac6ce-b2c7-4b1f-a9db-45296841f30b",
+            actor: "MoneyBus", type: "PAYMENT_FAILED",
+            summary: `Payment failed on link ${link.razorpay_link_id} (${payment.method || payment.payment_method || "unknown method"}) — retry nudge armed`,
+            data: {
+              razorpay_link_id: link.razorpay_link_id, razorpay_payment_id: rec.paymentId,
+              method: payment.method || payment.payment_method || null,
+              order_id: rec.orderId, via: source, nudge_skipped_paid: paid || undefined,
+            },
+            severity: "warning",
+          });
+          if (!paid) await sendLinkFailureNudge(link, payment, rec.orderId);
+        };
+
         let throttled = false;
-        for (const link of liveLinks) {
+        const pollSet = liveLinks.length <= POLL_SLICE_SIZE
+          ? liveLinks
+          : liveLinks.slice(pollSlice, pollSlice + POLL_SLICE_SIZE);
+        pollSlice = liveLinks.length <= POLL_SLICE_SIZE
+          ? 0
+          : (pollSlice + POLL_SLICE_SIZE) % liveLinks.length;
+        for (const link of pollSet) {
           if (throttled) break;
           try {
             // Bounded: one hung gateway socket must not wedge the tick
@@ -519,28 +570,13 @@ function startScheduler() {
               await query("UPDATE payment_links SET status = $1 WHERE id = $2", [rpLink.status, link.id]);
             }
 
-            // Failed-attempt detection: a link reports 'created' even after
-            // attempts fail — failures live on link.payments[]. First
-            // sighting records + nudges (existing link reused); re-sightings
-            // are silent (dedupe by payment id).
+            // Failed-attempt detection source 1: the link's own payments[].
+            // (Often empty — the gateway lists attempts inconsistently —
+            // so the gateway-wide sweep below is the primary net.)
             try {
-              const { extractFailedAttempts, recordLinkPaymentFailure, ensureLinkAttemptsTable } = await import("./lib/linkFailures.js");
               const failed = extractFailedAttempts(rpLink);
-              if (failed.length > 0) {
-                await ensureLinkAttemptsTable();
-                const { sendLinkFailureNudge } = await import("./agents/failureRetryBot.js");
-                for (const payment of failed) {
-                  const rec = await recordLinkPaymentFailure(undefined, link, payment);
-                  if (!rec.isNew) continue;
-                  await appendActivity({
-                    merchant_id: link.merchant_id || "5a3ac6ce-b2c7-4b1f-a9db-45296841f30b",
-                    actor: "MoneyBus", type: "PAYMENT_FAILED",
-                    summary: `Payment failed on link ${link.razorpay_link_id} (${payment.method || "unknown method"}) — retry nudge armed`,
-                    data: { razorpay_link_id: link.razorpay_link_id, razorpay_payment_id: rec.paymentId, method: payment.method || null, order_id: rec.orderId },
-                    severity: "warning",
-                  });
-                  await sendLinkFailureNudge(link, payment, rec.orderId);
-                }
+              for (const payment of failed) {
+                await handleFailedAttempt(link, payment, "link-payments");
               }
             } catch (detectErr: any) {
               log.error({ linkId: link.razorpay_link_id, error: detectErr?.message }, "Link-failure detection error");
@@ -557,8 +593,33 @@ function startScheduler() {
               log.error({ linkId: link.razorpay_link_id, error: err.message, status, detail: err.error }, "Poller error");
             }
           }
-          // Gentle spacing: 33 back-to-back fetches invite the throttle.
-          await new Promise((r) => setTimeout(r, 250));
+          // Gentle spacing: back-to-back fetches invite the throttle.
+          await new Promise((r) => setTimeout(r, 100));
+        }
+
+        // Failed-attempt detection source 2 (primary net): gateway-wide
+        // failed payments. Verified live: link.payments[] came back EMPTY
+        // for links with 2 failed + 1 captured attempt, while payments.all
+        // lists every failed attempt WITH our notes (cart_id/ext_ref) —
+        // the entity inherits them. One call per tick; dedupe by payment
+        // id makes the 35-min overlap window harmless.
+        try {
+          const nowSec = Math.floor(Date.now() / 1000);
+          const listed: any = await withTimeout(
+            fetchPaymentsList({ from: nowSec - 2100, to: nowSec, count: 100 }),
+            GATEWAY_TIMEOUT_MS,
+            "poller failed-payments sweep"
+          );
+          const items: any[] = (listed && (listed.items || listed)) || [];
+          const { isFailedAttempt } = await import("./lib/linkFailures.js");
+          for (const payment of (Array.isArray(items) ? items : [])) {
+            if (!isFailedAttempt(payment)) continue;
+            const link = matchFailedToLink(payment, liveLinks);
+            if (!link) continue;
+            await handleFailedAttempt(link, payment, "gateway-sweep");
+          }
+        } catch (sweepErr: any) {
+          log.error({ error: sweepErr?.message }, "Failed-payments sweep error");
         }
       }
     } catch (err: any) {
