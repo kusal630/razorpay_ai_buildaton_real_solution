@@ -205,12 +205,14 @@ function startScheduler() {
   log.info("Starting 15s scheduler loop");
   let tickSeq = 0;
   let tickInFlight = 0;
-  // Poller rotation: 42 live links × fetch each pass keeps every tick over
-  // 15s (chronic skip-spiral). Each pass polls ONE slice (~12 links, ~4s);
-  // full coverage rotates every ~1min. Webhooks stay the instant path;
-  // resolvePayment is idempotent, so slice boundaries are harmless.
+  // Poll rotation: fetch the list newest-first and walk a 20-slice through
+  // it each pass (~7s/pass, full coverage ~every 2 passes ≈ 30–45s worst
+  // case). Fresh links — where a customer just paid — sit at the front so
+  // they are seen fast; the tail still rotates so nothing starves. The old
+  // full-set poll (42 links/pass) kept every tick over 15s and tripped 429s.
+  // Webhooks stay the instant path; resolution is idempotent.
   let pollSlice = 0;
-  const POLL_SLICE_SIZE = 12;
+  const POLL_SLICE_SIZE = 20;
   setInterval(async () => {
     const tickId = ++tickSeq;
     // Single-flight: a tick that overruns its 15s window must NOT overlap
@@ -496,7 +498,7 @@ function startScheduler() {
          FROM payment_links
          WHERE status = 'live' AND razorpay_link_id IS NOT NULL
          AND created_at > NOW() - INTERVAL '25 hours'
-         ORDER BY id LIMIT 50`
+         ORDER BY created_at DESC LIMIT 50`
       );
       if (liveLinks.length > 0) {
         const { fetchPaymentLink, resolvePayment, fetchPaymentsList } = await import("./lib/moneyBus.js");
@@ -594,7 +596,7 @@ function startScheduler() {
             }
           }
           // Gentle spacing: back-to-back fetches invite the throttle.
-          await new Promise((r) => setTimeout(r, 100));
+          await new Promise((r) => setTimeout(r, 50));
         }
 
         // Failed-attempt detection source 2 (primary net): gateway-wide

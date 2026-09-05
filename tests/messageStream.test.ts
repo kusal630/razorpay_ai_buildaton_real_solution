@@ -25,6 +25,10 @@ describe("U-MSGSENT masking at emission (PII hard rule)", () => {
     expect(maskRecipient("+919876543210")).toBe("+91 ••••• 3210");
     expect(maskRecipient("+919876543210")).not.toContain("987654");
   });
+  it("bare 10-digit and truncated 11-digit inputs still render +91", () => {
+    expect(maskRecipient("9876543210")).toBe("+91 ••••• 3210");
+    expect(maskRecipient("+91987654321")).toBe("+91 ••••• 4321");
+  });
   it("emails hide the local part", () => {
     const m = maskRecipient("riya.sharma@example.com");
     expect(m).not.toContain("riya.sharma");

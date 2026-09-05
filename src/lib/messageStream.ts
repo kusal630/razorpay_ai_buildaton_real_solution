@@ -54,7 +54,13 @@ export function maskRecipient(contact: string): string {
   }
   const digits = c.replace(/\D/g, "");
   const last4 = digits.slice(-4) || "••••";
-  const cc = digits.length > 10 ? `+${digits.slice(0, digits.length - 10)} ` : "+91 ";
+  // Indian numbers arrive as 10 digits, or 12 with the 91 prefix (an
+  // 11-digit 91-prefixed value means a digit was dropped upstream — the
+  // last-4 below is still the correct identity anchor either way).
+  const indian =
+    digits.length === 10 ||
+    (digits.length >= 11 && digits.startsWith("91"));
+  const cc = indian ? "+91 " : digits.length > 10 ? `+${digits.slice(0, digits.length - 10)} ` : "+91 ";
   return `${cc}••••• ${last4}`;
 }
 
