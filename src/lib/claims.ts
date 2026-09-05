@@ -299,12 +299,59 @@ export async function groundCopy(
   const scannable = source === "code" && facts.items
     ? facts.items.reduce((t, i) => t.split(i.name).join(""), working)
     : working;
+  // Step 4.5: bare numbers must trace to a grounded value — with a scale
+  // rule for ₹-amounts. The allowed set carries BOTH paise and rupee forms
+  // (facts + resolutions), so a literal "₹189900" used to pass as "the cart
+  // total, in paise" while displaying paise under a rupee symbol (U-RUPEE:
+  // FailureRetryBot sent "saved amount of ₹189900"). ₹-prefixed amounts are
+  // therefore judged against rupee-scale values ONLY; every other number
+  // keeps the existing trace check.
+  const RUPEE_AMT_RE = /₹\s?([\d,]+)/g;
+  function rupeeAmounts(text: string): number[] {
+    const out: number[] = [];
+    const re = new RegExp(RUPEE_AMT_RE.source, RUPEE_AMT_RE.flags);
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(text)) !== null) {
+      const n = Number(m[1].replace(/,/g, ""));
+      if (Number.isFinite(n)) out.push(n);
+    }
+    return out;
+  }
+  // Rupee-scale values: every paise fact at /100, small ints verbatim,
+  // plus ₹-amounts inside merchant-configured strings (offer text is
+  // ground truth, so its printed amounts are grounded by construction).
+  const rupeeScale: number[] = [];
+  const pushPaiseAsRupees = (v: unknown) => {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return;
+    if (n >= 100 && n % 100 === 0) rupeeScale.push(n / 100);
+    else if (Math.abs(n) < 100) rupeeScale.push(n);
+  };
+  pushPaiseAsRupees(facts.incentive_paise);
+  pushPaiseAsRupees(facts.cart_total_paise);
+  pushPaiseAsRupees(facts.order_incentive_paise);
+  for (const it of facts.items || []) pushPaiseAsRupees((it as any).price_paise);
+  for (const n of facts.extra_numbers || []) {
+    const v = Number(n);
+    if (Number.isFinite(v)) rupeeScale.push(v);
+  }
+  for (const r of resolved) {
+    if (typeof r.value === "number") pushPaiseAsRupees(r.value);
+    else if (typeof r.value === "string") rupeeScale.push(...rupeeAmounts(r.value));
+    if (typeof r.rendered === "string" && r.rendered !== r.value) {
+      rupeeScale.push(...rupeeAmounts(r.rendered));
+    }
+  }
+  const noRupeeSpans = scannable.replace(/₹\s?[\d,]+/g, "#");
+  const rupeeViolations = rupeeAmounts(scannable).filter((n) => !rupeeScale.includes(n));
   if (source === "llm") {
-    for (const n of numbersIn(scannable)) {
+    for (const n of rupeeViolations) violations.push(`rupee_amount_not_grounded: ₹${n}`);
+    for (const n of numbersIn(noRupeeSpans)) {
       if (!allowed.includes(n)) violations.push(`bare_number_without_token: ${n}`);
     }
   } else {
-    for (const n of numbersIn(scannable)) {
+    for (const n of rupeeViolations) violations.push(`code_rupee_not_in_facts: ₹${n}`);
+    for (const n of numbersIn(noRupeeSpans)) {
       if (!allowed.includes(n)) violations.push(`code_number_not_in_facts: ${n}`);
     }
   }
