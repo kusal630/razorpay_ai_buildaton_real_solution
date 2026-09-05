@@ -48,10 +48,19 @@ export async function ensureLinkAttemptsTable(
 /** Failed-attempt statuses on a Razorpay payment entity. */
 const FAILED_PAYMENT_STATUSES = new Set(["failed", "rejected"]);
 
+/** Settled statuses on a Razorpay payment entity. */
+const CAPTURED_PAYMENT_STATUSES = new Set(["captured", "authorized"]);
+
 /** Pure: is this link.payments[] entry a failed attempt? */
 export function isFailedAttempt(payment: any): boolean {
   if (!payment || typeof payment !== "object") return false;
   return FAILED_PAYMENT_STATUSES.has(String(payment.status || "").toLowerCase());
+}
+
+/** Pure: is this a settled (captured/authorized) payment? */
+export function isCapturedAttempt(payment: any): boolean {
+  if (!payment || typeof payment !== "object") return false;
+  return CAPTURED_PAYMENT_STATUSES.has(String(payment.status || "").toLowerCase());
 }
 
 /** Pure: pull failed attempts out of a fetched link payload. */
@@ -70,6 +79,8 @@ export interface LinkRef {
   amount_paise: number;
   short_url?: string | null;
   ext_ref?: string | null;
+  audit_seq?: number;
+  incentive_paise?: number;
 }
 
 /**

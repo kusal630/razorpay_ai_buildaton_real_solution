@@ -213,6 +213,11 @@ function startScheduler() {
   // Webhooks stay the instant path; resolution is idempotent.
   let pollSlice = 0;
   const POLL_SLICE_SIZE = 20;
+  // Twice-gone links: test gateway purges links (fetch → 404), including
+  // links that were PAID just before purging. First 404 only notes the
+  // link (transient protection); the second consecutive 404 expires it so
+  // dead links stop consuming the poller forever.
+  const goneLinks = new Set<string>();
   setInterval(async () => {
     const tickId = ++tickSeq;
     // Single-flight: a tick that overruns its 15s window must NOT overlap
@@ -560,6 +565,7 @@ function startScheduler() {
               GATEWAY_TIMEOUT_MS,
               `poller fetch ${link.razorpay_link_id}`
             );
+            goneLinks.delete(link.id);
             if (rpLink.status === "paid") {
               await resolvePayment({
                 id: link.id, merchant_id: link.merchant_id || "5a3ac6ce-b2c7-4b1f-a9db-45296841f30b",
@@ -591,6 +597,32 @@ function startScheduler() {
               // doomed fetches. One log line, not 33 error rows.
               throttled = true;
               log.warn("Poller throttled by gateway (429) — deferring rest of pass");
+            } else if (status === 404) {
+              // Link gone on the gateway (test-mode purge). Resolve-first:
+              // a captured payment may already be recorded against it (the
+              // sweep below resolves on payment evidence, not link state).
+              // Otherwise expire on the SECOND consecutive 404 so dead
+              // links stop consuming the poller.
+              if (goneLinks.has(link.id)) {
+                goneLinks.delete(link.id);
+                await query("UPDATE payment_links SET status = 'expired' WHERE id = $1 AND status = 'live'", [link.id]);
+                try {
+                  const incentive = Number(link.incentive_paise || 0);
+                  if (incentive > 0) {
+                    const { releaseBudget } = await import("./lib/budget.js");
+                    await releaseBudget(link.merchant_id, incentive);
+                  }
+                } catch { /* budget best-effort */ }
+                await appendActivity({
+                  merchant_id: link.merchant_id || "5a3ac6ce-b2c7-4b1f-a9db-45296841f30b",
+                  actor: "MoneyBus", type: "HOLD_RELEASED",
+                  summary: `Link ${link.razorpay_link_id} vanished on gateway (404 twice) — expired locally`,
+                  data: { razorpay_link_id: link.razorpay_link_id },
+                });
+              } else {
+                goneLinks.add(link.id);
+                log.debug({ linkId: link.razorpay_link_id }, "Link 404 on gateway (first sighting, watching)");
+              }
             } else {
               log.error({ linkId: link.razorpay_link_id, error: err.message, status, detail: err.error }, "Poller error");
             }
@@ -613,12 +645,32 @@ function startScheduler() {
             "poller failed-payments sweep"
           );
           const items: any[] = (listed && (listed.items || listed)) || [];
-          const { isFailedAttempt } = await import("./lib/linkFailures.js");
+          const { isFailedAttempt, isCapturedAttempt } = await import("./lib/linkFailures.js");
           for (const payment of (Array.isArray(items) ? items : [])) {
-            if (!isFailedAttempt(payment)) continue;
-            const link = matchFailedToLink(payment, liveLinks);
-            if (!link) continue;
-            await handleFailedAttempt(link, payment, "gateway-sweep");
+            if (isFailedAttempt(payment)) {
+              const link = matchFailedToLink(payment, liveLinks);
+              if (!link) continue;
+              await handleFailedAttempt(link, payment, "gateway-sweep");
+              continue;
+            }
+            // Captured on a link the fetch path can't see (purged/404):
+            // resolve on PAYMENT evidence, not link state. Idempotent —
+            // already-paid links no-op inside resolvePayment.
+            if (isCapturedAttempt(payment)) {
+              const link = matchFailedToLink(payment, liveLinks);
+              if (!link) continue;
+              try {
+                await resolvePayment({
+                  id: link.id, merchant_id: link.merchant_id || "5a3ac6ce-b2c7-4b1f-a9db-45296841f30b",
+                  razorpay_link_id: link.razorpay_link_id, audit_seq: Number(link.audit_seq || 0),
+                  amount_paise: Number(link.amount_paise || 0), incentive_paise: Number(link.incentive_paise || 0),
+                  cart_id: link.cart_id, customer_id: link.customer_id,
+                });
+                log.info({ linkId: link.razorpay_link_id, paymentId: payment.id }, "Sweep resolved capture missed by link poll");
+              } catch (capErr: any) {
+                log.error({ linkId: link.razorpay_link_id, error: capErr?.message }, "Sweep capture-resolve error");
+              }
+            }
           }
         } catch (sweepErr: any) {
           log.error({ error: sweepErr?.message }, "Failed-payments sweep error");

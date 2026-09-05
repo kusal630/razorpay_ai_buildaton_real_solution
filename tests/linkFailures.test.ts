@@ -14,6 +14,7 @@ vi.mock("../src/db.js", () => ({
 import { classifyLink } from "../src/lib/reconcile.js";
 import {
   isFailedAttempt,
+  isCapturedAttempt,
   extractFailedAttempts,
   recordLinkPaymentFailure,
   matchFailedToLink,
@@ -42,12 +43,18 @@ describe("link failure classification (pure)", () => {
     expect(isFailedAttempt({ id: "pay_2", status: "Failed" })).toBe(true);
     expect(isFailedAttempt({ id: "pay_3", status: "rejected" })).toBe(true);
   });
-  it("captured/authorized/created attempts are not failures", () => {
+  it("captured/authorized attempts are not failures", () => {
     expect(isFailedAttempt({ id: "pay_4", status: "captured" })).toBe(false);
     expect(isFailedAttempt({ id: "pay_5", status: "authorized" })).toBe(false);
     expect(isFailedAttempt({ id: "pay_6", status: "created" })).toBe(false);
     expect(isFailedAttempt(null)).toBe(false);
     expect(isFailedAttempt({})).toBe(false);
+  });
+  it("captured/authorized detected for the sweep resolver", () => {
+    expect(isCapturedAttempt({ id: "pay_7", status: "captured" })).toBe(true);
+    expect(isCapturedAttempt({ id: "pay_8", status: "authorized" })).toBe(true);
+    expect(isCapturedAttempt({ id: "pay_9", status: "failed" })).toBe(false);
+    expect(isCapturedAttempt(null)).toBe(false);
   });
   it("extracts only failures from a link payload, tolerates missing arrays", () => {
     const link = { payments: [{ id: "a", status: "failed" }, { id: "b", status: "captured" }] };
