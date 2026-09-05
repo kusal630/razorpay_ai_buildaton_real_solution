@@ -438,7 +438,17 @@
         const badge = r.simulated ? '<span class="badge badge-gray">SIMULATED</span>' : '';
         const blocked = (r.severity === 'warning') ? '<span class="badge badge-red">BLOCKED</span>' : '';
         const dataStr = r.data ? JSON.stringify(r.data).slice(0, 120) : '';
-        return `<div class="feed-row"><span class="feed-ts">${ts}</span><span class="feed-actor" style="color:${actorColor}">${actor}</span><span class="feed-type">${type} ${badge} ${blocked}</span><span class="feed-summary">${summary}</span><span class="feed-amount">${amount}</span></div>`;
+        // §3a: LINK_CREATED rows carry a primary action opening the REAL
+        // Razorpay URL (short_url from the payment_links row) — never an
+        // internal-only page.
+        let payAction = '';
+        try {
+          const url = r.data && r.data.short_url;
+          if (type === 'LINK_CREATED' && typeof url === 'string' && url.startsWith('https://')) {
+            payAction = `<a class="btn btn-primary" style="margin-left:8px" href="${url}" target="_blank" rel="noopener">Open payment link</a>`;
+          }
+        } catch {}
+        return `<div class="feed-row"><span class="feed-ts">${ts}</span><span class="feed-actor" style="color:${actorColor}">${actor}</span><span class="feed-type">${type} ${badge} ${blocked}</span><span class="feed-summary">${summary}</span><span class="feed-amount">${amount}</span>${payAction}</div>`;
       }).join('');
     }
 

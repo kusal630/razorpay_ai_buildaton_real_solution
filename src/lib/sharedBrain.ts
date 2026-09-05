@@ -52,6 +52,18 @@ export function getLastTrip(): { reason: string | null; at: number } {
   return { reason: lastTripReason, at: lastTripAt };
 }
 
+/** F1/U-LOUD: human label for a fallback reason (feed headlines must name it). */
+export function fallbackLabel(reason?: string | null): string {
+  switch (reason) {
+    case "llm_model_unavailable": return "model unavailable";
+    case "circuit_breaker_open": return "circuit open";
+    case "kill_switch_active": return "kill switch on";
+    case "llm_transport_error": return "LLM transport error";
+    case "llm_no_api_key": return "no API key";
+    case "validation_failed": return "output rejected";
+    default: return "LLM unavailable";
+  }
+}
 /** F5: operator breaker reset (dashboard control + tests). Ledgered by caller. */
 export function resetBreaker(reason = "manual_reset"): void {
   consecutiveFailures = 0;

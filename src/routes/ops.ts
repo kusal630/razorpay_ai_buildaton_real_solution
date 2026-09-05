@@ -8,6 +8,7 @@ import { query, withTransaction } from "../db.js";
 import { invalidatePolicyCache } from "../lib/policyEngine.js";
 import { verifyChain, createCheckpoint } from "../lib/ledger.js";
 import { appendActivity, getRecentActivity } from "../lib/activity.js";
+import { recordAdminAudit } from "../lib/adminAudit.js";
 import { createLogger } from "../logger.js";
 import { processAbandonedCart } from "../agents/recoveryBot.js";
 import fs from "node:fs";
@@ -325,19 +326,42 @@ opsRouter.post("/api/qa/inject-abandoned", requireAuth, csrfCheck, async (req: R
 });
 
 opsRouter.post("/api/qa/inject-payment-failure", requireAuth, csrfCheck, async (req: Request, res: Response) => {
-  const cartId = crypto.randomUUID();
-  const token = crypto.randomBytes(16).toString("hex");
-  await query(
-    `INSERT INTO payment_links (merchant_id, cart_id, amount_paise, incentive_paise, status, token, audit_seq)
-     VALUES ($1, $2, 159800, 0, 'live', $3, NULL)`,
-    [MERCHANT_ID, cartId, token]
+  // §2: create what the G4 failure-scan actually selects — a FAILED order
+  // (not a live link): seeded customer + contact, source qa_injection,
+  // failed 7 min ago, admin-audited. Chain follows within ~15s.
+  const failCartId = crypto.randomUUID();
+  const failTime = new Date(Date.now() - 7 * 60e3);
+  const cust = await query(
+    `SELECT id FROM customers WHERE merchant_id = $1 AND consent_marketing->>'opt_in' = 'true' LIMIT 1`,
+    [MERCHANT_ID]
   );
+  const customerId = req.body.customer_id || cust.rows[0]?.id || null;
+  const { rows: prod } = await query(
+    "SELECT id, price_paise FROM products WHERE active = true AND is_gift = false ORDER BY price_paise DESC LIMIT 1"
+  );
+  if (!prod[0]) { res.status(400).json({ error: "No active products" }); return; }
+  const total = Number(prod[0].price_paise);
+  await query(
+    `INSERT INTO carts (id, merchant_id, customer_id, total_paise, status, abandoned_at, updated_at)
+     VALUES ($1, $2, $3, $4, 'abandoned', $5, $5)`,
+    [failCartId, MERCHANT_ID, customerId, total, failTime]
+  );
+  await query(
+    "INSERT INTO cart_items (cart_id, product_id, qty, unit_price_paise) VALUES ($1, $2, 1, $3)",
+    [failCartId, prod[0].id, total]
+  );
+  const { rows: orderRows } = await query(
+    `INSERT INTO orders (merchant_id, source, cart_id, customer_id, amount_paise, incentive_paise, margin_paise, status, created_at, failed_at, fee_basis, payment_method)
+     VALUES ($1, 'qa_injection', $2, $3, $4, 0, $5, 'failed', $6, $6, 'modeled', 'upi') RETURNING id`,
+    [MERCHANT_ID, failCartId, customerId, total, Math.floor(total * 0.4), failTime]
+  );
+  await recordAdminAudit({ adminUser: (req as any).userId, action: "qa_inject_failure", detail: { order_id: orderRows[0].id, cart_id: failCartId }, ip: req.ip });
   await appendActivity({
     merchant_id: MERCHANT_ID, actor: "Admin", type: "TRIGGER_DETECTED",
-    summary: `QA: Injected payment failure for cart ${cartId}`,
-    data: { cart_id: cartId, injected: true },
+    summary: `QA: Injected payment failure ${orderRows[0].id} (cart ${failCartId})`,
+    data: { order_id: orderRows[0].id, cart_id: failCartId, injected: true },
   });
-  res.json({ success: true, cart_id: cartId });
+  res.json({ success: true, order_id: orderRows[0].id, cart_id: failCartId });
 });
 
 opsRouter.post("/api/qa/policy-drill", requireAuth, csrfCheck, async (_req: Request, res: Response) => {

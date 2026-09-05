@@ -4,7 +4,7 @@ import { evaluateAction } from "../lib/policyEngine.js";
 import * as moneyBus from "../lib/moneyBus.js";
 import { appendActivity } from "../lib/activity.js";
 import { checkMarketingConsent } from "../lib/consent.js";
-import { callBrain, buildUpsellContext } from "../lib/sharedBrain.js";
+import { callBrain, buildUpsellContext, fallbackLabel } from "../lib/sharedBrain.js";
 import { finalizeCopy } from "../lib/claims.js";
 import { getCustomerArm } from "../lib/experiment.js";
 import { createLogger } from "../logger.js";
@@ -166,7 +166,7 @@ export async function processPaidOrder(pl: {
     type: "AGENT_THOUGHT",
     summary: brain.mode === "llm"
       ? `Brain: ${selectedProduct.name}, ${discountPct}% off — ${brain.rationale.reasoning.slice(0, 120)}`
-      : `Rules: ${selectedProduct.name}, default suggestion — LLM unavailable`,
+      : `Rules: ${selectedProduct.name}, default suggestion — ${fallbackLabel((brain as any).fallback_reason)}`,
     data: {
       mode: brain.mode,
       selected_item_id: selectedProduct.id,

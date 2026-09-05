@@ -2,7 +2,7 @@ import { query } from "../db.js";
 import { evaluateAction } from "../lib/policyEngine.js";
 import * as moneyBus from "../lib/moneyBus.js";
 import { appendActivity } from "../lib/activity.js";
-import { callBrain, buildChatContext, isCircuitOpen } from "../lib/sharedBrain.js";
+import { callBrain, buildChatContext, isCircuitOpen, fallbackLabel } from "../lib/sharedBrain.js";
 import { evaluateChatGrant, recordChatAttempt, CHAT_MIN_CART_PAISE } from "../lib/chatEconomics.js";
 import {
   loadSession, meterTurn, tokensToCostPaise, classifyFaq, answerFaq,
@@ -149,7 +149,7 @@ export async function handleChatMessage(
     type: "AGENT_THOUGHT",
     summary: brain.mode === "llm"
       ? `Brain: tool=${tool} — ${brain.rationale.reasoning.slice(0, 100)}`
-      : `Rules: tool=${tool} — LLM unavailable`,
+      : `Rules: tool=${tool} — ${fallbackLabel((brain as any).fallback_reason)}`,
     data: {
       mode: brain.mode,
       tool,

@@ -10,6 +10,7 @@ import { getConfig } from "../config.js";
 import { query } from "../db.js";
 import { appendLedger } from "../lib/ledger.js";
 import { appendActivity } from "../lib/activity.js";
+import { recordAdminAudit } from "../lib/adminAudit.js";
 import { createLogger } from "../logger.js";
 import { isConfigKey } from "../lib/v5config.js";
 import { ndrTransition, classifyFee, creditBonus, codLossEv, COD_TOKEN_CONFIRM_PAISE, THETA_SAVE_PRIOR, CREDIT_EXPIRY_DAYS } from "../lib/v5ops.js";
@@ -73,8 +74,7 @@ v5Router.put("/api/config/:key", requireAuth, async (req: Request, res: Response
      ON CONFLICT (merchant_id, key) DO UPDATE SET value_jsonb = EXCLUDED.value_jsonb, updated_at = NOW(), updated_by = EXCLUDED.updated_by`,
     [MERCHANT_ID, key, JSON.stringify(req.body?.value ?? {}), String((req as any).userId || "admin")]
   );
-  await query("INSERT INTO admin_audit (admin_id, action, params_json, ip) VALUES ($1, $2, $3, $4)",
-    [(req as any).userId || null, `config_update:${key}`, JSON.stringify(req.body?.value ?? {}), req.ip || null]);
+  await recordAdminAudit({ adminUser: (req as any).userId, action: `config_update:${key}`, detail: req.body?.value ?? {}, ip: req.ip });
   const { seq } = await appendLedger({
     merchantId: MERCHANT_ID, actor: "Merchant", action: "config_update",
     params: { key, value: req.body?.value ?? {} }, decision: "ALLOW",
@@ -120,8 +120,7 @@ v5Router.post("/api/policy/edit", requireAuth, async (req: Request, res: Respons
   await query(`UPDATE policy_rules SET ${mapping.column} = $1 WHERE action = $2`, [Number(to_value), mapping.action]);
   const { invalidatePolicyCache } = await import("../lib/policyEngine.js");
   invalidatePolicyCache();
-  await query("INSERT INTO admin_audit (admin_id, action, params_json, ip) VALUES ($1, $2, $3, $4)",
-    [(req as any).userId || null, `policy_lower:${field}`, JSON.stringify({ from_value, to_value }), req.ip || null]);
+  await recordAdminAudit({ adminUser: (req as any).userId, action: `policy_lower:${field}`, detail: { from_value, to_value }, ip: req.ip });
   await appendLedger({
     merchantId: MERCHANT_ID, actor: "Merchant", action: "config_update",
     params: { field, from_value, to_value }, decision: "ALLOW",
@@ -137,8 +136,7 @@ v5Router.post("/api/ndr/log-attempt", requireAuth, async (req: Request, res: Res
   const { order_id } = req.body || {};
   if (!order_id) { res.status(400).json({ error: "order_id required" }); return; }
   const { rows } = await query("INSERT INTO ndr_cases (merchant_id, order_id) VALUES ($1, $2) RETURNING id", [MERCHANT_ID, order_id]);
-  await query("INSERT INTO admin_audit (admin_id, action, params_json, ip) VALUES ($1, 'ndr_log_attempt', $2, $3)",
-    [(req as any).userId || null, JSON.stringify({ order_id }), req.ip || null]);
+  await recordAdminAudit({ adminUser: (req as any).userId, action: "ndr_log_attempt", detail: { order_id }, ip: req.ip });
   const { seq } = await appendLedger({
     merchantId: MERCHANT_ID, actor: "OpsAgent", action: "ndr_case_opened",
     params: { order_id }, decision: "ALLOW",
@@ -312,8 +310,7 @@ v5Router.delete("/api/privacy/customer/:id", requireAuth, async (req: Request, r
     { q: query, ledgerAppend: (e) => (appendLedger as any)(e) },
     { merchantId: MERCHANT_ID, customerId: req.params.id }
   );
-  await query("INSERT INTO admin_audit (admin_id, action, params_json, ip) VALUES ($1, 'customer_erased', $2, $3)",
-    [(req as any).userId || null, JSON.stringify({ customer_id: req.params.id, seq: r.seq }), req.ip || null]);
+  await recordAdminAudit({ adminUser: (req as any).userId, action: "customer_erased", detail: { customer_id: req.params.id, seq: r.seq }, ip: req.ip });
   res.json({ ok: true, audit_seq: r.seq });
 });
 
@@ -480,8 +477,7 @@ v5Router.post("/api/funnel/resume", requireAuth, async (req: Request, res: Respo
     { q: query, ledgerAppend: (e) => (appendLedger as any)(e), activityAppend: appendActivity },
     MERCHANT_ID, "manual"
   );
-  await query("INSERT INTO admin_audit (admin_id, action, params_json, ip) VALUES ($1, 'funnel_resume', $2, $3)",
-    [(req as any).userId || null, JSON.stringify({ seq }), req.ip || null]);
+  await recordAdminAudit({ adminUser: (req as any).userId, action: "funnel_resume", detail: { seq }, ip: req.ip });
   res.json({ ok: true, audit_seq: seq });
 });
 

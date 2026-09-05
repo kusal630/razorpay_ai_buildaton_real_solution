@@ -19,7 +19,7 @@ import { formatINR } from "../lib/format.js";
 import { anchorTransactional } from "../lib/consent.js";
 import { appendActivity } from "../lib/activity.js";
 import { checkQuietHours } from "../lib/policy2.js";
-import { callBrain, buildRecoveryContext } from "../lib/sharedBrain.js";
+import { callBrain, buildRecoveryContext, fallbackLabel } from "../lib/sharedBrain.js";
 import { finalizeCopy } from "../lib/claims.js";
 import { appendLedger } from "../lib/ledger.js";
 import { chooseMessageStrategy, recordStrategyAttempt } from "../lib/copyStrategy.js";
@@ -557,7 +557,7 @@ export async function processAbandonedCart(
     type: "AGENT_THOUGHT",
     summary: brain.mode === "llm"
       ? `Brain: ${brain.strategy} (${formatINR(incentivePaise)} incentive, ${brain.message_tone}) — ${brain.rationale.reasoning.slice(0, 120)}`
-      : `Rules: ${brain.strategy} (${formatINR(incentivePaise)} incentive) — LLM unavailable`,
+      : `Rules: ${brain.strategy} (${formatINR(incentivePaise)} incentive) — ${fallbackLabel((brain as any).fallback_reason)}`,
     data: {
       mode: brain.mode,
       strategy: brain.strategy,

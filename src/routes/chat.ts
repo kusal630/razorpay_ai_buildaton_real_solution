@@ -6,6 +6,34 @@ import { createLogger } from "../logger.js";
 const log = createLogger("chat");
 export const chatRouter = Router();
 
+export interface PayPageFacts {
+  amountPaise: number;
+  incentivePaise: number;
+  shippingPaise: number;
+}
+
+/**
+ * §3b pay-page arithmetic (pure, unit-tested): item_total = amount +
+ * incentive; FINAL CHARGED = amount_paise (must equal the Razorpay link
+ * amount — asserted by U-PAYPAGE); struck price only with an incentive.
+ */
+export function buildPayPageAmounts(facts: PayPageFacts): {
+  itemTotalPaise: number; incentivePaise: number; shippingPaise: number;
+  finalPaise: number; allInPaise: number; hasIncentive: boolean;
+} {
+  const incentivePaise = Math.max(0, Math.round(Number(facts.incentivePaise || 0)));
+  const finalPaise = Math.max(0, Math.round(Number(facts.amountPaise || 0)));
+  const shippingPaise = Math.max(0, Math.round(Number(facts.shippingPaise || 0)));
+  return {
+    itemTotalPaise: finalPaise + incentivePaise,
+    incentivePaise,
+    shippingPaise,
+    finalPaise,
+    allInPaise: finalPaise + shippingPaise,
+    hasIncentive: incentivePaise > 0,
+  };
+}
+
 // GET /pay/:token — masked PII, offer terms, "Pay" button
 chatRouter.get("/pay/:token", async (req: Request, res: Response) => {
   const { token } = req.params;
@@ -104,9 +132,31 @@ chatRouter.get("/pay/:token", async (req: Request, res: Response) => {
         if (Number.isFinite(eta) && eta > 0) delivery_estimate = `delivery in ~${Math.round(eta)} days`;
       } catch { /* omit trust lines */ }
     }
-    res.json({
-      token, amount_paise: resolved.amountPaise, masked_pii: resolved.maskedPii,
-      pay_url: link?.short_url || "", incentive_paise: link?.incentive_paise || 0,
+    // §3b pay-page arithmetic (server-computed, integer paise) via the
+    // tested builder: item_total = amount + incentive (struck ONLY when
+    // incentive applies); FINAL CHARGED = amount_paise (== Razorpay link).
+    const incentivePaise = Number(link?.incentive_paise || 0);
+    const finalPaise = Number(link?.amount_paise ?? resolved.amountPaise);
+    let shippingPaise = 0;
+    if (link?.merchant_id) {
+      try {
+        const { rows: shipRows } = await query(
+          "SELECT value_jsonb FROM merchant_config WHERE merchant_id = $1 AND key = 'shipping'",
+          [link.merchant_id]
+        );
+        shippingPaise = Number(shipRows[0]?.value_jsonb?.flat_fee_paise || 0);
+      } catch { /* shipping 0 */ }
+    }
+    const allIn = buildPayPageAmounts({ amountPaise: finalPaise, incentivePaise, shippingPaise });
+    const { itemTotalPaise, finalPaise: chargedPaise, incentivePaise: offerPaise, shippingPaise: shipPaise } = allIn;
+    const inr = (p: number) => `₹${Math.round(Number(p || 0) / 100).toLocaleString("en-IN")}`;
+    const esc = (s: string) => String(s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+    const wantsJson = String(req.headers.accept || "").includes("application/json");
+    const data = {
+      token, amount_paise: chargedPaise, item_total_paise: itemTotalPaise,
+      masked_pii: resolved.maskedPii,
+      pay_url: link?.short_url || "", incentive_paise: offerPaise,
+      shipping_paise: shipPaise, all_in_total_paise: allIn.allInPaise,
       razorpay_link_id: link?.razorpay_link_id || "",
       chat_enabled: chatEnabled,
       experiment_arm: arm,
@@ -119,7 +169,29 @@ chatRouter.get("/pay/:token", async (req: Request, res: Response) => {
         ...(delivery_estimate ? { delivery_estimate } : {}),
       },
       ...(social_proof ? { social_proof } : {}),
-    });
+    };
+    if (wantsJson) { res.json(data); return; }
+    // HTML pay page: struck item price ONLY with an incentive; incentive
+    // line only when applied; single final amount otherwise. No invented
+    // discounts, no fake strike-throughs — ever.
+    const strikeRow = allIn.hasIncentive
+      ? `<div class="row"><span>Item price</span><span><s>${inr(itemTotalPaise)}</s></span></div>
+         <div class="row hl"><span>Recovery offer applied</span><span>−${inr(offerPaise)}</span></div>`
+      : ``;
+    const shipRow = shipPaise > 0
+      ? `<div class="row"><span>Shipping</span><span>${inr(shippingPaise)}</span></div>
+         <div class="row muted"><span>All-in total</span><span>${inr(allIn.allInPaise)}</span></div>`
+      : `<div class="row muted"><span>All-in total</span><span>${inr(allIn.allInPaise)}</span></div>`;
+    res.send(`<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Pay — Sellable</title>
+<style>body{font-family:system-ui,sans-serif;max-width:480px;margin:40px auto;padding:0 16px}.row{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #eee}.hl{color:#0a7d2c;font-weight:600}.final{font-size:1.4em;font-weight:700}.muted{color:#666}.btn{display:block;text-align:center;background:#2874f0;color:#fff;padding:14px;border-radius:8px;margin-top:20px;text-decoration:none;font-weight:700}.trust{margin-top:16px;color:#555;font-size:.9em}.footer{margin-top:24px;color:#888;font-size:.8em}</style></head><body>
+<h2>Complete your payment</h2>
+${strikeRow}
+${shipRow}
+<div class="row final"><span>Amount to pay</span><span>${inr(chargedPaise)}</span></div>
+<a class="btn" href="${link?.short_url || "#"}">Pay now</a>
+<div class="trust">${merchant_name ? `<div>Sold by ${esc(merchant_name)} · secured by Razorpay</div>` : `<div>Secured by Razorpay</div>`}${returns_policy ? `<div>${esc(returns_policy)}</div>` : ""}${delivery_estimate ? `<div>${esc(delivery_estimate)}</div>` : ""}</div>
+<div class="footer">TEST ENVIRONMENT — links are the delivery path. Ledger entries are recorded, pre-settlement.</div>
+</body></html>`);
   } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 

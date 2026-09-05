@@ -184,3 +184,27 @@ FREEZE RESUMES: bug fixes, tests, measurement, integration wiring only.
 - F5 U-BANNER: banner source = refund-anomaly detector firing on QA
   traffic (correct behavior); 24h TTL aging verified in code + live
   rows; source named in banner text. No funnel suspension active.
+
+## v5.9 emergency fixes (pre-deadline, verified live)
+
+- §1 DIAGNOSTIC (all green, no provider fix needed): key present
+  ("not-needed", len 10), pin byte-exact in provider list, breaker
+  closed, kill OFF, POST 200 with OpenAI-compatible shape. The visible
+  "Rules — LLM unavailable" was a U-LOUD headline bug: summaries
+  hardcoded the generic text. Now every feed headline names the cause
+  via fallbackLabel() (all four agents) + unit gate.
+- §2 U-FAILINJECT: root cause = endpoint created a LIVE LINK while the
+  G4 scan selects FAILED ORDERS (nothing ever matched). Rewritten to
+  create a real failed order (seeded customer, qa_injection source,
+  failed 7min ago, admin-audited). Live: full retry chain with
+  AGENT_THOUGHT mode:llm + live ₹0 link. BONUS FIND: all six
+  admin_audit writers used a nonexistent column shape → Express-4
+  async-throw hung requests with zero response; new safe
+  recordAdminAudit() helper (live shape, never throws) at all sites.
+- §3 U-PAYPAGE: feed LINK_CREATED rows render "Open payment link"
+  (real short_url, https-validated). Pay page renders struck ₹1,899 +
+  "Recovery offer applied −₹100" + final ₹1,799 + Pay now (plain:
+  single amount, no strike). 3c AGREEMENT proven three ways:
+  Razorpay 179900 = DB 179900 = pay page ₹1,799 (live API fetch).
+- Acceptance: kill OFF persisted, breaker closed, drill green, chain
+  PASS (head seq 248), verify 21/21 with switch still OFF after.

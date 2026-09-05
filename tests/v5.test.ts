@@ -1175,3 +1175,37 @@ describe("U-BANNER", () => {
     expect(src).toMatch(/created_at > NOW\(\) - INTERVAL/); // ages out after window
   });
 });
+
+// ── v5.9 U-LOUD: feed headlines name the specific cause ──
+describe("U-LOUD labels", () => {
+  it("fallbackLabel maps every reason (never generic when known)", async () => {
+    const sb = await import("../src/lib/sharedBrain.js");
+    expect(sb.fallbackLabel("validation_failed")).toBe("output rejected");
+    expect(sb.fallbackLabel("llm_model_unavailable")).toBe("model unavailable");
+    expect(sb.fallbackLabel("circuit_breaker_open")).toBe("circuit open");
+    expect(sb.fallbackLabel("kill_switch_active")).toBe("kill switch on");
+    expect(sb.fallbackLabel("llm_transport_error")).toBe("LLM transport error");
+    expect(sb.fallbackLabel("llm_no_api_key")).toBe("no API key");
+    expect(sb.fallbackLabel(undefined)).toBe("LLM unavailable");
+  });
+});
+
+// ── v5.9 U-PAYPAGE arithmetic: struck only with incentive; final == amount ──
+describe("U-PAYPAGE", () => {
+  it("incentivized: item struck, offer line, final == amount (179900)", async () => {
+    const { buildPayPageAmounts } = await import("../src/routes/chat.js");
+    const a = buildPayPageAmounts({ amountPaise: 179900, incentivePaise: 10000, shippingPaise: 0 });
+    expect(a).toMatchObject({ itemTotalPaise: 189900, finalPaise: 179900, allInPaise: 179900, hasIncentive: true });
+  });
+  it("plain: single amount, no incentive lines", async () => {
+    const { buildPayPageAmounts } = await import("../src/routes/chat.js");
+    const a = buildPayPageAmounts({ amountPaise: 189900, incentivePaise: 0, shippingPaise: 0 });
+    expect(a).toMatchObject({ itemTotalPaise: 189900, finalPaise: 189900, hasIncentive: false });
+  });
+  it("display never renders negatives (clamped at zero)", async () => {
+    const { buildPayPageAmounts } = await import("../src/routes/chat.js");
+    const a = buildPayPageAmounts({ amountPaise: -50, incentivePaise: -10, shippingPaise: -5 });
+    expect(a.finalPaise).toBe(0);
+    expect(a.hasIncentive).toBe(false);
+  });
+});
