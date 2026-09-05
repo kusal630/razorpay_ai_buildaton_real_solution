@@ -45,10 +45,12 @@ describe("U-FILTER chips", () => {
   });
 });
 
-describe("U-SCROLL auto-scroll intelligence", () => {
-  it("follows at bottom, suspends scrolled-up, jump pill counts + re-engages", () => {
+describe("U-SCROLL auto-scroll intelligence (top-anchored, newest-first)", () => {
+  it("follows at top, suspends scrolled-down, jump pill counts + re-engages", () => {
     expect(dash).toMatch(/id="jump-pill"/);
-    expect(dash).toMatch(/scrollHeight - el\.scrollTop - el\.clientHeight < 120/);
+    expect(dash).toMatch(/el\.scrollTop < 120/);
+    expect(dash).toMatch(/feedAtTop/);
+    expect(dash).not.toMatch(/feedAtBottom/);
     expect(dash).toMatch(/jumpToLatest/);
     expect(dash).toMatch(/awayCount/);
   });

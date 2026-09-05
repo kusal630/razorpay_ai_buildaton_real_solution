@@ -64,7 +64,7 @@
     .chip.active { background: #1f6feb; border-color: #1f6feb; color: white; }
     .chip-group { margin: 4px 0; }
     .chip-label { font-size: 11px; color: #484f58; margin-right: 6px; }
-    #jump-pill { display: none; position: sticky; bottom: 12px; float: right; margin-right: 12px; background: #1f6feb; color: white; border: none; border-radius: 16px; padding: 6px 14px; cursor: pointer; font-size: 12px; }
+    #jump-pill { display: none; position: sticky; top: 12px; float: right; margin-right: 12px; background: #1f6feb; color: white; border: none; border-radius: 16px; padding: 6px 14px; cursor: pointer; font-size: 12px; }
     #event-overlay { display: none; position: fixed; top: 60px; right: 20px; width: 420px; max-height: 80vh; overflow-y: auto; background: #161b22; border: 1px solid #58a6ff; border-radius: 8px; padding: 16px; z-index: 100; font-size: 12px; }
     #event-overlay pre { white-space: pre-wrap; word-break: break-word; color: #8b949e; margin-top: 8px; }
     .feed-row { cursor: pointer; }
@@ -171,7 +171,7 @@
         <div class="chip-group" id="chips-special"><span class="chip-label">Show:</span></div>
         <div><span class="chip" onclick="clearFilters()">× clear all</span></div>
         <div id="feed"></div>
-        <button id="jump-pill" onclick="jumpToLatest()">↓ <span id="jump-count">0</span> new events</button>
+        <button id="jump-pill" onclick="jumpToLatest()">↑ <span id="jump-count">0</span> new events</button>
         <div id="event-overlay">
           <div style="display:flex; justify-content:space-between; align-items:center">
             <b>Event detail</b>
@@ -478,7 +478,9 @@
         : `── Console cleared · full history in Ledger · ${ts} ──`;
       awayCount = 0;
       document.getElementById('jump-pill').style.display = 'none';
+      feedAtTop = true;
       renderFeed();
+      document.getElementById('feed').scrollTop = 0;
     }
     function toggleShortcuts() {
       const el = document.getElementById('shortcuts-pop');
@@ -512,7 +514,9 @@
       feedFilters.special = feedFilters.special || [];
     } catch { feedFilters = { actors: [], types: [], special: [] }; }
     let lastVisible = [];
-    let feedAtBottom = true;
+    // Top-anchored feed (newest first): follow new events only while the
+    // user sits at the top; reading further down suspends the follow.
+    let feedAtTop = true;
     let awayCount = 0;
     const ACTOR_CHIPS = ['RecoveryBot', 'UpsellBot', 'Poller', 'Buyer', 'System', 'Admin'];
     const TYPE_CHIPS = ['TRIGGER', 'DECISION', 'POLICY', 'LINK', 'PAYMENT', 'ERROR'];
@@ -628,8 +632,8 @@
     }
     function jumpToLatest() {
       const el = document.getElementById('feed');
-      el.scrollTop = el.scrollHeight;
-      feedAtBottom = true;
+      el.scrollTop = 0;
+      feedAtTop = true;
       awayCount = 0;
       document.getElementById('jump-pill').style.display = 'none';
     }
@@ -694,7 +698,7 @@
           }
           feedRows.unshift(d);
           if (feedRows.length > 500) feedRows.pop();
-          if (!feedAtBottom) {
+          if (!feedAtTop) {
             awayCount++;
             document.getElementById('jump-count').textContent = awayCount;
             document.getElementById('jump-pill').style.display = 'block';
@@ -713,9 +717,9 @@
 
     function renderFeed() {
       const el = document.getElementById('feed');
-      // Auto-scroll only when already at the bottom (within 3 rows).
-      const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
-      if (nearBottom) feedAtBottom = true;
+      // Top-anchored feed: follow only while already at the top (within 3 rows).
+      const nearTop = el.scrollTop < 120;
+      if (nearTop) feedAtTop = true;
       lastVisible = feedRows.filter((r) => (clearedBeforeId == null || (r.id != null && r.id > clearedBeforeId)) && rowMatches(r)).slice(0, 200);
       // The badge counts what the viewport actually shows (filters + clear
       // aware); the buffered total rides in the tooltip.
@@ -757,14 +761,14 @@
         } catch {}
         return `<div class="feed-row" onclick="inspectEvent(${i})"><span class="feed-ts">${ts}</span><span class="feed-actor" style="color:${actorColor}">${actor}</span><span class="feed-type">${type} ${badge} ${blocked} ${srcBadge(r.source_tag)}</span><span class="feed-summary">${summary}</span><span class="feed-amount">${amount}</span>${payAction}</div>`;
       }).join('');
-      if (feedAtBottom && !feedPaused) el.scrollTop = el.scrollHeight;
+      if (feedAtTop && !feedPaused) el.scrollTop = 0;
     }
 
     function trackFeedScroll() {
       const el = document.getElementById('feed');
-      const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
-      feedAtBottom = nearBottom;
-      if (nearBottom) {
+      const nearTop = el.scrollTop < 120;
+      feedAtTop = nearTop;
+      if (nearTop) {
         awayCount = 0;
         document.getElementById('jump-pill').style.display = 'none';
       }
