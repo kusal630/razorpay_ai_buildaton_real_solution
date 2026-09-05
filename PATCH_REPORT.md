@@ -161,3 +161,26 @@ FREEZE RESUMES: bug fixes, tests, measurement, integration wiring only.
   one 26s outlier); 8s would abort legitimate calls and trip the
   breaker. Unreachable endpoint reports yellow (RULES honestly
   available); wrong-name reports RED per spec.
+
+## v5.7 fixes (post-build verification defects)
+
+- F1 U-KILLRESTORE: ROOT CAUSE — not a test-teardown bug. No test or
+  verify path writes the DB kill flag (grep-gated; verify Gate 11 is
+  read-only). The KILLED sighting came from acceptance probing itself
+  (flag set ON + server rebooted while ON — persistence working as
+  designed). Hardened anyway: explicit in-test restore + structural
+  no-DB-write gate; switch explicitly OFF; badge now reads AI MODE;
+  flag still OFF after verify (this run proves it).
+- F2 U-DOCTORMIG2: expected migrations derived from files on disk with
+  per-file sentinel verification (13/13 live); missing applies
+  idempotently + records. Fixture-hiding test green.
+- F3 U-BRAINPROOF: fresh inject → TRIGGER → INTENT → AGENT_THOUGHT
+  mode:llm/functional → real plink_ live, on the final tree.
+- F4 U-UIFIX: "ABANDONERY" verified absent repo-wide, in history, and
+  in all DB surfaces (never existed — likely screenshot misread).
+  "$1899" sourced to moneyBus `($₹...)` template; shared formatINR
+  (₹1,899) applied across feed/agents/routes/dashboard/pay-resolver;
+  render fixture green.
+- F5 U-BANNER: banner source = refund-anomaly detector firing on QA
+  traffic (correct behavior); 24h TTL aging verified in code + live
+  rows; source named in banner text. No funnel suspension active.
