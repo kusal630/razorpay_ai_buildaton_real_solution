@@ -57,6 +57,19 @@ if (!SERVER_KEY) {
   process.exit(1);
 }
 
+// Validate --mode BEFORE any API calls (a bad flag must fail fast, seeding nothing).
+// Accepts both `--mode live` and `--mode=live` (npm passes either).
+const argv = process.argv.slice(2);
+let modeArg = 'demo';
+for (let i = 0; i < argv.length; i++) {
+  if (argv[i] === '--mode' && argv[i + 1]) { modeArg = argv[i + 1]; break; }
+  if (argv[i].startsWith('--mode=')) { modeArg = argv[i].split('=')[1]; break; }
+}
+if (!['demo', 'live'].includes(modeArg)) {
+  console.error(`--mode must be demo|live (got '${modeArg}')`);
+  process.exit(1);
+}
+
 // Real catalog UUIDs (seed.ts). No hub/charger rows exist: prod_hub maps to
 // the mouse (same price point), prod_charger to coffee (closest price).
 const PRODUCTS = {
@@ -151,17 +164,7 @@ async function main() {
 
   // STEP 2: --mode live adds 20 anonymous background carts (API only,
   // tagged demo-bg so the dashboard sub-toggle can silence them).
-  // Accepts both `--mode live` and `--mode=live` (npm passes either).
-  const argv = process.argv.slice(2);
-  let modeArg = 'demo';
-  for (let i = 0; i < argv.length; i++) {
-    if (argv[i] === '--mode' && argv[i + 1]) { modeArg = argv[i + 1]; break; }
-    if (argv[i].startsWith('--mode=')) { modeArg = argv[i].split('=')[1]; break; }
-  }
-  if (!['demo', 'live'].includes(modeArg)) {
-    console.error(`--mode must be demo|live (got '${modeArg}')`);
-    process.exit(1);
-  }
+  // (modeArg validated at the top, before any API calls.)
   if (modeArg === 'live') {
     console.log('── mode=live: seeding 20 background carts ──');
     const prodIds = Object.values(PRODUCTS);
