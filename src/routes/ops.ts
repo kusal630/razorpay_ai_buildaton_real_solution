@@ -125,8 +125,13 @@ async function runDoctorChecks() {
     } else { checks.llm = "yellow (no key)"; }
   } catch { checks.llm = "red"; }
   try {
-    const { rows } = await query("SELECT COUNT(*) as cnt FROM schema_migrations");
-    checks.migrations = Number(rows[0]?.cnt || 0) >= 8 ? "green" : "red";
+    // F2: effect-verified like doctor.ts — the schema_migrations tracker
+    // diverges out-of-band (4 rows vs 13 applied), so a raw count lies red.
+    const { migrationFiles, checkMigrations } = await import("../lib/migrateCheck.js");
+    const path = await import("node:path");
+    const files = migrationFiles(path.join(process.cwd(), "src", "migrate"));
+    const status = await checkMigrations(async (sql: string, params?: any[]) => query(sql, params), files);
+    checks.migrations = status.ok ? "green" : "red";
   } catch { checks.migrations = "red"; }
   try {
     const { rows } = await query("SELECT COUNT(*) as cnt FROM products");
@@ -239,25 +244,78 @@ opsRouter.post("/api/policy/preset", requireAuth, csrfCheck, async (req: Request
   res.json({ success: true, preset });
 });
 
-// Reconcile
+// Reconcile (v5.1 F3 contract): matched vs Razorpay, pending with oldest
+// age, exceptions split critical/warn. Claims language: the target is
+// "zero unresolved critical exceptions" — never a bare zero-count claim.
 opsRouter.post("/api/reconcile", requireAuth, async (_req: Request, res: Response) => {
   try {
-    const { rows: links } = await query("SELECT razorpay_link_id, ext_ref, status FROM payment_links WHERE razorpay_link_id IS NOT NULL");
+    const { rows: links } = await query(
+      "SELECT razorpay_link_id, ext_ref, status, created_at FROM payment_links WHERE razorpay_link_id IS NOT NULL"
+    );
     let matched = 0;
-    let mismatches = 0;
+    const exceptions: Array<{
+      razorpay_link_id: string; status_local: string; status_remote: string;
+      age_min: number; severity: "critical" | "warn";
+    }> = [];
     for (const link of links) {
+      const ageMin = link.created_at
+        ? Math.max(0, Math.round((Date.now() - new Date(link.created_at).getTime()) / 60000))
+        : 0;
       try {
         const rp = (await import("../lib/razorpayService.js")).getRazorpay();
         const rpLink = await rp.paymentLink.fetch(link.razorpay_link_id);
         if (rpLink.status === link.status || (rpLink.status === "paid" && link.status === "paid")) {
           matched++;
         } else {
-          mismatches++;
+          exceptions.push({
+            razorpay_link_id: link.razorpay_link_id, status_local: link.status,
+            status_remote: rpLink.status, age_min: ageMin, severity: "critical",
+          });
         }
-      } catch { mismatches++; }
+      } catch {
+        exceptions.push({
+          razorpay_link_id: link.razorpay_link_id, status_local: link.status,
+          status_remote: "unreachable", age_min: ageMin, severity: "critical",
+        });
+      }
     }
-    await query(`INSERT INTO reconcile_runs (merchant_id, matched, mismatches, ran_at) VALUES ($1, $2, $3, NOW())`, [MERCHANT_ID, matched, mismatches]);
-    res.json({ matched, mismatches, total: links.length });
+    // Pending (unsettled) orders + oldest age; stale pendings (>60m) are warn.
+    let pending = 0, pendingOldestMin = 0, warn = 0;
+    try {
+      const { rows: pendRows } = await query(
+        `SELECT COUNT(*) AS cnt, MIN(created_at) AS oldest, NOW() AS now FROM orders WHERE status = 'pending'`
+      );
+      pending = Number(pendRows[0]?.cnt || 0);
+      if (pendRows[0]?.oldest) {
+        pendingOldestMin = Math.max(0, Math.round(
+          (new Date(pendRows[0].now).getTime() - new Date(pendRows[0].oldest).getTime()) / 60000
+        ));
+      }
+      const { rows: staleRows } = await query(
+        `SELECT id, created_at, NOW() AS now FROM orders WHERE status = 'pending' AND created_at < NOW() - INTERVAL '60 minutes' ORDER BY created_at ASC LIMIT 25`
+      );
+      warn = staleRows.length;
+      for (const o of staleRows) {
+        exceptions.push({
+          razorpay_link_id: `order:${o.id}`, status_local: "pending",
+          status_remote: "unsettled", age_min: Math.max(0, Math.round(
+            (new Date(o.now).getTime() - new Date(o.created_at).getTime()) / 60000
+          )), severity: "warn",
+        });
+      }
+    } catch { /* orders table shape varies by deploy; link numbers stay real */ }
+    const critical = exceptions.filter((e) => e.severity === "critical").length;
+    const rowsChecked = links.length;
+    await query(
+      `INSERT INTO reconcile_runs (rows_checked, matched, mismatches, pending, detail_json)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [rowsChecked, matched, critical, pending, JSON.stringify({ exceptions, pending_oldest_min: pendingOldestMin })]
+    );
+    res.json({
+      matched, pending, pending_oldest_min: pendingOldestMin,
+      exceptions_critical: critical, exceptions_warn: warn,
+      exceptions, total: rowsChecked, rows_checked: rowsChecked,
+    });
   } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
@@ -375,12 +433,78 @@ opsRouter.post("/api/qa/policy-drill", requireAuth, csrfCheck, async (_req: Requ
 });
 
 opsRouter.post("/api/qa/fast-forward", requireAuth, csrfCheck, async (req: Request, res: Response) => {
+  // Fast-forward deferred intents: re-validate each (cart-paid → cancels
+  // itself; consent re-check), then consume + execute recovery NOW through
+  // processAbandonedCart (a ledger row per intent, reason fast_forwarded).
+  // Never silent: zero deferred → visible "nothing deferred" event.
   const { intent_id } = req.body;
-  await query(
-    "UPDATE action_intents SET status = 'pending', resume_at = NOW() WHERE status = 'deferred' AND id = $1",
-    [intent_id || 0]
+  const { rows: deferred } = await query(
+    `SELECT id, merchant_id, customer_id, target_id, action_type FROM action_intents
+      WHERE status = 'deferred' ${intent_id ? "AND id = $1" : ""}
+      ORDER BY resume_at NULLS FIRST LIMIT 25`,
+    intent_id ? [intent_id] : []
   );
-  res.json({ success: true });
+  if (deferred.length === 0) {
+    await appendActivity({
+      merchant_id: MERCHANT_ID, actor: "Admin", type: "FAST_FORWARD",
+      summary: "FAST_FORWARD: nothing deferred",
+      data: { dispatched: 0, cancelled: 0 },
+    });
+    res.json({ success: true, dispatched: 0, cancelled: 0, note: "nothing deferred" });
+    return;
+  }
+  const { appendLedger } = await import("../lib/ledger.js");
+  let dispatched = 0, cancelled = 0;
+  for (const intent of deferred) {
+    const cartId = intent.target_id;
+    try {
+      const { rows: cartRows } = await query("SELECT status, customer_id FROM carts WHERE id::text = $1::text", [cartId]);
+      if (!cartRows[0] || ["paid", "converted"].includes(cartRows[0].status)) {
+        // Re-validation: cart paid/converted (or gone) → cancels itself.
+        await query("UPDATE action_intents SET status = 'cancelled', lease_expires_at = NULL WHERE id = $1", [intent.id]);
+        await appendLedger({
+          merchantId: intent.merchant_id || MERCHANT_ID, actor: "RecoveryBot", action: "intent_fast_forward",
+          params: { intent_id: intent.id, cart_id: cartId }, decision: "ALLOW", policy_checks: {},
+          rationale: { reason: "fast_forward_cart_paid", prior_status: "deferred" },
+          outcome: "SKIPPED",
+        } as any);
+        cancelled++;
+        continue;
+      }
+      if (String(intent.action_type || "").startsWith("recovery")) {
+        // Consume the stale queue row (frees the dedupe key) + ledger it,
+        // then execute the full chain synchronously — dispatches NOW.
+        await query("DELETE FROM action_intents WHERE id = $1", [intent.id]);
+        await appendLedger({
+          merchantId: intent.merchant_id || MERCHANT_ID, actor: "RecoveryBot", action: "intent_fast_forward",
+          params: { intent_id: intent.id, cart_id: cartId }, decision: "ALLOW", policy_checks: {},
+          rationale: { reason: "fast_forwarded", prior_status: "deferred" },
+          outcome: "SUCCESS",
+        } as any);
+        const { processAbandonedCart } = await import("../agents/recoveryBot.js");
+        await processAbandonedCart(cartId, { stage: "24h" });
+        dispatched++;
+      } else {
+        // Non-recovery deferred work: release to the normal dispatcher.
+        await query("UPDATE action_intents SET status = 'pending', resume_at = NOW(), lease_expires_at = NULL WHERE id = $1", [intent.id]);
+        await appendLedger({
+          merchantId: intent.merchant_id || MERCHANT_ID, actor: "RecoveryBot", action: "intent_fast_forward",
+          params: { intent_id: intent.id, cart_id: cartId }, decision: "ALLOW", policy_checks: {},
+          rationale: { reason: "fast_forwarded", prior_status: "deferred" },
+          outcome: "SUCCESS",
+        } as any);
+        dispatched++;
+      }
+    } catch (err: any) {
+      log.warn({ intentId: intent.id, error: err?.message }, "Fast-forward failed on intent");
+    }
+  }
+  await appendActivity({
+    merchant_id: MERCHANT_ID, actor: "Admin", type: "FAST_FORWARD",
+    summary: `FAST_FORWARD: dispatched ${dispatched}, cancelled ${cancelled}`,
+    data: { dispatched, cancelled },
+  });
+  res.json({ success: true, dispatched, cancelled });
 });
 
 // Policy rules

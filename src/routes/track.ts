@@ -123,7 +123,7 @@ trackRouter.post("/api/track/consent", async (req: Request, res: Response) => {
     // Update customer consent flags
     if (consent_type === "marketing") {
       await query(
-        `UPDATE customers SET consent_marketing = jsonb_build_object('opt_in', $2, 'source', $3, 'consented_at', NOW()::text) WHERE id = $1`,
+        `UPDATE customers SET consent_marketing = jsonb_build_object('opt_in', $2::boolean, 'source', $3::text, 'consented_at', NOW()::text) WHERE id = $1`,
         [customer_id, opt_in !== false, source || "api"]
       );
     } else if (consent_type === "transactional") {

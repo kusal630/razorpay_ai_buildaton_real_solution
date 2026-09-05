@@ -172,12 +172,14 @@
         <button class="btn" onclick="qaPolicyDrill()">Policy Drill (20%→15%)</button>
         <button class="btn" onclick="qaFastForward()">Fast-Forward Deferred</button>
         <button class="btn btn-primary" onclick="qaBrainTest()">Test LLM Brain</button>
+        <div id="ff-result" style="margin-top:10px"></div>
         <div id="brain-result" style="margin-top:10px"></div>
       </div>
       <div class="card">
         <h3>Reconcile</h3>
         <button class="btn btn-primary" onclick="reconcile()">Run Reconcile</button>
         <div id="reconcile-result" style="margin-top:10px"></div>
+        <p class="muted">Target: zero unresolved critical exceptions.</p>
       </div>
     </div>
 
@@ -512,8 +514,20 @@
     }
 
     async function qaFastForward() {
-      await fetch('/api/qa/fast-forward', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken }, body: JSON.stringify({}) });
-      alert('Deferred intents fast-forwarded');
+      const el = document.getElementById('ff-result');
+      el.textContent = 'Fast-forwarding deferred intents...';
+      try {
+        const res = await fetch('/api/qa/fast-forward', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken }, body: JSON.stringify({}) });
+        const d = await res.json();
+        if (!res.ok) { el.textContent = `Fast-forward failed: ${d.error || res.status}`; return; }
+        // Never silent: the API always emits a FAST_FORWARD console event
+        // (live feed); the counts render here too, including "nothing deferred".
+        el.textContent = (d.dispatched === 0 && d.cancelled === 0)
+          ? 'FAST_FORWARD: nothing deferred'
+          : `FAST_FORWARD: dispatched ${d.dispatched || 0}, cancelled ${d.cancelled || 0}`;
+      } catch (err) {
+        el.textContent = `Fast-forward failed: ${(err && err.message) || err}`;
+      }
     }
 
     async function qaBrainTest() {      const el = document.getElementById('brain-result');
@@ -527,9 +541,21 @@
     async function reconcile() {
       const el = document.getElementById('reconcile-result');
       el.textContent = 'Reconciling...';
-      const res = await fetch('/api/reconcile', { method: 'POST', headers: { 'X-CSRF-Token': csrfToken } });
-      const d = await res.json();
-      el.textContent = `Matched: ${d.matched}, Mismatches: ${d.mismatches}, Total: ${d.total}`;
+      try {
+        const res = await fetch('/api/reconcile', { method: 'POST', headers: { 'X-CSRF-Token': csrfToken } });
+        const d = await res.json();
+        if (!res.ok) { el.textContent = `Reconcile failed: ${d.error || res.status}`; return; }
+        const n = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+        const headline = `Matched: ${n(d.matched)} · Pending: ${n(d.pending)} (oldest ${n(d.pending_oldest_min)}m) · Exceptions: ${n(d.exceptions_critical)} critical / ${n(d.exceptions_warn)} warn`;
+        const rows = Array.isArray(d.exceptions) && d.exceptions.length > 0
+          ? '<ul>' + d.exceptions.slice(0, 25).map((e) =>
+              `<li>${e.severity === 'critical' ? 'CRITICAL' : 'warn'} — ${e.razorpay_link_id} (local ${e.status_local}, remote ${e.status_remote}, age ${n(e.age_min)}m)</li>`
+            ).join('') + '</ul>'
+          : '<div>no unresolved exceptions</div>';
+        el.innerHTML = `<div>${headline}</div>${rows}`;
+      } catch (err) {
+        el.textContent = `Reconcile failed: ${(err && err.message) || err}`;
+      }
     }
 
     // Auto-refresh overview every 15s

@@ -20,6 +20,8 @@
     "lint:claims": "npx tsx scripts/lint-claims.ts",
     "typecheck": "tsc --noEmit",
     "seed": "npx tsx --env-file=.env seed.ts",
+    "seed-bind": "node --env-file=.env scripts/seed-bind.js",
+    "seed-real": "node --env-file=.env scripts/seed-real.js",
     "reset:sample": "npx tsx --env-file=.env scripts/reset.ts",
     "doctor": "npx tsx --env-file=.env doctor.ts",
     "verify": "npx tsx --env-file=.env verify.ts",

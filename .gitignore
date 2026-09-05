@@ -8,3 +8,4 @@ playwright-report/
 checkpoints/
 logs/
 *.tmp.ts
+scripts/seed-history.last.sql

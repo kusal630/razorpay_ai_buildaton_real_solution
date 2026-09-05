@@ -53,6 +53,26 @@ async function main() {
     }
   }
 
+  // First-boot auto-seed: empty merchants table + test mode only.
+  // DB-direct seed.ts first (history/catalog, no HTTP needed), then the
+  // API-path identity bind once listening (same code as npm run seed-bind,
+  // idempotent — reruns are no-ops). NEVER in live mode.
+  let autoSeeded = false;
+  if (config.RAZORPAY_MODE !== "live") {
+    try {
+      const { query } = await import("./db.js");
+      const { rows } = await query("SELECT count(*)::int AS n FROM merchants");
+      if (Number(rows[0]?.n || 0) === 0) {
+        log.info("Empty database detected — running first-boot seed (seed.ts)");
+        const { execFileSync } = await import("node:child_process");
+        execFileSync("npx", ["tsx", "--env-file=.env", "seed.ts"], { stdio: "inherit" });
+        autoSeeded = true;
+      }
+    } catch (err: any) {
+      log.warn({ error: err.message }, "Auto-seed check failed (boot continues unseeded)");
+    }
+  }
+
   const app = express();
   app.use(helmet({ contentSecurityPolicy: false }));
 
@@ -95,6 +115,19 @@ async function main() {
 
   const server = app.listen(config.PORT, () => {
     log.info({ port: config.PORT }, "Server listening");
+    if (autoSeeded && config.RAZORPAY_MODE !== "live") {
+      // Identity bind through the REAL ingestion endpoint (detached —
+      // never blocks boot; failures only log, the DB seed stands alone).
+      void (async () => {
+        try {
+          const { execFileSync } = await import("node:child_process");
+          execFileSync(process.execPath, ["--env-file=.env", "scripts/seed-bind.js"], { stdio: "inherit" });
+          log.info("First-boot API identity bind complete");
+        } catch (err: any) {
+          log.warn({ error: err?.message }, "First-boot API bind failed (run npm run seed-bind manually)");
+        }
+      })();
+    }
   });
 
   // Start scheduler loop (15s interval)
