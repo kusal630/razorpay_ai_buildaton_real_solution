@@ -3,6 +3,7 @@ import crypto from "node:crypto";
 import argon2 from "argon2";
 import * as jose from "jose";
 import { getConfig } from "../config.js";
+import { formatINR } from "../lib/format.js";
 import { query, withTransaction } from "../db.js";
 import { invalidatePolicyCache } from "../lib/policyEngine.js";
 import { verifyChain, createCheckpoint } from "../lib/ledger.js";
@@ -419,7 +420,7 @@ opsRouter.post("/api/backtest/run", requireAuth, csrfCheck, async (req: Request,
   );
   await appendActivity({
     merchant_id: MERCHANT_ID, actor: "Backtest", type: "UPLIFT_DECISION",
-    summary: `Backtest ${nJourneys} journeys: SIMULATED ₹${(simulatedRevenue / 100).toFixed(0)} (trips: ${result.circuitBreakerTrips}, prod untouched: ${result.productionStatsUntouched && before === after})`,
+    summary: `Backtest ${nJourneys} journeys: SIMULATED ${formatINR(simulatedRevenue)} (trips: ${result.circuitBreakerTrips}, prod untouched: ${result.productionStatsUntouched && before === after})`,
     data: { run_id: runRows[0].id, journeys: nJourneys, simulated_revenue_paise: simulatedRevenue, trips: result.circuitBreakerTrips, distribution: result.chosenDistribution },
     simulated: true,
   });

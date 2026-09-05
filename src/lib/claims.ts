@@ -2,6 +2,7 @@ import { query } from "../db.js";
 import { appendLedger } from "./ledger.js";
 import { checkDarkPatterns } from "./darkPatternFilter.js";
 import { foldTokenBrackets } from "./v5brain.js";
+import { formatINR } from "./format.js";
 import { createLogger } from "../logger.js";
 
 const log = createLogger("claims");
@@ -63,7 +64,7 @@ export interface GroundResult {
 const MARK = "STRIPPED_CLAIM";
 
 function rupees(paise: number): string {
-  return `₹${(paise / 100).toFixed(0)}`;
+  return formatINR(paise);
 }
 
 /** IST hour rendering for deadlines, e.g. "9 PM". */

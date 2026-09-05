@@ -58,17 +58,40 @@ async function doctor() {
     results.llm = { status: "yellow", detail: "RULES mode (LLM unreachable)" };
   }
 
-  // Schema: required tables exist (what setup actually guarantees — the
-  // version table is vestigial across migration runners).
+  // Schema (F2): expected migrations DERIVED from files on disk, each
+  // verified by effect (sentinel object). Missing + APPLY_MISSING=1 →
+  // apply that file idempotently and record; otherwise RED naming it.
+  // Never red-for-working, never green-for-genuinely-missing.
   try {
-    const required = ["audit_log", "customers", "orders", "payment_links", "merchant_config",
-      "reviews", "credit_ledger", "action_intents", "policy_rules", "segment_stats"];
-    const { rows } = await pool.query(
-      "SELECT COUNT(*) as cnt FROM pg_tables WHERE schemaname = 'public' AND tablename = ANY($1)",
-      [required]
+    const path = await import("node:path");
+    const { migrationFiles, checkMigrations, applyMigrationFile } = await import("./src/lib/migrateCheck.js");
+    const migrateDir = path.join(process.cwd(), "src", "migrate");
+    const files = migrationFiles(migrateDir);
+    let status = await checkMigrations(
+      (sql: string, params?: unknown[]) => pool.query(sql, params as any[]) as any,
+      files
     );
-    const cnt = Number(rows[0]?.cnt || 0);
-    results.migrations = { status: cnt >= required.length ? "green" : "red", detail: `${cnt}/${required.length} required tables present` };
+    if (!status.ok && process.env.APPLY_MISSING === "1") {
+      for (const m of status.missing) {
+        const file = m.split(" ")[0];
+        if (!file.endsWith(".sql")) continue;
+        try {
+          await applyMigrationFile(
+            (sql: string, params?: unknown[]) => pool.query(sql, params as any[]) as any,
+            migrateDir, file
+          );
+        } catch (err: any) {
+          status.missing = [...status.missing, `apply-failed:${file}`];
+        }
+      }
+      status = await checkMigrations(
+        (sql: string, params?: unknown[]) => pool.query(sql, params as any[]) as any,
+        files
+      );
+    }
+    results.migrations = status.ok
+      ? { status: "green", detail: `${status.applied.length}/${status.expected.length} migrations applied (verified by effect)` }
+      : { status: "red", detail: `missing: ${status.missing.join(", ")}` };
   } catch (err: any) {
     results.migrations = { status: "red", detail: err.message };
   }

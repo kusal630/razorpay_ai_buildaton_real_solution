@@ -341,6 +341,7 @@
       document.getElementById('industry-status').textContent = res.ok ? 'Saved.' : 'Save failed.';
       loadIndustry();
     }
+    function fmtINR(paise) { return '₹' + Math.round(Number(paise || 0) / 100).toLocaleString('en-IN'); }
     async function loadIndustry() {
       try {
         const res = await fetch('/api/industry');
@@ -362,9 +363,8 @@
       try {
         const res = await fetch('/api/cart-values');
         const d = await res.json();
-        const fmt = (p) => '₹' + (Number(p) / 100).toFixed(0);
         document.getElementById('cartval-body').textContent =
-          `Completed ${fmt(d.avg_completed_paise)} (n=${d.n_completed}) · Abandoned ${fmt(d.avg_abandoned_paise)} (n=${d.n_abandoned}) · Recovered ${fmt(d.avg_recovered_paise)}`;
+          `Completed ${fmtINR(d.avg_completed_paise)} (n=${d.n_completed}) · Abandoned ${fmtINR(d.avg_abandoned_paise)} (n=${d.n_abandoned}) · Recovered ${fmtINR(d.avg_recovered_paise)}`;
         document.getElementById('cartval-alert').textContent = d.alert || '';
       } catch {}
     }
@@ -382,11 +382,11 @@
       const res = await fetch('/api/state');
       if (!res.ok) return;
       const s = await res.json();
-      document.getElementById('revenue-real').textContent = '₹' + ((s.revenue?.real || 0) / 100).toFixed(0);
-      document.getElementById('revenue-sim').textContent = '₹' + ((s.revenue?.sim || 0) / 100).toFixed(0);
+      document.getElementById('revenue-real').textContent = fmtINR(s.revenue?.real || 0);
+      document.getElementById('revenue-sim').textContent = fmtINR(s.revenue?.sim || 0);
       document.getElementById('orders-count').textContent = s.revenue?.orders || 0;
       document.getElementById('budget-gauge').textContent = `${(s.budget?.reserved_paise || 0) / 100} / ${(s.budget?.cap_paise || 0) / 100}`;
-      document.getElementById('kill-status').innerHTML = s.kill_switch ? '<span class="badge badge-red">KILLED</span>' : '<span class="badge badge-green">ACTIVE</span>';
+      document.getElementById('kill-status').innerHTML = s.kill_switch ? '<span class="badge badge-red">KILLED</span>' : '<span class="badge badge-green">AI MODE</span>';
       const b = s.breaker || {};
       document.getElementById('breaker-status').innerHTML =
         `state: <b>${b.state || 'closed'}</b> · opens/h: ${b.opens_last_hour ?? 0}` +
@@ -398,7 +398,7 @@
       if (refundAlert) {
         const p = refundAlert.payload || {};
         bannerEl.style.display = 'block';
-        bannerEl.innerHTML = `<div class="card" style="border-left:4px solid #f0b429"><h3>⚠ refund_anomaly</h3><div>Refunds last hour: ${p.hour_count || 0} (₹${((p.hour_paise || 0) / 100).toFixed(0)}) on ${p.scope || '?'}. Alarm only — no auto-block.</div></div>`;
+        bannerEl.innerHTML = `<div class="card" style="border-left:4px solid #f0b429"><h3>⚠ refund_anomaly</h3><div>Refunds last hour: ${p.hour_count || 0} (${fmtINR(p.hour_paise || 0)}) on ${p.scope || '?'}. Alarm only — no auto-block.</div></div>`;
       } else {
         bannerEl.style.display = 'none';
         bannerEl.innerHTML = '';
@@ -433,7 +433,7 @@
         const actor = r.actor || '';
         const type = r.type || r.action || '';
         const summary = r.summary || r.message || '';
-        const amount = r.amount_paise ? '₹' + (r.amount_paise / 100).toFixed(0) : '';
+        const amount = r.amount_paise ? fmtINR(r.amount_paise) : '';
         const actorColor = actor === 'RecoveryBot' ? '#58a6ff' : actor === 'UpsellBot' ? '#a371f7' : actor === 'MoneyBus' ? '#3fb950' : actor === 'Admin' ? '#f0ad4e' : '#8b949e';
         const badge = r.simulated ? '<span class="badge badge-gray">SIMULATED</span>' : '';
         const blocked = (r.severity === 'warning') ? '<span class="badge badge-red">BLOCKED</span>' : '';

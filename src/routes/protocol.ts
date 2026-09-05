@@ -8,6 +8,7 @@ import * as moneyBus from "../lib/moneyBus.js";
 import { appendLedger } from "../lib/ledger.js";
 import { appendActivity } from "../lib/activity.js";
 import { createLogger } from "../logger.js";
+import { formatINR } from "../lib/format.js";
 
 const log = createLogger("protocol");
 export const protocolRouter = Router();
@@ -137,7 +138,7 @@ protocolRouter.post("/agent/sessions/:id/purchase-intent", requireBuyerKey, idem
     await query("UPDATE buyer_sessions SET status = 'intent' WHERE id = $1", [id]);
     const { seq } = await appendLedger({ merchantId: MERCHANT_ID, actor: "BuyerAgent", action: "purchase_intent", params: { session_id: id, total_paise: totalPaise }, decision: "ESCALATE", policy_checks: policyResult.checks, rationale: { session_id: id }, outcome: "ESCALATED" });
     const { rows: approvalRows } = await query("INSERT INTO approvals (merchant_id, audit_seq, context, status) VALUES ($1, $2, $3, 'pending') RETURNING id", [MERCHANT_ID, seq, JSON.stringify({ session_id: id, total_paise: totalPaise })]);
-    await appendActivity({ merchant_id: MERCHANT_ID, actor: "BuyerAgent", type: "ESCALATED", summary: `Buyer session ${id} escalated (₹${(totalPaise/100).toFixed(0)})`, data: { session_id: id, approval_id: approvalRows[0].id } });
+    await appendActivity({ merchant_id: MERCHANT_ID, actor: "BuyerAgent", type: "ESCALATED", summary: `Buyer session ${id} escalated (${formatINR(totalPaise)})`, data: { session_id: id, approval_id: approvalRows[0].id } });
     res.status(202).json({ status: "escalated", approval_id: approvalRows[0].id, audit_seq: seq });
     return;
   }

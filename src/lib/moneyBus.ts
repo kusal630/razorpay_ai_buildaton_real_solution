@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import { getConfig } from "../config.js";
 import { query, withTransaction } from "../db.js";
 import { getRazorpay, initMoneyBus } from "./razorpayService.js";
+import { formatINR } from "./format.js";
 // M26: moneyBus is the SOLE holder of the Razorpay mutation capability.
 const BUS_CAP = initMoneyBus();
 const rzp = (): any => getRazorpay(BUS_CAP);
@@ -294,7 +295,7 @@ async function createPaymentLink(
 
   await appendActivity({
     merchant_id: merchantId, actor, type: "LINK_CREATED",
-    summary: `Payment link created ($₹${(amount / 100).toFixed(0)})`,
+    summary: `Payment link created (${formatINR(amount)})`,
     amount_paise: amount,
     data: { seq, razorpay_link_id: link.id, short_url: link.short_url, token, ext_ref: extRef, amount_paise: amount },
   });
@@ -589,7 +590,7 @@ export async function resolvePayment(pl: {
     }
 
     // Activity rows
-    const rupees = `₹${(Number(pl.amount_paise) / 100).toFixed(0)}`;
+    const rupees = formatINR(pl.amount_paise);
     await client.query(
       `INSERT INTO activity (merchant_id, actor, type, summary, amount_paise, data, simulated, severity)
        VALUES ($1, 'MoneyBus', 'PAYMENT_PAID', $2, $3, $4, false, 'info')`,
@@ -806,7 +807,7 @@ export async function sweepExpiredLinks(): Promise<{ expired: number }> {
       }
       await appendActivity({
         merchant_id: link.merchant_id, actor: "MoneyBus", type: "HOLD_RELEASED",
-        summary: `Hold released — link expired${incentive > 0 ? `, ₹${incentive / 100} incentive returned to budget` : ""}`,
+        summary: `Hold released — link expired${incentive > 0 ? `, ${formatINR(incentive)} incentive returned to budget` : ""}`,
         data: { link_id: link.id, razorpay_link_id: link.razorpay_link_id, incentive_paise: incentive },
       });
       expired++;

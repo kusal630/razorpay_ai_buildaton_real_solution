@@ -1,4 +1,5 @@
 import { query } from "../db.js";
+import { formatINR } from "../lib/format.js";
 import { evaluateAction } from "../lib/policyEngine.js";
 import * as moneyBus from "../lib/moneyBus.js";
 import { appendActivity } from "../lib/activity.js";
@@ -105,7 +106,7 @@ export async function processPaidOrder(pl: {
     merchant_id: MERCHANT_ID,
     actor: "UpsellBot",
     type: "UPLIFT_DECISION",
-    summary: `Shortlist: ${shortlist.map((s: any) => `${s.name}(₹${s.price_paise / 100})`).join(", ")}`,
+    summary: `Shortlist: ${shortlist.map((s: any) => `${s.name}(${formatINR(s.price_paise)})`).join(", ")}`,
     data: {
       candidates: shortlist.map((s: any) => ({ id: s.id, name: s.name, price_paise: s.price_paise, margin_paise: s.margin_paise })),
       feasible_discounts: feasibleDiscounts,

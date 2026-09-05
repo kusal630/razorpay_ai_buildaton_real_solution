@@ -1,5 +1,6 @@
 import { query } from "../db.js";
 import { checkQuietHours, checkIncentiveCap30d, checkIncentiveLifetime, getMaxIncentiveForFirstTouch } from "./policy2.js";
+import { formatINR } from "./format.js";
 import { checkTransactionalConsent, checkMarketingConsent } from "./consent.js";
 
 interface PolicyRule {
@@ -179,7 +180,7 @@ export async function evaluateAction(
     const lifetime = await checkIncentiveLifetime(context.customerId);
     if (lifetime.capped) {
       checks.lifetime_incentive_cap = "BLOCK";
-      reasons.push(`lifetime_incentive_cap: identity used ${lifetime.count} incentives totaling ₹${(lifetime.totalPaise / 100).toFixed(0)} (max 3 / ₹300)`);
+      reasons.push(`lifetime_incentive_cap: identity used ${lifetime.count} incentives totaling ${formatINR(lifetime.totalPaise)} (max 3 / ₹300)`);
     } else {
       checks.lifetime_incentive_cap = "PASS";
     }

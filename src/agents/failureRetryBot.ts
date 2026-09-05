@@ -6,6 +6,7 @@ import { callBrain, buildRecoveryContext } from "../lib/sharedBrain.js";
 import { finalizeCopy } from "../lib/claims.js";
 import { checkTransactionalConsent, anchorTransactional } from "../lib/consent.js";
 import { appendActivity } from "../lib/activity.js";
+import { formatINR } from "../lib/format.js";
 import { createLogger } from "../logger.js";
 
 const log = createLogger("FailureRetryBot");
@@ -82,7 +83,7 @@ export async function processFailedOrder(orderId: string): Promise<void> {
 
   await appendActivity({
     merchant_id: MERCHANT_ID, actor: "FailureRetryBot", type: "TRIGGER_DETECTED",
-    summary: `Payment failed for order ${orderId} (₹${(cartTotal / 100).toFixed(0)})`,
+    summary: `Payment failed for order ${orderId} (${formatINR(cartTotal)})`,
     amount_paise: cartTotal,
     data: { order_id: orderId, cart_id: cartId, method: order.payment_method || null },
   });

@@ -1,5 +1,6 @@
 import { query } from "../db.js";
 import { createLogger } from "../logger.js";
+import { formatINR } from "./format.js";
 
 const log = createLogger("chatSession");
 
@@ -124,7 +125,7 @@ export function answerFaq(
   if (hit && Date.now() - hit.at < FAQ_CACHE_TTL_MS) {
     return { answer: hit.answer, cached: true };
   }
-  const rs = (p: number) => `₹${(p / 100).toFixed(0)}`;
+  const rs = (p: number) => formatINR(p);
   let answer: string;
   if (intent === "price") {
     const lines = facts.items.map((i) => `${i.name}: ${rs(i.price_paise)}`).join("; ");

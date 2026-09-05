@@ -1,5 +1,6 @@
 import { query } from "../db.js";
 import { appendLedger } from "./ledger.js";
+import { formatINR } from "./format.js";
 import { appendActivity } from "./activity.js";
 import { createLogger } from "../logger.js";
 
@@ -114,7 +115,7 @@ export async function checkRefundAnomaly(): Promise<{ fired: RefundAlarmScope[] 
       merchant_id: (s.merchant_id as string) || "5a3ac6ce-b2c7-4b1f-a9db-45296841f30b",
       actor: "RefundAlarm",
       type: "ALERT",
-      summary: `Refund anomaly on ${label}: ${hour.count} refunds / ₹${(hour.paise / 100).toFixed(0)} in the last hour vs 7-day baseline`,
+      summary: `Refund anomaly on ${label}: ${hour.count} refunds / ${formatINR(hour.paise)} in the last hour vs 7-day baseline`,
       data: { banner: "refund_anomaly", ...scope },
       severity: "warning",
     });

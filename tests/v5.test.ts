@@ -93,11 +93,28 @@ describe("U-LOUD loud fallbacks", () => {
 
   it("kill_switch_active fires when the switch is on", async () => {
     const sb = await import("../src/lib/sharedBrain.js");
+    expect(sb.getKillSwitch()).toBe(false);
     sb.setKillSwitch(true);
+    expect(sb.getKillSwitch()).toBe(true);
     const r = await sb.callBrain("recovery", baseCtx);
     expect(r.mode).toBe("rules");
     expect(r.fallback_reason).toBe("kill_switch_active");
     expect(events.map((e) => e.data.reason)).toContain("kill_switch_active");
+    // U-KILLRESTORE: explicit in-test restore (teardown also restores).
+    sb.setKillSwitch(false);
+    expect(sb.getKillSwitch()).toBe(false);
+  });
+
+  it("U-KILLRESTORE: no test path writes the DB kill flag (verify only reads it)", async () => {
+    const fs = await import("node:fs");
+    // Executable writes only (the assertion text itself names the table).
+    const writeRe = /query\(\s*[`'"]\s*(UPDATE|INSERT INTO)\s+kill_switch_state/i;
+    for (const f of ["tests/v5.test.ts", "verify.ts"]) {
+      expect(fs.readFileSync(f, "utf8")).not.toMatch(writeRe);
+    }
+    // verify.ts Gate 11 is read-only by construction
+    const verifySrc = fs.readFileSync("verify.ts", "utf8");
+    expect(verifySrc).toMatch(/SELECT enabled FROM kill_switch_state/);
   });
 
   it("llm_model_unavailable names the model + provider list (no POST attempted)", async () => {
@@ -211,7 +228,7 @@ describe("U-ALLIN + U-OFFERS resolver", () => {
       cart_total_paise: 500000, incentive_paise: 10000, shipping_paise: 7900,
     }, "llm");
     expect(r.fallback).toBe(false);
-    expect(r.copy).toContain("₹4979");
+    expect(r.copy).toContain("₹4,979");
     expect(r.resolved[0].type).toBe("all_in_total");
     const bad = await groundCopy("Pay {{all_in_total:cart1}} today", {}, "llm");
     expect(bad.fallback).toBe(true);
@@ -1075,5 +1092,86 @@ describe("U-TrustResolve", () => {
     expect(g.copy).toContain("7-day easy returns");
     expect(g.copy).toContain("delivery in ~3 days");
     expect(g.resolved.map((r: any) => r.type).sort()).toEqual(["delivery_estimate", "expiry", "returns_policy"]);
+  });
+});
+
+// ── v5.7 F2 U-DOCTORMIG2: file-derived expectations, missing named ──
+describe("U-DOCTORMIG2", () => {
+  it("all sentinels present → ok; one hidden → RED naming it", async () => {
+    const mc = await import("../src/lib/migrateCheck.js");
+    const files = mc.MIGRATION_SENTINELS.map((s) => s.file);
+    expect(files.length).toBeGreaterThanOrEqual(13);
+    const present = new Set(mc.MIGRATION_SENTINELS.map((s) => `${s.table}.${s.column || ""}`));
+    const qAll = async (sql: string) => ({ rows: sql.includes("information_schema") ? [{ "1": 1 }] : [{ "1": 1 }] });
+    void present;
+    const q = async (sql: string, params?: any[]) => {
+      const key = `${params?.[0]}.${params?.[1] || ""}`;
+      // hide 007's sentinel to simulate an unapplied migration
+      if (key.startsWith("open_links")) return { rows: [] };
+      return { rows: [{ "1": 1 }] };
+    };
+    const st = await mc.checkMigrations(q, files);
+    expect(st.ok).toBe(false);
+    expect(st.missing.join(" ")).toMatch(/007_v4_0/);
+    const st2 = await mc.checkMigrations(async () => ({ rows: [{ "1": 1 }] }), files);
+    expect(st2.ok).toBe(true);
+    expect(st2.applied.length).toBe(files.length);
+  });
+  it("applyMigrationFile runs the file SQL then records the version", async () => {
+    const mc = await import("../src/lib/migrateCheck.js");
+    const seen: string[] = [];
+    const q = async (sql: string, params?: any[]) => {
+      seen.push(sql);
+      return { rows: [] };
+    };
+    await mc.applyMigrationFile(q, "src/migrate", "011_v5_checkout_flag.sql");
+    expect(seen.some((s) => s.includes("checkout_started_at"))).toBe(true);
+    expect(seen.some((s) => s.includes("schema_migrations"))).toBe(true);
+  });
+});
+
+// ── v5.7 F4 U-UIFIX: rupee display formatting on all money surfaces ──
+describe("U-UIFIX", () => {
+  it("formatINR renders en-IN grouped rupees", async () => {
+    const { formatINR } = await import("../src/lib/format.js");
+    expect(formatINR(189900)).toBe("₹1,899");
+    expect(formatINR(0)).toBe("₹0");
+    expect(formatINR(10000)).toBe("₹100");
+    expect(formatINR(10000000)).toBe("₹1,00,000");
+  });
+  it("no $₹ concatenations or raw ungrouped money templates in money paths", async () => {
+    const fs = await import("node:fs");
+    const files = [
+      "src/lib/moneyBus.ts", "src/agents/recoveryBot.ts", "src/agents/failureRetryBot.ts",
+      "src/agents/upsellBot.ts", "src/routes/ops.ts", "src/routes/protocol.ts",
+      "src/lib/policyEngine.ts", "src/lib/refundAlarm.ts", "src/lib/chatSession.ts",
+      "src/lib/claims.ts", "src/public/dashboard/index.html",
+    ];
+    for (const f of files) {
+      const src = fs.readFileSync(f, "utf8");
+      expect(src).not.toContain("$₹");
+    }
+    const rawMoney = /₹\$\{[^}]*toFixed|₹\$\{[^}]*\/ 100\}/;
+    for (const f of files.filter((x) => x.endsWith(".ts"))) {
+      expect(fs.readFileSync(f, "utf8")).not.toMatch(rawMoney);
+    }
+  });
+  it("ABANDONERY appears nowhere (code, history-covered tree, docs)", async () => {
+    const { execSync } = await import("node:child_process");
+    const out = execSync("grep -rni abandonery src/ docs/ README.md e2e/ 2>/dev/null || true", { encoding: "utf8" });
+    expect(out.trim()).toBe("");
+  });
+});
+
+// ── v5.7 F5 U-BANNER: anomaly banner ages out, source named ──
+describe("U-BANNER", () => {
+  it("refund banner is TTL-gated and names its detector", async () => {
+    const ra = await import("../src/lib/refundAlarm.js");
+    expect(ra.REFUND_ALARM_BANNER_TTL_HOURS).toBeGreaterThan(0);
+    const fs = await import("node:fs");
+    const dash = fs.readFileSync("src/public/dashboard/index.html", "utf8");
+    expect(dash).toMatch(/refund_anomaly/); // source detector named in banner text
+    const src = fs.readFileSync("src/lib/refundAlarm.ts", "utf8");
+    expect(src).toMatch(/created_at > NOW\(\) - INTERVAL/); // ages out after window
   });
 });

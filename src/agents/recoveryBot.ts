@@ -15,6 +15,7 @@ import { createLogger } from "../logger.js";
 import { checkTransactionalConsent, checkMarketingConsent } from "../lib/consent.js";
 import { upliftEv, selectBucket, CONSTANTS, INCENTIVE_BUCKETS } from "../lib/economics.js";
 import { reserveBudget, releaseBudget } from "../lib/budget.js";
+import { formatINR } from "../lib/format.js";
 import { anchorTransactional } from "../lib/consent.js";
 import { appendActivity } from "../lib/activity.js";
 import { checkQuietHours } from "../lib/policy2.js";
@@ -87,7 +88,7 @@ export async function processAbandonedCart(
     merchant_id: MERCHANT_ID,
     actor: "RecoveryBot",
     type: "TRIGGER_DETECTED",
-    summary: `Abandoned cart detected: ${cartId} (₹${(cartTotal / 100).toFixed(0)}, stage=${stage})`,
+    summary: `Abandoned cart detected: ${cartId} (${formatINR(cartTotal)}, stage=${stage})`,
     amount_paise: cartTotal,
     data: { cart_id: cartId, abandoned_at: cart.abandoned_at, total_paise: cartTotal, stage },
   });
@@ -380,7 +381,7 @@ export async function processAbandonedCart(
         merchant_id: MERCHANT_ID,
         actor: "RecoveryBot",
         type: "CLAMPED",
-        summary: `Incentive CLAMPED to plain ₹0 — consent_marketing_missing (buckets ₹${excluded.map((b) => b / 100).join(", ₹")} off-menu)`,
+        summary: `Incentive CLAMPED to plain ₹0 — consent_marketing_missing (buckets ${excluded.map((b) => formatINR(b)).join(", ")} off-menu)`,
         data: {
           reason: "consent_marketing_missing",
           excluded_buckets_paise: excluded,
@@ -414,7 +415,7 @@ export async function processAbandonedCart(
     merchant_id: MERCHANT_ID,
     actor: "RecoveryBot",
     type: "UPLIFT_DECISION",
-    summary: `Feasible: ${feasibleOptions.map(o => `₹${o.bucket_paise / 100}(EV:${o.ev_paise})`).join(", ")}`,
+    summary: `Feasible: ${feasibleOptions.map(o => `${formatINR(o.bucket_paise)}(EV:${o.ev_paise})`).join(", ")}`,
     data: {
       feasible: feasibleOptions,
       best: feasibleOptions.find(o => o.bucket_paise === bestBucket),
@@ -555,8 +556,8 @@ export async function processAbandonedCart(
     actor: "RecoveryBot",
     type: "AGENT_THOUGHT",
     summary: brain.mode === "llm"
-      ? `Brain: ${brain.strategy} (₹${incentivePaise / 100} incentive, ${brain.message_tone}) — ${brain.rationale.reasoning.slice(0, 120)}`
-      : `Rules: ${brain.strategy} (₹${incentivePaise / 100} incentive) — LLM unavailable`,
+      ? `Brain: ${brain.strategy} (${formatINR(incentivePaise)} incentive, ${brain.message_tone}) — ${brain.rationale.reasoning.slice(0, 120)}`
+      : `Rules: ${brain.strategy} (${formatINR(incentivePaise)} incentive) — LLM unavailable`,
     data: {
       mode: brain.mode,
       strategy: brain.strategy,
@@ -594,7 +595,7 @@ export async function processAbandonedCart(
         merchant_id: MERCHANT_ID,
         actor: "RecoveryBot",
         type: "BLOCKED",
-        summary: `Budget exhausted for ₹${(incentivePaise / 100).toFixed(0)} incentive`,
+        summary: `Budget exhausted for ${formatINR(incentivePaise)} incentive`,
         data: { checks: { budget: "BLOCK" }, reasons: ["budget_exhausted"] },
       });
       await failIntent(intent.intentId, "skipped");
@@ -964,7 +965,7 @@ export async function processFinalCall(cartId: string): Promise<void> {
 
   // Code-built final copy over the REAL deadline, verified by the resolver.
   const exp = renderExpiryParts(deadlineIso);
-  const amountTxt = finalIncentive > 0 ? `Your ₹${finalIncentive / 100} reservation releases ${exp.phrase}` : `Your cart is still reserved — it releases ${exp.phrase}`;
+  const amountTxt = finalIncentive > 0 ? `Your ${formatINR(finalIncentive)} reservation releases ${exp.phrase}` : `Your cart is still reserved — it releases ${exp.phrase}`;
   const rawCopy = `${amountTxt}. This is the final call.${shortUrl ? ` ${shortUrl}` : ""}`;
   const grounded = await finalizeCopy({
     copy: rawCopy,
