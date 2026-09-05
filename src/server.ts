@@ -53,6 +53,15 @@ async function main() {
     }
   }
 
+  // Data-mode schema (LIVE/DEMO toggle + source tags). Idempotent;
+  // covers SKIP_MIGRATIONS / out-of-band schemas.
+  try {
+    const { ensureDataModeSchema } = await import("./lib/dataMode.js");
+    await ensureDataModeSchema();
+  } catch (err: any) {
+    log.warn({ error: err.message }, "Data-mode schema ensure failed (toggle may be unavailable)");
+  }
+
   // First-boot auto-seed: empty merchants table + test mode only.
   // DB-direct seed.ts first (history/catalog, no HTTP needed), then the
   // API-path identity bind once listening (same code as npm run seed-bind,
@@ -134,6 +143,17 @@ async function main() {
   if (config.PROCESS_ROLE === "all" || config.PROCESS_ROLE === "worker") {
     startScheduler();
 
+    // LIVE data mode: resume the organic traffic simulator across restarts.
+    try {
+      const { getDataMode } = await import("./lib/dataMode.js");
+      if ((await getDataMode()).mode === "live") {
+        const { startLiveTraffic } = await import("./lib/liveTraffic.js");
+        await startLiveTraffic();
+      }
+    } catch (err: any) {
+      log.warn({ error: err.message }, "Live traffic autostart failed (toggle it manually)");
+    }
+
     // S4 (v4.2): hourly refund-anomaly alarm (alarm only, never blocks)
     const runRefundAlarm = async () => {
       try {
@@ -180,12 +200,22 @@ function startScheduler() {
       const { query } = await import("./db.js");
       const config = (await import("./config.js")).getConfig();
 
+      // Demo-bg sub-toggle: silenced background carts are invisible to all
+      // scans (in-flight intents drain; no NEW chains start for them).
+      let bgClause = "";
+      try {
+        const { getDataMode } = await import("./lib/dataMode.js");
+        if (!(await getDataMode()).demo_bg_enabled) bgClause = "AND COALESCE(source_tag,'demo') <> 'demo-bg' ";
+      } catch { /* fail open: scans run unfiltered */ }
+      const bgClauseC = bgClause ? "AND COALESCE(c.source_tag,'demo') <> 'demo-bg' " : "";
+
       // Find abandoned carts
       const abandonMinutes = config.ABANDON_MINUTES;
       const { rows: carts } = await query(
         `UPDATE carts SET status = 'abandoned', abandoned_at = COALESCE(abandoned_at, NOW())
          WHERE status = 'active'
          AND updated_at < NOW() - INTERVAL '${abandonMinutes} minutes'
+         ${bgClause}
          RETURNING id`
       );
 
@@ -216,6 +246,7 @@ function startScheduler() {
            WHERE ai.dedupe_key LIKE '%:recovery_early:%'
            AND ai.dedupe_key LIKE '%' || c.id::text || '%'
          )
+         ${bgClauseC}
          LIMIT 10`
       );
       if (earlyCarts.length > 0) {
@@ -246,6 +277,7 @@ function startScheduler() {
            SELECT 1 FROM action_intents ai
            WHERE ai.dedupe_key LIKE '%' || c.id::text || '%'
          )
+         ${bgClauseC}
          LIMIT 10`
       );
       if (unprocessed.length > 0) {
@@ -291,6 +323,7 @@ function startScheduler() {
            SELECT 1 FROM orders o
            WHERE o.cart_id = c.id AND o.status = 'paid'
          )
+         ${bgClauseC}
          LIMIT 10`
       );
       if (finalCarts.length > 0) {

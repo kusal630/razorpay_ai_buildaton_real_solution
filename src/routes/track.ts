@@ -12,6 +12,12 @@ export const trackRouter = Router();
 const MERCHANT_ID = "5a3ac6ce-b2c7-4b1f-a9db-45296841f30b";
 
 const CONTACT_FIELDS = ["email", "name", "phone", "contact", "customer"];
+const SOURCE_TAGS = ["demo", "live", "demo-bg"];
+/** Optional metadata passthrough (feed tagging only — validated, defaults 'demo'). */
+function reqSourceTag(body: any): string {
+  const t = body?.source_tag;
+  return typeof t === "string" && SOURCE_TAGS.includes(t) ? t : "demo";
+}
 function containsContactFields(obj: any): boolean {
   if (!obj || typeof obj !== "object") return false;
   for (const key of Object.keys(obj)) {
@@ -51,11 +57,11 @@ trackRouter.post("/api/track/cart", async (req: Request, res: Response) => {
   try {
     const totalPaise = await computeCartTotal(items);
     await query(
-      `INSERT INTO carts (id, merchant_id, customer_id, total_paise, status, updated_at)
-       VALUES ($1, $2, NULL, $3, 'active', NOW())
+      `INSERT INTO carts (id, merchant_id, customer_id, total_paise, status, updated_at, source_tag)
+       VALUES ($1, $2, NULL, $3, 'active', NOW(), $4)
        ON CONFLICT (id) DO UPDATE SET total_paise = $3, updated_at = NOW(),
        status = CASE WHEN carts.status = 'abandoned' THEN 'active' ELSE carts.status END`,
-      [cart_id, keyInfo.merchantId || MERCHANT_ID, totalPaise]
+      [cart_id, keyInfo.merchantId || MERCHANT_ID, totalPaise, reqSourceTag(req.body)]
     );
     // Remote schema: line items live in cart_items (no items_json on carts)
     await query("DELETE FROM cart_items WHERE cart_id = $1", [cart_id]);
@@ -83,7 +89,10 @@ trackRouter.post("/api/track/bind-customer", async (req: Request, res: Response)
   try {
     const merchantId = keyInfo.merchantId || MERCHANT_ID;
     const { customerId, identityToken, isNew } = await findOrCreateCustomer(merchantId, { email, name, phone });
-    await query("UPDATE carts SET customer_id = $1 WHERE id = $2", [customerId, cart_id]);
+    await query(
+      "UPDATE carts SET customer_id = $1, source_tag = COALESCE($3, source_tag) WHERE id = $2",
+      [customerId, cart_id, req.body?.source_tag && SOURCE_TAGS.includes(req.body.source_tag) ? req.body.source_tag : null]
+    );
     // Record consent event (remote shape: class / evidence_ref)
     // M29: carries text_version, channel, ip_hash, ua_hash.
     if (email || phone) {

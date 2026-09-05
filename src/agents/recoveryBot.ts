@@ -695,6 +695,7 @@ export async function processAbandonedCart(
       brain_reasoning: brain.rationale.reasoning,
       brain_tone: brain.message_tone,
       message_copy: messageCopy,
+      raw_copy: brain.message_copy,
       claims_resolved: finalized.result.resolved,
       claims_stripped: finalized.result.stripped,
       resolved_tokens: (finalized.result.resolved || []).map((r: any) => `${r.type}:${r.ref}`),
@@ -992,6 +993,18 @@ export async function processFinalCall(cartId: string): Promise<void> {
       claims_stripped: grounded.result.stripped,
     },
   });
+  try {
+    const { emitMessageSent } = await import("../lib/messageStream.js");
+    await emitMessageSent({
+      merchantId: MERCHANT_ID, actor: "RecoveryBot", channel: "payment_link",
+      messageCopy: grounded.copy, rawCopy: rawCopy,
+      messageStrategy: "loss_framed", messageTone: "neutral",
+      brainMode: "rules", cartOrOrderRef: cartId,
+      resolvedTokens: (grounded as any).result?.resolved || [],
+      incentivePaise: finalIncentive, customerId: customerId || null,
+      ledgerSeq: seq ?? undefined,
+    });
+  } catch { /* stream never blocks recovery */ }
 
   await query(
     `INSERT INTO touches (merchant_id, customer_id, day, count) VALUES ($1, $2, $3, 1)

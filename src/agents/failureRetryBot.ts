@@ -189,6 +189,8 @@ export async function processFailedOrder(orderId: string): Promise<void> {
         incentive_paise: 0, policy_checks: policyResult.checks, intent_id: intent.intentId,
         brain_mode: brain.mode, brain_reasoning: brain.rationale.reasoning,
         message_copy: finalized.copy,
+        raw_copy: brain.message_copy,
+        message_strategy: (brain as any).raw?.message_strategy || "functional",
         claims_resolved: finalized.result.resolved, claims_stripped: finalized.result.stripped,
       },
       MERCHANT_ID

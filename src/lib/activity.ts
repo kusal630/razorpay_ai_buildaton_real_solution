@@ -12,18 +12,66 @@ export interface ActivityRow {
   data: Record<string, unknown>;
   simulated?: boolean;
   severity?: string;
+  /** Feed source tag. Explicit wins; else inferred from linked cart; else 'system'. */
+  source_tag?: string;
 }
 
 const sseListeners = new Set<any>();
 
+export const SOURCE_TAGS = ["demo", "live", "demo-bg", "system"] as const;
+export type SourceTag = (typeof SOURCE_TAGS)[number];
+
+/** Pure: pull a cart id out of an activity data payload, if present. */
+export function extractCartId(data: unknown): string | null {
+  if (!data || typeof data !== "object") return null;
+  const d = data as Record<string, unknown>;
+  for (const k of ["cart_id", "cartId", "cartID"]) {
+    const v = d[k];
+    if (typeof v === "string" && v.length > 0) return v;
+  }
+  return null;
+}
+
+/** Pure: resolve the effective tag (allowlisted; garbage → 'system'). */
+export function resolveSourceTag(explicit: unknown, cartTag: unknown): SourceTag {
+  for (const candidate of [explicit, cartTag]) {
+    if (typeof candidate === "string" && (SOURCE_TAGS as readonly string[]).includes(candidate)) {
+      return candidate as SourceTag;
+    }
+  }
+  return "system";
+}
+
+// PK-lookup cache for cart → source_tag (tags are write-once in practice).
+const cartTagCache = new Map<string, string | null>();
+
+async function lookupCartTag(cartId: string): Promise<string | null> {
+  const hit = cartTagCache.get(cartId);
+  if (hit !== undefined) return hit;
+  try {
+    const { rows } = await query("SELECT source_tag FROM carts WHERE id = $1", [cartId]);
+    const tag = typeof rows[0]?.source_tag === "string" ? rows[0].source_tag : null;
+    if (cartTagCache.size > 5000) cartTagCache.clear();
+    cartTagCache.set(cartId, tag);
+    return tag;
+  } catch {
+    return null;
+  }
+}
+
 export async function appendActivity(row: ActivityRow): Promise<number> {
+  let tag: SourceTag = resolveSourceTag(row.source_tag, null);
+  if (!row.source_tag) {
+    const cartId = extractCartId(row.data);
+    if (cartId) tag = resolveSourceTag(null, await lookupCartTag(cartId));
+  }
   const { rows } = await query(
-    `INSERT INTO activity (merchant_id, actor, type, summary, amount_paise, data, simulated, severity)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
+    `INSERT INTO activity (merchant_id, actor, type, summary, amount_paise, data, simulated, severity, source_tag)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
     [
       row.merchant_id, row.actor, row.type, row.summary,
       row.amount_paise != null ? row.amount_paise : null,
-      JSON.stringify(row.data), row.simulated || false, row.severity || "info",
+      JSON.stringify(row.data), row.simulated || false, row.severity || "info", tag,
     ]
   );
 
@@ -31,6 +79,7 @@ export async function appendActivity(row: ActivityRow): Promise<number> {
     id: rows[0].id,
     ts: new Date().toISOString(),
     ...row,
+    source_tag: tag,
   };
 
   broadcast(full);

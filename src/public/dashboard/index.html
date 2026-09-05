@@ -59,10 +59,24 @@
     #chain-result { margin-top: 10px; padding: 10px; border-radius: 4px; font-family: monospace; font-size: 13px; }
     .chain-pass { background: #0d2818; border: 1px solid #238636; color: #3fb950; }
     .chain-fail { background: #2d0d0d; border: 1px solid #da3633; color: #f85149; }
+    .chip { display: inline-block; padding: 3px 10px; margin: 2px; border: 1px solid #30363d; border-radius: 12px; font-size: 11px; cursor: pointer; color: #8b949e; background: #0d1117; }
+    .chip:hover { color: #c9d1d9; }
+    .chip.active { background: #1f6feb; border-color: #1f6feb; color: white; }
+    .chip-group { margin: 4px 0; }
+    .chip-label { font-size: 11px; color: #484f58; margin-right: 6px; }
+    #jump-pill { display: none; position: sticky; bottom: 12px; float: right; margin-right: 12px; background: #1f6feb; color: white; border: none; border-radius: 16px; padding: 6px 14px; cursor: pointer; font-size: 12px; }
+    #event-overlay { display: none; position: fixed; top: 60px; right: 20px; width: 420px; max-height: 80vh; overflow-y: auto; background: #161b22; border: 1px solid #58a6ff; border-radius: 8px; padding: 16px; z-index: 100; font-size: 12px; }
+    #event-overlay pre { white-space: pre-wrap; word-break: break-word; color: #8b949e; margin-top: 8px; }
+    .feed-row { cursor: pointer; }
+    .msg-bubble { background: #0d2818; border-left: 3px solid #3fb950; border-radius: 4px; padding: 6px 10px; margin: 4px 0 4px 100px; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #c9d1d9; white-space: pre-wrap; word-break: break-word; }
+    .msg-meta { display: flex; gap: 6px; flex-wrap: wrap; margin: 2px 0 2px 100px; }
+    .clear-marker { text-align: center; color: #484f58; font-size: 11px; padding: 8px; border-bottom: 1px dashed #30363d; }
+    .token-diff-raw { background: #2d0d0d; border-radius: 4px; padding: 6px 8px; margin-top: 6px; }
+    .token-diff-resolved { background: #0d2818; border-radius: 4px; padding: 6px 8px; margin-top: 6px; }
   </style>
 </head>
 <body>
-  <div class="footer-mode">TEST ENVIRONMENT — Razorpay test mode; notifications are not delivered; links are the delivery path. Ledger entries are recorded, pre-settlement.</div>
+  <div class="footer-mode">TEST ENVIRONMENT — Razorpay test mode; notifications are not delivered; links are the delivery path. Ledger entries are recorded, pre-settlement. <span id="data-mode-badge" class="badge badge-blue">DATA: DEMO</span></div>
 
   <div id="login-page" class="card">
     <h2>Sellable Ops Console</h2>
@@ -96,6 +110,14 @@
         <div class="stat gray"><div class="value" id="revenue-sim">₹0</div><div class="label">SIMULATED Revenue</div></div>
         <div class="stat"><div class="value" id="orders-count">0</div><div class="label">Orders</div></div>
         <div class="stat"><div class="value" id="budget-gauge">0 / 0</div><div class="label">Budget (reserved/cap)</div></div>
+      </div>
+      <div class="card">
+        <h3>Data Source</h3>
+        <button class="btn" id="mode-demo" onclick="setDataMode('demo')">Demo</button>
+        <button class="btn" id="mode-live" onclick="setDataMode('live')">Live</button>
+        <label style="margin-left:12px; font-size:12px"><input type="checkbox" id="bg-toggle" onchange="setDemoBg(this.checked)"> Background traffic</label>
+        <span id="mode-status" style="margin-left:12px; font-size:12px"></span>
+        <p class="muted">Demo: seeded stories only, then quiet. Live: organic traffic trickle (~1 action/45s). Every switch is audited.</p>
       </div>
       <div class="card">
         <h3>Kill Switch</h3>
@@ -137,8 +159,26 @@
 
     <div id="tab-feed" class="panel">
       <div class="card">
-        <h3>Live Agent Console <span class="badge badge-blue" id="feed-count">0</span></h3>
+        <h3>Live Agent Console <span class="badge badge-blue" id="feed-count">0</span>
+          <button class="btn" id="pause-btn" onclick="togglePause()" style="margin-left:12px">⏸ Pause</button>
+          <button class="btn" id="clear-btn" onclick="clearConsole()" title="Clears the view only — the ledger keeps everything." style="margin-left:4px">🗑 Clear</button>
+          <button class="btn" id="shortcuts-btn" onclick="toggleShortcuts()" title="Keyboard shortcuts" style="margin-left:4px">?</button>
+        </h3>
+        <div id="shortcuts-pop" style="display:none; font-size:12px; color:#8b949e; margin:4px 0">Keys: <b>Space</b>=pause/resume · <b>F</b>=collapse filters · <b>C</b>=clear (ignored while typing)</div>
+        <div id="paused-notice" style="display:none; margin:6px 0; color:#f0ad4e; font-size:12px"></div>
+        <div class="chip-group" id="chips-actor"><span class="chip-label">Actor:</span></div>
+        <div class="chip-group" id="chips-type"><span class="chip-label">Type:</span></div>
+        <div class="chip-group" id="chips-special"><span class="chip-label">Show:</span></div>
+        <div><span class="chip" onclick="clearFilters()">× clear all</span></div>
         <div id="feed"></div>
+        <button id="jump-pill" onclick="jumpToLatest()">↓ <span id="jump-count">0</span> new events</button>
+        <div id="event-overlay">
+          <div style="display:flex; justify-content:space-between; align-items:center">
+            <b>Event detail</b>
+            <span><button class="btn" id="pin-btn" onclick="togglePin()">Pin</button><button class="btn" onclick="closeOverlay()">Close</button></span>
+          </div>
+          <div id="overlay-body"></div>
+        </div>
       </div>
     </div>
 
@@ -259,7 +299,7 @@
       });
     });
 
-    async function init() { loadState(); startSSE(); loadLedger(); loadApprovals(); loadStrategies(); loadPatterns(); loadSettings(); loadFunnel(); loadCycles(); loadIndustry(); }
+    async function init() { loadState(); startSSE(); loadLedger(); loadApprovals(); loadStrategies(); loadPatterns(); loadSettings(); loadFunnel(); loadCycles(); loadIndustry(); loadMode(); renderChips(); syncPauseBtn(); document.getElementById('feed').addEventListener('scroll', trackFeedScroll); }
     async function loadCycles() {
       try {
         const res = await fetch('/api/abandonment/distribution');
@@ -412,6 +452,213 @@
       }
     }
 
+    // ── Clear console (VIEW ONLY — SSE stays connected, ledger untouched) ──
+    let clearedBeforeId = null;
+    let clearedMarker = null;
+    function clearConsole() {
+      // Discard the pause buffer too; the marker accounts for it.
+      let discarded = 0;
+      if (feedPaused) {
+        discarded = pausedBuffer.length + pausedDropped;
+        pausedBuffer = [];
+        pausedDropped = 0;
+        syncPauseBtn();
+      }
+      const topId = feedRows.length > 0 && feedRows[0].id != null ? feedRows[0].id : null;
+      clearedBeforeId = topId;
+      const ts = new Date().toLocaleTimeString();
+      clearedMarker = discarded > 0
+        ? `── Console cleared · ${discarded} buffered events discarded · ${ts} ──`
+        : `── Console cleared · full history in Ledger · ${ts} ──`;
+      awayCount = 0;
+      document.getElementById('jump-pill').style.display = 'none';
+      renderFeed();
+    }
+    function toggleShortcuts() {
+      const el = document.getElementById('shortcuts-pop');
+      el.style.display = el.style.display === 'none' ? 'block' : 'none';
+    }
+    function toggleFilterBar() {
+      for (const id of ['chips-actor', 'chips-type', 'chips-special']) {
+        const el = document.getElementById(id);
+        el.style.display = el.style.display === 'none' ? 'block' : 'none';
+      }
+    }
+    document.addEventListener('keydown', (e) => {
+      const tag = (document.activeElement && document.activeElement.tagName) || '';
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+      if (document.getElementById('app').classList.contains('hidden')) return;
+      if (e.code === 'Space') { e.preventDefault(); togglePause(); }
+      else if (e.key === 'c' || e.key === 'C') clearConsole();
+      else if (e.key === 'f' || e.key === 'F') toggleFilterBar();
+    });
+
+    // ── Console readability controls (VIEW state only — the pipeline never pauses) ──
+    let feedPaused = localStorage.getItem('feedPaused') === '1';
+    let pausedBuffer = [];
+    let pausedDropped = 0;
+    let feedFilters = JSON.parse(localStorage.getItem('feedFilters') || '{"actors":[],"types":[],"special":[]}');
+    let lastVisible = [];
+    let feedAtBottom = true;
+    let awayCount = 0;
+    const ACTOR_CHIPS = ['RecoveryBot', 'UpsellBot', 'Poller', 'Buyer', 'System', 'Admin'];
+    const TYPE_CHIPS = ['TRIGGER', 'DECISION', 'POLICY', 'LINK', 'PAYMENT', 'ERROR'];
+    const SPECIAL_CHIPS = ['BLOCKED only', 'ESCALATED only', 'mode:"llm" only', 'SIMULATED only', 'REAL only', 'source: live', 'source: demo', 'MESSAGES only'];
+
+    // Spec actor groups: Poller = the MoneyBus/polling path, Buyer = the AI
+    // buyer agent, System = everything else automated (TrafficSim, chat and
+    // retry bots, reassurance/review senders).
+    function actorGroup(r) {
+      const a = r.actor || '';
+      if (a === 'RecoveryBot') return 'RecoveryBot';
+      if (a === 'UpsellBot') return 'UpsellBot';
+      if (a === 'MoneyBus' || a === 'Poller') return 'Poller';
+      if (a === 'BuyerAgent' || a === 'Buyer') return 'Buyer';
+      if (a === 'Admin') return 'Admin';
+      return 'System';
+    }
+    function typeGroups(r) {
+      const t = String(r.type || r.action || '').toUpperCase();
+      if (t === 'MESSAGE_SENT') return ['MESSAGE'];
+      const g = [];
+      if (/TRIGGER|INTENT/.test(t)) g.push('TRIGGER');
+      if (/DECISION|UPLIFT|THOUGHT/.test(t)) g.push('DECISION');
+      if (/POLICY/.test(t)) g.push('POLICY');
+      if (/LINK/.test(t)) g.push('LINK');
+      if (/PAYMENT|PAID|REFUND|CREDIT|ORDER/.test(t)) g.push('PAYMENT');
+      if (/FAIL|ERROR|BLOCK/.test(t) || r.severity === 'warning') g.push('ERROR');
+      return g;
+    }
+    function specialMatch(r, chip) {
+      const text = JSON.stringify(r);
+      switch (chip) {
+        case 'BLOCKED only': return r.severity === 'warning';
+        case 'ESCALATED only': return /ESCALAT/i.test(text);
+        case 'mode:"llm" only': return /"mode"\s*:\s*"llm"|mode:["']?llm/i.test(text);
+        case 'SIMULATED only': return !!r.simulated;
+        case 'REAL only': return !r.simulated;
+        case 'source: live': return (r.source_tag || 'system') === 'live';
+        case 'source: demo': return (r.source_tag || 'system') === 'demo' || (r.source_tag || '') === 'demo-bg';
+        case 'MESSAGES only': return String(r.type || r.action || '').toUpperCase() === 'MESSAGE_SENT';
+        default: return true;
+      }
+    }
+    // OR within a chip group, AND across groups.
+    function rowMatches(r) {
+      const f = feedFilters;
+      if (f.actors && f.actors.length > 0 && !f.actors.includes(actorGroup(r))) return false;
+      if (f.types && f.types.length > 0 && !typeGroups(r).some((g) => f.types.includes(g))) return false;
+      if (f.special && f.special.length > 0 && !f.special.every((c) => specialMatch(r, c))) return false;
+      return true;
+    }
+    function saveFilters() { localStorage.setItem('feedFilters', JSON.stringify(feedFilters)); }
+    function toggleChip(group, value) {
+      const arr = feedFilters[group] || (feedFilters[group] = []);
+      const i = arr.indexOf(value);
+      if (i >= 0) arr.splice(i, 1); else arr.push(value);
+      saveFilters();
+      renderChips();
+      renderFeed();
+    }
+    function clearFilters() {
+      feedFilters = { actors: [], types: [], special: [] };
+      saveFilters();
+      renderChips();
+      renderFeed();
+    }
+    function renderChips() {
+      const groups = [['actors', 'chips-actor', ACTOR_CHIPS], ['types', 'chips-type', TYPE_CHIPS], ['special', 'chips-special', SPECIAL_CHIPS]];
+      for (const [group, elId, chips] of groups) {
+        const el = document.getElementById(elId);
+        const label = el.querySelector('.chip-label').outerHTML;
+        el.innerHTML = label + chips.map((c) =>
+          `<span class="chip ${((feedFilters[group] || []).includes(c)) ? 'active' : ''}" onclick="toggleChip('${group}','${c}')">${c}</span>`
+        ).join('');
+      }
+    }
+    function togglePause() {
+      feedPaused = !feedPaused;
+      localStorage.setItem('feedPaused', feedPaused ? '1' : '0');
+      if (!feedPaused) {
+        // Catch-me-up: last 50 buffered (newest first), plus the notice.
+        const show = pausedBuffer.slice(-50).reverse();
+        for (const d of show) {
+          feedRows.unshift(d);
+          if (feedRows.length > 500) feedRows.pop();
+        }
+        const total = pausedBuffer.length + pausedDropped;
+        const el = document.getElementById('paused-notice');
+        el.style.display = 'block';
+        el.textContent = `(${total} events occurred while paused — showing last ${show.length}; full history in the Ledger tab)`;
+        pausedBuffer = [];
+        pausedDropped = 0;
+        setTimeout(() => { el.style.display = 'none'; }, 15000);
+      }
+      syncPauseBtn();
+      renderFeed();
+    }
+    function syncPauseBtn() {
+      document.getElementById('pause-btn').textContent = feedPaused ? '▶ Resume' : '⏸ Pause';
+      const n = document.getElementById('paused-notice');
+      if (feedPaused) {
+        n.style.display = 'block';
+        n.textContent = `Paused — buffering (${pausedBuffer.length} held, ledger still recording)`;
+      } else if (pausedBuffer.length === 0) {
+        n.style.display = 'none';
+      }
+    }
+    function jumpToLatest() {
+      const el = document.getElementById('feed');
+      el.scrollTop = el.scrollHeight;
+      feedAtBottom = true;
+      awayCount = 0;
+      document.getElementById('jump-pill').style.display = 'none';
+    }
+    let overlayEvent = null;
+    let overlayPinned = false;
+    // Overlay is a fixed panel: opening it never moves the feed, and while
+    // pinned the feed scrolls behind it without replacing the selection.
+    function inspectEvent(idx) {
+      if (overlayPinned) return;
+      overlayEvent = lastVisible[idx] || null;
+      renderOverlay();
+    }
+    function escHtml(s) {
+      return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    function renderOverlay() {
+      const ov = document.getElementById('event-overlay');
+      if (!overlayEvent) { ov.style.display = 'none'; return; }
+      const r = overlayEvent;
+      ov.style.display = 'block';
+      document.getElementById('pin-btn').textContent = overlayPinned ? 'Unpin' : 'Pin';
+      let extra = '';
+      try {
+        const d = r.data || {};
+        if (String(r.type || r.action || '').toUpperCase() === 'MESSAGE_SENT') {
+          const toks = (d.resolved_tokens || []).map((t) =>
+            `<li>${escHtml(t.token || '')} → <b>${escHtml(String(t.resolved_value ?? ''))}</b></li>`
+          ).join('');
+          extra = `<div style="margin-top:8px"><b>Channel:</b> ${escHtml(d.channel || '')} · <b>To:</b> ${escHtml(d.masked_recipient || '')} · <b>Ledger seq:</b> ${d.ledger_seq != null ? d.ledger_seq : '—'}</div>` +
+            (d.raw_copy ? `<div><b>Raw (token-bearing) copy:</b></div><div class="token-diff-raw">${escHtml(d.raw_copy)}</div>` : '') +
+            `<div><b>Resolved copy (what the customer saw):</b></div><div class="token-diff-resolved">${escHtml(d.message_copy || '')}</div>` +
+            (toks ? `<div><b>Resolved tokens → sources:</b></div><ul>${toks}</ul>` : `<div style="color:#484f58">No claim tokens — plain copy.</div>`);
+        }
+      } catch {}
+      document.getElementById('overlay-body').innerHTML =
+        `<div><b>${escHtml(r.actor || '')}</b> · ${escHtml(r.type || r.action || '')} · ${(r.source_tag || 'system')}</div>${extra}<pre>${escHtml(JSON.stringify(r, null, 1)).slice(0, 4000)}</pre>`;
+    }
+    function togglePin() {
+      overlayPinned = !overlayPinned;
+      renderOverlay();
+    }
+    function closeOverlay() {
+      overlayEvent = null;
+      overlayPinned = false;
+      document.getElementById('event-overlay').style.display = 'none';
+    }
+
     function startSSE() {
       if (eventSource) eventSource.close();
       eventSource = new EventSource('/api/feed');
@@ -419,26 +666,61 @@
         try {
           const d = JSON.parse(e.data);
           if (d.type === 'connected') return;
+          if (feedPaused) {
+            // Buffer in memory (cap 500, drop-oldest); pipeline untouched.
+            if (pausedBuffer.length >= 500) { pausedBuffer.shift(); pausedDropped++; }
+            pausedBuffer.push(d);
+            syncPauseBtn();
+            return;
+          }
           feedRows.unshift(d);
           if (feedRows.length > 500) feedRows.pop();
+          if (!feedAtBottom) {
+            awayCount++;
+            document.getElementById('jump-count').textContent = awayCount;
+            document.getElementById('jump-pill').style.display = 'block';
+          }
           renderFeed();
         } catch {}
       };
       eventSource.onerror = () => { setTimeout(() => { if (!eventSource || eventSource.readyState === 2) startSSE(); }, 3000); };
     }
 
+    function srcBadge(src) {
+      const s = src || 'system';
+      const cls = s === 'live' ? 'badge-green' : s === 'demo' ? 'badge-blue' : s === 'demo-bg' ? 'badge-yellow' : 'badge-gray';
+      return `<span class="badge ${cls}">${s}</span>`;
+    }
+
     function renderFeed() {
       const el = document.getElementById('feed');
       document.getElementById('feed-count').textContent = feedRows.length;
-      el.innerHTML = feedRows.slice(0, 200).map(r => {
+      // Auto-scroll only when already at the bottom (within 3 rows).
+      const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
+      if (nearBottom) feedAtBottom = true;
+      lastVisible = feedRows.filter((r) => (clearedBeforeId == null || (r.id != null && r.id > clearedBeforeId)) && rowMatches(r)).slice(0, 200);
+      const markerHtml = clearedMarker
+        ? `<div class="feed-row" style="color:#484f58; font-style:italic; cursor:default">${clearedMarker}</div>`
+        : '';
+      el.innerHTML = markerHtml + lastVisible.map((r, i) => {
         const ts = new Date(r.ts || r.created_at || Date.now()).toLocaleTimeString();
         const actor = r.actor || '';
         const type = r.type || r.action || '';
         const summary = r.summary || r.message || '';
         const amount = r.amount_paise ? fmtINR(r.amount_paise) : '';
-        const actorColor = actor === 'RecoveryBot' ? '#58a6ff' : actor === 'UpsellBot' ? '#a371f7' : actor === 'MoneyBus' ? '#3fb950' : actor === 'Admin' ? '#f0ad4e' : '#8b949e';
+        const actorColor = actor === 'RecoveryBot' ? '#58a6ff' : actor === 'UpsellBot' ? '#a371f7' : (actor === 'MoneyBus' || actor === 'Poller') ? '#3fb950' : actor === 'Admin' ? '#f0ad4e' : actor === 'TrafficSim' ? '#3fb950' : (actor === 'ChatAgent' || actor === 'FailureRetryBot') ? '#79c0ff' : (actor === 'Reassurance' || actor === 'ReviewBot') ? '#7ee787' : '#8b949e';
         const badge = r.simulated ? '<span class="badge badge-gray">SIMULATED</span>' : '';
         const blocked = (r.severity === 'warning') ? '<span class="badge badge-red">BLOCKED</span>' : '';
+        // MESSAGE_SENT rows are visually distinct: chat-bubble copy block,
+        // strategy + tone + brain_mode badges, masked recipient ONLY.
+        if (String(type).toUpperCase() === 'MESSAGE_SENT') {
+          const d = r.data || {};
+          const strat = d.message_strategy ? `<span class="badge badge-blue">${escHtml(d.message_strategy)}</span>` : '';
+          const tone = d.message_tone ? `<span class="badge badge-gray">${escHtml(d.message_tone)}</span>` : '';
+          const mode = d.brain_mode ? `<span class="badge ${d.brain_mode === 'llm' ? 'badge-green' : 'badge-gray'}">${escHtml(d.brain_mode)}</span>` : '';
+          const to = d.masked_recipient ? `<span style="color:#484f58">to ${escHtml(d.masked_recipient)}</span>` : '';
+          return `<div class="feed-row" onclick="inspectEvent(${i})"><span class="feed-ts">${ts}</span><span class="feed-actor" style="color:${actorColor}">✉️ ${escHtml(actor)}</span><span class="feed-type">${escHtml(type)} ${badge} ${srcBadge(r.source_tag)}</span><span class="feed-summary"><div class="msg-bubble">${escHtml(d.message_copy || summary)}</div><div class="msg-meta">${strat} ${tone} ${mode} ${to}</div></span></div>`;
+        }
         const dataStr = r.data ? JSON.stringify(r.data).slice(0, 120) : '';
         // §3a: LINK_CREATED rows carry a primary action opening the REAL
         // Razorpay URL (short_url from the payment_links row) — never an
@@ -450,8 +732,52 @@
             payAction = `<a class="btn btn-primary" style="margin-left:8px" href="${url}" target="_blank" rel="noopener">Open payment link</a>`;
           }
         } catch {}
-        return `<div class="feed-row"><span class="feed-ts">${ts}</span><span class="feed-actor" style="color:${actorColor}">${actor}</span><span class="feed-type">${type} ${badge} ${blocked}</span><span class="feed-summary">${summary}</span><span class="feed-amount">${amount}</span>${payAction}</div>`;
+        return `<div class="feed-row" onclick="inspectEvent(${i})"><span class="feed-ts">${ts}</span><span class="feed-actor" style="color:${actorColor}">${actor}</span><span class="feed-type">${type} ${badge} ${blocked} ${srcBadge(r.source_tag)}</span><span class="feed-summary">${summary}</span><span class="feed-amount">${amount}</span>${payAction}</div>`;
       }).join('');
+      if (feedAtBottom && !feedPaused) el.scrollTop = el.scrollHeight;
+    }
+
+    function trackFeedScroll() {
+      const el = document.getElementById('feed');
+      const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
+      feedAtBottom = nearBottom;
+      if (nearBottom) {
+        awayCount = 0;
+        document.getElementById('jump-pill').style.display = 'none';
+      }
+    }
+
+    // ── Data-source mode controls ──
+    async function loadMode() {
+      try {
+        const res = await fetch('/api/data-mode');
+        if (!res.ok) return;
+        const d = await res.json();
+        syncModeUI(d.mode, d.demo_bg_enabled);
+      } catch {}
+    }
+    function syncModeUI(mode, bg) {
+      const badge = document.getElementById('data-mode-badge');
+      badge.textContent = mode === 'live' ? 'DATA: LIVE' : 'DATA: DEMO';
+      badge.className = 'badge ' + (mode === 'live' ? 'badge-green' : 'badge-blue');
+      document.getElementById('bg-toggle').checked = bg !== false;
+    }
+    async function setDataMode(mode) {
+      if (mode === 'live' && !confirm('Live mode adds continuous traffic — console will stay busy. Switch?')) return;
+      const el = document.getElementById('mode-status');
+      el.textContent = 'Switching...';
+      const res = await fetch('/api/data-mode', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken }, body: JSON.stringify({ mode }) });
+      const d = await res.json();
+      if (!res.ok) { el.textContent = `Switch failed: ${d.error || res.status}`; return; }
+      el.textContent = mode === 'live' ? 'LIVE — trickle on' : 'DEMO — simulator off';
+      syncModeUI(d.mode, d.demo_bg_enabled);
+    }
+    async function setDemoBg(enabled) {
+      const el = document.getElementById('mode-status');
+      const res = await fetch('/api/demo-bg', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken }, body: JSON.stringify({ enabled }) });
+      const d = await res.json();
+      el.textContent = res.ok ? `Background traffic ${d.demo_bg_enabled ? 'ON' : 'OFF'} (audited)` : `Switch failed: ${d.error || res.status}`;
+      if (res.ok) syncModeUI(d.mode, d.demo_bg_enabled);
     }
 
     async function loadLedger() {

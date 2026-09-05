@@ -57,6 +57,24 @@ export async function execute(
       data: { seq, simulated: true },
       simulated: true,
     });
+    // Outbound stream: simulated sends are badged, never REAL revenue.
+    try {
+      const { emitMessageSent } = await import("./messageStream.js");
+      await emitMessageSent({
+        merchantId, actor, channel: "payment_link",
+        messageCopy: String(context?.message_copy || "Your payment link is ready."),
+        rawCopy: context?.raw_copy ? String(context.raw_copy) : undefined,
+        messageStrategy: context?.message_strategy || "functional",
+        messageTone: context?.brain_tone,
+        brainMode: context?.brain_mode === "llm" ? "llm" : "rules",
+        cartOrOrderRef: context?.cart_id || null,
+        resolvedTokens: context?.claims_resolved || context?.resolved_tokens || [],
+        incentivePaise: Number(context?.incentive_paise ?? action.params?.incentive_paise ?? 0),
+        simulated: true, customerId: context?.customer_id || null,
+        sourceTag: (context as any)?.source_tag,
+        ledgerSeq: seq,
+      });
+    } catch { /* stream never blocks money */ }
     return { seq, status: "simulated" };
   }
 
@@ -299,6 +317,26 @@ async function createPaymentLink(
     amount_paise: amount,
     data: { seq, razorpay_link_id: link.id, short_url: link.short_url, token, ext_ref: extRef, amount_paise: amount },
   });
+
+  // Outbound stream: the notification_outbox row above is the hook point —
+  // emit MESSAGE_SENT with the FINAL resolved copy in the same code path.
+  try {
+    const { emitMessageSent } = await import("./messageStream.js");
+    await emitMessageSent({
+      merchantId, actor, channel: "payment_link",
+      messageCopy: String(context?.message_copy || "Your payment link is ready."),
+      rawCopy: context?.raw_copy ? String(context.raw_copy) : undefined,
+      messageStrategy: context?.message_strategy || "functional",
+      messageTone: context?.brain_tone,
+      brainMode: context?.brain_mode === "llm" ? "llm" : "rules",
+      cartOrOrderRef: context?.cart_id || context?.order_id || null,
+      resolvedTokens: context?.claims_resolved || context?.resolved_tokens || [],
+      incentivePaise: Number(context?.incentive_paise ?? params.incentive_paise ?? 0),
+      simulated: false, customerId: context?.customer_id || customerId || null,
+      sourceTag: (context as any)?.source_tag,
+      ledgerSeq: seq,
+    });
+  } catch { /* stream never blocks money */ }
 
   log.info({ seq, linkId: link.id }, "Payment link created");
   return { seq, status: "created", data: { link_id: link.id, short_url: link.short_url, token, order_id: order.id, seq } };
@@ -768,6 +806,16 @@ async function sendReassurance(pl: {
     amount_paise: Number(pl.amount_paise),
     data: { message_copy: copy, incentive_paise: incentive, customer_id: pl.customer_id, cart_id: pl.cart_id },
   });
+  try {
+    const { emitMessageSent } = await import("./messageStream.js");
+    await emitMessageSent({
+      merchantId: pl.merchant_id, actor: "Reassurance", channel: "reassurance",
+      messageCopy: copy, messageStrategy: "functional", messageTone: "warm",
+      brainMode: "rules", cartOrOrderRef: pl.cart_id,
+      resolvedTokens: [], incentivePaise: incentive,
+      simulated: false, customerId: pl.customer_id || null,
+    });
+  } catch { /* stream never blocks resolution */ }
 }
 
 /**

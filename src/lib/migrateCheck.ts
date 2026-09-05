@@ -29,6 +29,7 @@ export const MIGRATION_SENTINELS: MigrationSentinel[] = [
   { file: "011_v5_checkout_flag.sql", table: "carts", column: "checkout_started_at" },
   { file: "012_v5_abandonment_cycles.sql", table: "customers", column: "abandonment_cycles" },
   { file: "013_v5_benchmarks.sql", table: "industry_benchmarks" },
+  { file: "014_v5_datamode.sql", table: "data_mode" },
 ];
 
 export function migrationFiles(migrateDir: string): string[] {

@@ -26,6 +26,11 @@
  *   have no exact catalog match and map to the closest stand-ins.
  *
  * MUST NEVER RUN IN LIVE MODE. Test/demo tool only.
+ *
+ * Usage: npm run seed-real [-- --mode demo|live] (default demo).
+ * - demo: the 12 test-case people only (plus system catalog/policy/stats).
+ * - live: the 12 people AND 20 anonymous background carts tagged demo-bg
+ *   (equivalent to seeding demo, then flipping the dashboard toggle).
  */
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -144,7 +149,37 @@ async function main() {
     }
   }
 
-  // STEP 2: historical-state SQL with CAPTURED ids (no hash guessing).
+  // STEP 2: --mode live adds 20 anonymous background carts (API only,
+  // tagged demo-bg so the dashboard sub-toggle can silence them).
+  // Accepts both `--mode live` and `--mode=live` (npm passes either).
+  const argv = process.argv.slice(2);
+  let modeArg = 'demo';
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === '--mode' && argv[i + 1]) { modeArg = argv[i + 1]; break; }
+    if (argv[i].startsWith('--mode=')) { modeArg = argv[i].split('=')[1]; break; }
+  }
+  if (!['demo', 'live'].includes(modeArg)) {
+    console.error(`--mode must be demo|live (got '${modeArg}')`);
+    process.exit(1);
+  }
+  if (modeArg === 'live') {
+    console.log('── mode=live: seeding 20 background carts ──');
+    const prodIds = Object.values(PRODUCTS);
+    let bgOk = 0;
+    for (let i = 1; i <= 20; i++) {
+      try {
+        const r = await track('cart', {
+          cart_id: cartUuid(`bg:${i}`),
+          items: [{ id: prodIds[i % prodIds.length], qty: 1 + (i % 2) }],
+          source_tag: 'demo-bg',
+        });
+        if ((r.total_paise || 0) > 0) bgOk++;
+      } catch (e) {
+        console.error(`FAIL bg cart ${i}: ${e.message}`);
+      }
+    }
+    console.log(`   → ${bgOk}/20 background carts with server totals (source_tag demo-bg)\n`);
+  }
   const failures = PEOPLE.filter((p) => !bound[p.key]);
   if (failures.length > 0) {
     console.error(`${failures.length} people failed to bind — history SQL skipped (run again; binds are idempotent).`);

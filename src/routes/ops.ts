@@ -227,6 +227,53 @@ opsRouter.post("/api/breaker/reset", requireAuth, csrfCheck, async (_req: Reques
   res.json({ success: true });
 });
 
+// Data-source mode (DEMO/LIVE console traffic) + background-cart sub-toggle.
+// Every change is admin-audited and ledgered via a console event.
+opsRouter.get("/api/data-mode", requireAuth, async (_req: Request, res: Response) => {
+  try {
+    const { getDataMode } = await import("../lib/dataMode.js");
+    res.json(await getDataMode());
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+opsRouter.post("/api/data-mode", requireAuth, csrfCheck, async (req: Request, res: Response) => {
+  const { mode } = req.body || {};
+  if (mode !== "demo" && mode !== "live") { res.status(400).json({ error: "mode must be 'demo' or 'live'" }); return; }
+  try {
+    const { query: dbQuery } = await import("../db.js");
+    const { setDataMode } = await import("../lib/dataMode.js");
+    const state = await setDataMode(dbQuery, mode, String((req as any).userId || "admin"));
+    await recordAdminAudit({ adminUser: (req as any).userId, action: `data_mode:${mode}`, detail: { mode }, ip: req.ip });
+    await appendActivity({
+      merchant_id: MERCHANT_ID, actor: "Admin", type: "DATA_MODE",
+      summary: mode === "live"
+        ? "DATA SOURCE: LIVE — organic traffic simulator on (readable trickle)"
+        : "DATA SOURCE: DEMO — simulator off, seeded stories only",
+      data: { mode }, source_tag: "system",
+    });
+    const { startLiveTraffic, stopLiveTraffic } = await import("../lib/liveTraffic.js");
+    if (mode === "live") await startLiveTraffic();
+    else stopLiveTraffic();
+    res.json({ success: true, ...state });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+opsRouter.post("/api/demo-bg", requireAuth, csrfCheck, async (req: Request, res: Response) => {
+  const { enabled } = req.body;
+  try {
+    const { query: dbQuery } = await import("../db.js");
+    const { setDemoBg } = await import("../lib/dataMode.js");
+    const state = await setDemoBg(dbQuery, enabled === true, String((req as any).userId || "admin"));
+    await recordAdminAudit({ adminUser: (req as any).userId, action: `demo_bg:${enabled === true}`, detail: { enabled: enabled === true }, ip: req.ip });
+    await appendActivity({
+      merchant_id: MERCHANT_ID, actor: "Admin", type: "DEMO_BG",
+      summary: `Background demo traffic ${enabled === true ? "ON" : "OFF"}`,
+      data: { enabled: enabled === true }, source_tag: "system",
+    });
+    res.json({ success: true, ...state });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
 // Policy preset
 opsRouter.post("/api/policy/preset", requireAuth, csrfCheck, async (req: Request, res: Response) => {
   const { preset } = req.body;

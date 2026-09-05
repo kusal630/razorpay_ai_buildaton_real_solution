@@ -109,6 +109,15 @@ export async function handleChatMessage(
       summary: `FAQ answered from DB facts (${faqIntent}${cached ? ", cached" : ""}) — zero LLM tokens`,
       data: { mode: "faq", intent: faqIntent, cached },
     });
+    try {
+      const { emitMessageSent } = await import("../lib/messageStream.js");
+      await emitMessageSent({
+        merchantId: MERCHANT_ID, actor: "ChatAgent", channel: "chat",
+        messageCopy: answer, messageStrategy: "functional",
+        brainMode: "rules", cartOrOrderRef: (params as any)?.cart_id || null,
+        resolvedTokens: [], customerId: cart?.customer_id || null,
+      });
+    } catch { /* stream never blocks chat */ }
     return { response: answer };
   }
 
@@ -278,9 +287,23 @@ export async function handleChatMessage(
           brain_mode: brain.mode,
           brain_reasoning: brain.rationale.reasoning,
           message_copy: grounded.copy,
+          raw_copy: brain.message_copy,
+          message_strategy: (brain as any).raw?.message_strategy || "functional",
         },
         MERCHANT_ID
       );
+      try {
+        const { emitMessageSent } = await import("../lib/messageStream.js");
+        await emitMessageSent({
+          merchantId: MERCHANT_ID, actor: "ChatAgent", channel: "chat",
+          messageCopy: grounded.copy, rawCopy: brain.message_copy,
+          messageStrategy: (brain as any).raw?.message_strategy || "functional",
+          brainMode: brain.mode === "llm" ? "llm" : "rules",
+          cartOrOrderRef: (params as any)?.cart_id || null,
+          resolvedTokens: (grounded as any).result?.resolved || [],
+          customerId: cart?.customer_id || null,
+        });
+      } catch { /* stream never blocks chat */ }
       return { response: grounded.copy, action: `discount_applied_${newSeq}` };
     } catch (err: any) {
       log.error({ seq, error: err.message }, "ChatAgent link creation failed");
@@ -301,7 +324,28 @@ export async function handleChatMessage(
       fallbackTemplate: "Thanks for asking — the price and terms shown on this page are current.",
       ledger: { merchantId: MERCHANT_ID, actor: "ChatAgent", action: "chat_explain" },
     });
+    try {
+      const { emitMessageSent } = await import("../lib/messageStream.js");
+      await emitMessageSent({
+        merchantId: MERCHANT_ID, actor: "ChatAgent", channel: "chat",
+        messageCopy: grounded.copy, rawCopy: brain.message_copy,
+        messageStrategy: (brain as any).raw?.message_strategy || "functional",
+        brainMode: "llm", cartOrOrderRef: (params as any)?.cart_id || null,
+        resolvedTokens: (grounded as any).result?.resolved || [],
+        customerId: cart?.customer_id || null,
+      });
+    } catch { /* stream never blocks chat */ }
     return { response: grounded.copy };
   }
+  try {
+    const { emitMessageSent } = await import("../lib/messageStream.js");
+    await emitMessageSent({
+      merchantId: MERCHANT_ID, actor: "ChatAgent", channel: "chat",
+      messageCopy: brain.message_copy,
+      messageStrategy: "functional",
+      brainMode: "rules", cartOrOrderRef: (params as any)?.cart_id || null,
+      resolvedTokens: [], customerId: cart?.customer_id || null,
+    });
+  } catch { /* stream never blocks chat */ }
   return { response: brain.message_copy };
 }

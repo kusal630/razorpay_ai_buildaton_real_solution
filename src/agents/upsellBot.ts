@@ -278,6 +278,7 @@ export async function processPaidOrder(pl: {
         fallback_reason: (brain as any).fallback_reason || null,
         prompt_version: "v5.6",
         message_copy: upsellCopy,
+        raw_copy: brain.message_copy,
         claims_resolved: finalizedUpsell.result.resolved,
         claims_stripped: finalizedUpsell.result.stripped,
       },

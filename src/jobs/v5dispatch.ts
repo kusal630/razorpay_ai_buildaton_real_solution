@@ -107,6 +107,16 @@ export async function dispatchReviewRequests(): Promise<{ requested: number }> {
       rationale: { reason: "post-delivery window elapsed; one transactional request" },
       outcome: "SUCCESS",
     } as any);
+    try {
+      const { emitMessageSent } = await import("../lib/messageStream.js");
+      await emitMessageSent({
+        merchantId: MERCHANT_ID, actor: "ReviewBot", channel: "review",
+        messageCopy: "How was your order? A quick rating helps other shoppers like you.",
+        messageStrategy: "social_proof", brainMode: "rules",
+        cartOrOrderRef: String(o.order_id), resolvedTokens: [],
+        customerId: o.customer_id || null,
+      });
+    } catch { /* stream never blocks dispatch */ }
     requested++;
   }
   return { requested };
