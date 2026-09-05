@@ -93,6 +93,16 @@ trackRouter.post("/api/track/bind-customer", async (req: Request, res: Response)
       "UPDATE carts SET customer_id = $1, source_tag = COALESCE($3, source_tag) WHERE id = $2",
       [customerId, cart_id, req.body?.source_tag && SOURCE_TAGS.includes(req.body.source_tag) ? req.body.source_tag : null]
     );
+    // H1 repair: the contact handoff IS the transactional anchor. Without
+    // this, checkTransactionalConsent (which reads consent_transactional)
+    // fails for every API-seeded cart and RecoveryBot re-fires + skips it
+    // on every scheduler pass forever (the DEMO-mode console flood).
+    try {
+      const { anchorTransactional } = await import("../lib/consent.js");
+      await anchorTransactional(customerId, cart_id);
+    } catch (anchorErr: any) {
+      log.warn({ error: anchorErr?.message }, "Transactional anchor skipped (non-critical)");
+    }
     // Record consent event (remote shape: class / evidence_ref)
     // M29: carries text_version, channel, ip_hash, ua_hash.
     if (email || phone) {
@@ -157,6 +167,17 @@ trackRouter.post("/api/track/checkout-start", async (req: Request, res: Response
          checkout_started_at = COALESCE(carts.checkout_started_at, NOW())`,
       [cart_id, MERCHANT_ID]
     );
+    // H1 repair: checkout-start is the explicit purchase-intent anchor
+    // (anchorTransactional's contract names it). Best-effort, never blocks.
+    try {
+      const { rows: ownerRows } = await query("SELECT customer_id FROM carts WHERE id = $1", [cart_id]);
+      if (ownerRows[0]?.customer_id) {
+        const { anchorTransactional } = await import("../lib/consent.js");
+        await anchorTransactional(ownerRows[0].customer_id, cart_id);
+      }
+    } catch (anchorErr: any) {
+      log.warn({ error: anchorErr?.message }, "Checkout anchor skipped (non-critical)");
+    }
     res.json({ success: true });
   } catch (err: any) { res.status(500).json({ error: err.message }); }
 });

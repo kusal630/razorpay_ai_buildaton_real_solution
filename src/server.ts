@@ -195,7 +195,22 @@ async function main() {
 
 function startScheduler() {
   log.info("Starting 15s scheduler loop");
+  let tickSeq = 0;
+  let tickInFlight = 0;
   setInterval(async () => {
+    const tickId = ++tickSeq;
+    // Single-flight: a tick that overruns its 15s window must NOT overlap
+    // the next one. Overlapping ticks process the same carts concurrently,
+    // interleave ledger appends/resolves (non-tip resolutions abort on the
+    // append-only trigger), and re-fire the same triggers seconds apart —
+    // the second sustaining mechanism of the DEMO console flood. The skip
+    // is logged so a chronically-overrunning loop stays visible.
+    if (tickInFlight > 0) {
+      log.warn({ tickId, inFlight: tickInFlight }, "Scheduler tick skipped — previous tick still running");
+      return;
+    }
+    tickInFlight++;
+    const tickStart = Date.now();
     try {
       const { query } = await import("./db.js");
       const config = (await import("./config.js")).getConfig();
@@ -221,6 +236,29 @@ function startScheduler() {
       const demoClause = liveClause;
       const demoClauseC = liveClauseC;
 
+      // H4 guard: scans only hand ACTIONABLE carts to the agents — identity
+      // present + a valid transactional anchor, the exact predicate
+      // processAbandonedCart enforces. Consent-less/anonymous carts used to
+      // be re-selected on every pass, emitting TRIGGER_DETECTED +
+      // DUPLICATE_SKIPPED forever with zero progress (the DEMO-mode
+      // console flood: ~36 events/15s). Filtering here stops generation at
+      // the source; the in-agent skip paths stay as a one-off safety net.
+      // Consent is dynamic: a cart becomes selectable as soon as its
+      // customer gains an anchor (bind/checkout-start anchor it now).
+      const { checkTransactionalConsent } = await import("./lib/consent.js");
+      const actionableCartIds = async (
+        rows: Array<{ id: string; customer_id: string | null }>
+      ): Promise<Set<string>> => {
+        const ok = new Set<string>();
+        for (const r of rows) {
+          if (!r.customer_id) continue;
+          try {
+            if (await checkTransactionalConsent(r.customer_id)) ok.add(r.id);
+          } catch { /* one bad row never breaks the scan */ }
+        }
+        return ok;
+      };
+
       // Find abandoned carts
       const abandonMinutes = config.ABANDON_MINUTES;
       const { rows: carts } = await query(
@@ -229,13 +267,15 @@ function startScheduler() {
           AND updated_at < NOW() - INTERVAL '${abandonMinutes} minutes'
           ${bgClause}
           ${demoClause}
-          RETURNING id`
+          RETURNING id, customer_id`
       );
 
       if (carts.length > 0) {
         log.info({ count: carts.length }, "Carts marked as abandoned");
+        const markedActionable = await actionableCartIds(carts);
         const { processAbandonedCart } = await import("./agents/recoveryBot.js");
         for (const cart of carts) {
+          if (!markedActionable.has(cart.id)) continue;
           try {
             await processAbandonedCart(cart.id, { stage: "24h" });
           } catch (err: any) {
@@ -265,9 +305,11 @@ function startScheduler() {
       );
       if (earlyCarts.length > 0) {
         log.info({ count: earlyCarts.length }, "Early-window carts found");
+        const earlyActionable = await actionableCartIds(earlyCarts);
         const { processAbandonedCart } = await import("./agents/recoveryBot.js");
         const { isTouchAllowed } = await import("./lib/fatigue.js");
         for (const cart of earlyCarts) {
+          if (!earlyActionable.has(cart.id)) continue;
           try {
             // G9: early requires zero touches ever, so fatigue cannot trigger
             // here yet — check anyway for uniformity (cheap, future-proof).
@@ -296,9 +338,11 @@ function startScheduler() {
           LIMIT 10`
       );
       if (unprocessed.length > 0) {
+        const unprocessedActionable = await actionableCartIds(unprocessed);
         const { processAbandonedCart } = await import("./agents/recoveryBot.js");
         const { isTouchAllowed } = await import("./lib/fatigue.js");
         for (const cart of unprocessed) {
+          if (!unprocessedActionable.has(cart.id)) continue;
           try {
             // G9 (v4.3): fatigued identities sit out until spacing elapses.
             if (cart.customer_id) {
@@ -344,9 +388,11 @@ function startScheduler() {
       );
       if (finalCarts.length > 0) {
         log.info({ count: finalCarts.length }, "Final-call carts found");
+        const finalActionable = await actionableCartIds(finalCarts);
         const { processFinalCall } = await import("./agents/recoveryBot.js");
         const { isTouchAllowed } = await import("./lib/fatigue.js");
         for (const cart of finalCarts) {
+          if (!finalActionable.has(cart.id)) continue;
           try {
             // G9: the final call obeys the doubled window like any touch.
             if (cart.customer_id) {
@@ -399,6 +445,19 @@ function startScheduler() {
         log.error({ error: err.message }, "Sweeper error");
       }
 
+      // Intent janitor: resume due deferred intents (quiet-hours chains
+      // otherwise never wake), reset stale gateway waits, expire
+      // past-window rows. The worker module is not loaded in this
+      // process and Redis is down in this env, so the tick owns it —
+      // previously it never ran anywhere (stale awaiting_gateway rows
+      // dating back hours proved it).
+      try {
+        const { runJanitor } = await import("./lib/intentExecutor.js");
+        await runJanitor();
+      } catch (err: any) {
+        log.error({ error: err.message }, "Janitor error");
+      }
+
       // v5.0 dispatch: revocation backstop, reminders, price watches, reviews.
       try {
         const { runV5Dispatch } = await import("./jobs/v5dispatch.js");
@@ -447,6 +506,11 @@ function startScheduler() {
       }
     } catch (err: any) {
       log.error({ error: err.message }, "Scheduler error");
+    } finally {
+      tickInFlight--;
+      if (Date.now() - tickStart > 15000) {
+        log.warn({ tickId, elapsedMs: Date.now() - tickStart }, "Scheduler tick overran its 15s window");
+      }
     }
   }, 15000);
 }

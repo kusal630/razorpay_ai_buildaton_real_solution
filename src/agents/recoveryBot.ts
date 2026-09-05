@@ -93,25 +93,9 @@ export async function processAbandonedCart(
     data: { cart_id: cartId, abandoned_at: cart.abandoned_at, total_paise: cartTotal, stage },
   });
 
-  // ── PAID-SKIP: never chase a cart that already converted ──
-  const { rows: paidRows } = await query(
-    `SELECT 1 FROM payment_links WHERE cart_id = $1 AND status = 'paid'
-     UNION SELECT 1 FROM orders WHERE cart_id = $1::uuid AND status = 'paid' LIMIT 1`,
-    [cartId]
-  );
-  if (paidRows.length > 0) {
-    await appendActivity({
-      merchant_id: MERCHANT_ID,
-      actor: "RecoveryBot",
-      type: "DUPLICATE_SKIPPED",
-      summary: `Cart ${cartId} skipped — already paid`,
-      data: { cart_id: cartId, reason: "already_paid", stage },
-    });
-    log.debug({ cartId, stage }, "Cart already paid, skipping");
-    return;
-  }
-
-  // ── STEP 3: WRITE-AHEAD INTENT (crash guard) ──
+  // ── TERMINAL GATES (cheap, pre-intent; the scheduler's actionable
+  // filter already excludes these — what reaches here is a rare race,
+  // so a one-off skip event is correct and self-limiting) ──
   if (!customerId) {
     await appendActivity({
       merchant_id: MERCHANT_ID,
@@ -145,34 +129,7 @@ export async function processAbandonedCart(
   // T4: abandonment-cycle covariate (record now, graduate later — NO θ math).
   const abandonmentCycles = Number((custRows[0] as any)?.abandonment_cycles || 0);
 
-  const today = new Date().toISOString().slice(0, 10);
-  const { rows: touchRows } = await query(
-    "SELECT count FROM touches WHERE customer_id = $1 AND day = $2",
-    [customerId, today]
-  );
-  const touchesToday = Number(touchRows[0]?.count || 0);
-
-  // Total touch history across all days
-  const { rows: totalTouchRows } = await query(
-    "SELECT COALESCE(SUM(count), 0) as total_touches FROM touches WHERE customer_id = $1",
-    [customerId]
-  );
-  const touchHistory = Number(totalTouchRows[0]?.total_touches || 0);
-
-  // ── R1 (v4.2) early-stage guards: velocity 2/day governs the extra touch ──
-  if (stage === "early" && touchesToday >= 2) {
-    await appendActivity({
-      merchant_id: MERCHANT_ID,
-      actor: "RecoveryBot",
-      type: "ABSTAIN",
-      summary: `Early touch skipped — velocity cap (touches_today=${touchesToday})`,
-      data: { cart_id: cartId, reason: "velocity_early_cap", stage, touches_today: touchesToday },
-    });
-    log.debug({ cartId, touchesToday }, "Early touch velocity-capped");
-    return;
-  }
-
-  // ── STEP 4: MARGIN CALCULATION (from joined line items) ──
+  // ── MARGIN (from joined line items; needed by the write-ahead intent) ──
   let marginPaise: number;
   if (itemsJson.length > 0) {
     marginPaise = itemsJson.reduce(
@@ -185,29 +142,12 @@ export async function processAbandonedCart(
   }
   if (!marginPaise) marginPaise = Math.floor(cartTotal * CONSTANTS.MARGIN_PERCENT);
 
-  // T3: funnel suspension — proactive persuasion into a broken funnel stays
-  // out. Transactional paths (failure retry) never check this flag.
-  const { isRecoverySuspended } = await import("../lib/v5funnel.js");
-  if (await isRecoverySuspended(query, MERCHANT_ID)) {
-    // One SUSPENDED note per cart per hour (no feed flood during incidents).
-    const { rows: recent } = await query(
-      `SELECT 1 FROM activity WHERE merchant_id = $1 AND type = 'SUSPENDED'
-        AND data->>'cart_id' = $2 AND ts > NOW() - INTERVAL '1 hour' LIMIT 1`,
-      [MERCHANT_ID, cartId]
-    ).catch(() => ({ rows: [] as any[] }));
-    if (recent.length === 0) {
-      await appendActivity({
-        merchant_id: MERCHANT_ID,
-        actor: "RecoveryBot",
-        type: "SUSPENDED",
-        summary: `Recovery held — funnel anomaly suspension active (cart ${cartId})`,
-        data: { cart_id: cartId, reason: "funnel_anomaly_suspended" },
-        severity: "warn",
-      });
-    }
-    return;
-  }
-
+  // ── WRITE-AHEAD INTENT FIRST (loop-proofing): every exit below this
+  // point — guard skip, policy block, mid-chain exception — leaves a
+  // day-scoped intent row, so no scan re-selects this cart until the key
+  // rolls (next business day). Before this ordering, a chain that died
+  // after TRIGGER but before intent creation re-fired every 15s pass
+  // forever (the DEMO-mode console flood).
   const intent = await createIntent({
     merchantId: MERCHANT_ID,
     customerId,
@@ -235,6 +175,77 @@ export async function processAbandonedCart(
     summary: `Write-ahead intent created for cart ${cartId}`,
     data: { intent_id: intent.intentId, cart_id: cartId, segment, margin_paise: marginPaise },
   });
+
+  // ── PAID-SKIP: never chase a cart that already converted. Post-intent
+  // so the skip leaves a blocking row (webhook-paid carts used to re-fire
+  // TRIGGER + SKIP on every pass — their carts stay 'abandoned').
+  const { rows: paidRows } = await query(
+    `SELECT 1 FROM payment_links WHERE cart_id = $1 AND status = 'paid'
+     UNION SELECT 1 FROM orders WHERE cart_id = $1::uuid AND status = 'paid' LIMIT 1`,
+    [cartId]
+  );
+  if (paidRows.length > 0) {
+    await appendActivity({
+      merchant_id: MERCHANT_ID,
+      actor: "RecoveryBot",
+      type: "DUPLICATE_SKIPPED",
+      summary: `Cart ${cartId} skipped — already paid`,
+      data: { cart_id: cartId, reason: "already_paid", stage },
+    });
+    await failIntent(intent.intentId, "skipped");
+    log.debug({ cartId, stage }, "Cart already paid, skipping");
+    return;
+  }
+
+  const today = new Date().toISOString().slice(0, 10);
+  const { rows: touchRows } = await query(
+    "SELECT count FROM touches WHERE customer_id = $1 AND day = $2",
+    [customerId, today]
+  );
+  const touchesToday = Number(touchRows[0]?.count || 0);
+
+  // Total touch history across all days
+  const { rows: totalTouchRows } = await query(
+    "SELECT COALESCE(SUM(count), 0) as total_touches FROM touches WHERE customer_id = $1",
+    [customerId]
+  );
+  const touchHistory = Number(totalTouchRows[0]?.total_touches || 0);
+
+  // ── R1 (v4.2) early-stage guards: velocity 2/day governs the extra touch ──
+  if (stage === "early" && touchesToday >= 2) {
+    await appendActivity({
+      merchant_id: MERCHANT_ID,
+      actor: "RecoveryBot",
+      type: "ABSTAIN",
+      summary: `Early touch skipped — velocity cap (touches_today=${touchesToday})`,
+      data: { cart_id: cartId, reason: "velocity_early_cap", stage, touches_today: touchesToday },
+    });
+    log.debug({ cartId, touchesToday }, "Early touch velocity-capped");
+    return;
+  }
+
+  // ── T3: funnel suspension — proactive persuasion into a broken funnel stays
+  // out. Transactional paths (failure retry) never check this flag.
+  const { isRecoverySuspended } = await import("../lib/v5funnel.js");
+  if (await isRecoverySuspended(query, MERCHANT_ID)) {
+    // One SUSPENDED note per cart per hour (no feed flood during incidents).
+    const { rows: recent } = await query(
+      `SELECT 1 FROM activity WHERE merchant_id = $1 AND type = 'SUSPENDED'
+        AND data->>'cart_id' = $2 AND ts > NOW() - INTERVAL '1 hour' LIMIT 1`,
+      [MERCHANT_ID, cartId]
+    ).catch(() => ({ rows: [] as any[] }));
+    if (recent.length === 0) {
+      await appendActivity({
+        merchant_id: MERCHANT_ID,
+        actor: "RecoveryBot",
+        type: "SUSPENDED",
+        summary: `Recovery held — funnel anomaly suspension active (cart ${cartId})`,
+        data: { cart_id: cartId, reason: "funnel_anomaly_suspended" },
+        severity: "warn",
+      });
+    }
+    return;
+  }
 
   // ── STEP 5: EXPERIMENT ASSIGNMENT ──
   let experimentId: string | null = null;
@@ -789,6 +800,16 @@ export async function processFinalCall(cartId: string): Promise<void> {
   const cartMerchantId = cart.merchant_id;
   const today = new Date().toISOString().slice(0, 10);
 
+  // Intent-first (loop-proofing, same as the ladder touches): every exit
+  // below leaves a day-scoped recovery_final row, so a cart that cannot
+  // proceed (no prior link, consent revoked, mid-chain error) goes quiet
+  // instead of re-firing TRIGGER on every pass.
+  const intent = await createIntent({
+    merchantId: MERCHANT_ID, customerId, targetId: cartId,
+    actionType: "recovery_final",
+  });
+  if (!intent.isNew) return;
+
   await appendActivity({
     merchant_id: MERCHANT_ID, actor: "RecoveryBot", type: "TRIGGER_DETECTED",
     summary: `Final-call window for cart ${cartId}`,
@@ -862,12 +883,6 @@ export async function processFinalCall(cartId: string): Promise<void> {
     });
     return;
   }
-
-  const intent = await createIntent({
-    merchantId: MERCHANT_ID, customerId, identityToken,
-    actionType: "recovery_final", targetId: cartId,
-  });
-  if (!intent.isNew) return;
 
   // Full policy gate (velocity 2/day, quiet hours, caps govern the final touch).
   const policyResult = await evaluateAction("recovery_incentive", {
