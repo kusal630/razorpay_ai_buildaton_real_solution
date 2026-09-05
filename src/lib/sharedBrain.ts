@@ -6,6 +6,7 @@ import { findBareNumbers } from "./claims.js";
 import {
   validateV20,
   unknownTokens,
+  INLINE_TOKEN_RE,
   defaultBrainExtension,
   type SecondaryCta,
 } from "./v5brain.js";
@@ -333,7 +334,13 @@ function checkBannedClaims(copy: string): string[] {
   // M31: NFKC + zero-width normalization BEFORE the banned-claims filter.
   const normalized = normalizeForFilters(copy);
   const violations: string[] = [];
+  // M20-V7 letter: pressure strings are banned WHEN NO grounding token
+  // accompanies them. A token-grounded deadline may be stated firmly.
+  INLINE_TOKEN_RE.lastIndex = 0;
+  const hasToken = INLINE_TOKEN_RE.test(copy);
+  INLINE_TOKEN_RE.lastIndex = 0;
   for (const { pattern, label } of BANNED_PATTERNS) {
+    if (hasToken && label.startsWith("pressure_")) continue;
     if (pattern.test(normalized)) violations.push(label);
   }
   return violations;
@@ -895,6 +902,14 @@ export async function callBrain(
     _evidence_rule2:
       `rationale.evidence_ids MUST be 1-2 items chosen EXACTLY from this list: ${(context.known_ids || []).join(", ")}. Never invent IDs, never use numbers, prices, or descriptions.`,
     _menu_rule: menuRule,
+    _cta_rule: (() => {
+      const r = (context as any).allow_reminder_choice === true;
+      const s = (context as any).allow_save_for_later === true;
+      if (r && s) return "secondary_cta may be reminder_choice, save_for_later, or none.";
+      if (r) return "secondary_cta may be reminder_choice or none. save_for_later is NOT available — never output it.";
+      if (s) return "secondary_cta may be save_for_later or none. reminder_choice is NOT available — never output it.";
+      return "secondary_cta MUST be none — neither reminder_choice nor save_for_later is available for this customer.";
+    })(),
   });
 
   try {

@@ -110,3 +110,22 @@ linter additions live (survey phrasing, AP2 rule, source/date labels).
   designed degraded path, and every fallback names its reason.
 
 FREEZE RESUMES: bug fixes, tests, measurement, integration wiring only.
+
+## Final evidence addendum (post-freeze fixes during v5.6 execution)
+
+- Live full chain (fresh inject): TRIGGER_DETECTED → INTENT → AGENT_THOUGHT
+  mode:llm/functional → LEDGER_SUCCESS → LINK_CREATED with a real
+  `plink_` link (₹1899). Dedupe holds on re-scan (DUPLICATE_SKIPPED).
+- Brain pass-rate work (code-owned user content only; system prompts
+  verbatim; validation ungated): menu rule, CTA rule, token/evidence rules,
+  plain-English retry hints, token-wins bucket resolution, V7 pressure
+  exemption exactly as specified ("when no grounding token accompanies
+  them"). Live probes 4/4 llm with varied strategies.
+- Ledger canonical bug found and fixed: `undefined` hashed as literal
+  "undefined" while JSONB storage drops it — every unresolved PROPOSED row
+  with an undefined field could never verify. Canonical now mirrors
+  storage; single canonical shared by ledger.js and auditLedger.js
+  (auditLedger2 removed as dead/Divergent). Re-genesis via reset+seed;
+  chain green including live pipeline rows. Regression gate U-LEDG-CANON.
+- Budget rollover ensure added (day-boundary had dropped the verify
+  budget gate); `carts.status='converted'` on payment proven by fixture.
