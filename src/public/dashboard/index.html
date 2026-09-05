@@ -263,7 +263,7 @@
         const res = await fetch('/api/abandonment/distribution');
         const d = await res.json();
         document.getElementById('cycles-dist').textContent =
-          ((d.distribution || []).map((r: any) => `${r.cycles}×: ${r.n}`).join(' · ')) || 'No data yet.';
+          ((d.distribution || []).map((r) => `${r.cycles}×: ${r.n}`).join(' · ')) || 'No data yet.';
       } catch {}
     }
     async function loadFunnel() {
