@@ -24,10 +24,18 @@ export interface LedgerResult {
 }
 
 function canonicalJson(obj: unknown): string {
-  if (obj === null || typeof obj !== "object") return JSON.stringify(obj);
-  if (Array.isArray(obj)) return "[" + obj.map(canonicalJson).join(",") + "]";
-  const keys = Object.keys(obj as Record<string, unknown>).sort();
-  return "{" + keys.map((k) => `${JSON.stringify(k)}:${canonicalJson((obj as Record<string, unknown>)[k])}`).join(",") + "}";
+  // Mirror JSON.stringify storage semantics: undefined/function/symbol values
+  // are DROPPED from objects (null in arrays). Otherwise the hash covers
+  // phantom keys the database never stores and verification can never pass.
+  if (obj === null || typeof obj !== "object") return JSON.stringify(obj) ?? "null";
+  if (Array.isArray(obj)) {
+    return "[" + obj.map((v) => (v === undefined ? "null" : canonicalJson(v))).join(",") + "]";
+  }
+  const rec = obj as Record<string, unknown>;
+  const keys = Object.keys(rec)
+    .filter((k) => rec[k] !== undefined && typeof rec[k] !== "function" && typeof rec[k] !== "symbol")
+    .sort();
+  return "{" + keys.map((k) => `${JSON.stringify(k)}:${canonicalJson(rec[k])}`).join(",") + "}";
 }
 
 function computeHash(prevHash: string, row: Record<string, unknown>): string {

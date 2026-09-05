@@ -325,6 +325,14 @@ function startScheduler() {
         log.error({ error: err.message }, "v5 dispatch error");
       }
 
+      // Budget rollover: ensure today's row exists for every merchant.
+      try {
+        const { ensureTodayBudget } = await import("./lib/budget.js");
+        await ensureTodayBudget();
+      } catch (err: any) {
+        log.error({ error: err.message }, "Budget rollover error");
+      }
+
       // Poll payment links
       const { rows: liveLinks } = await query(
         `SELECT id, razorpay_link_id, merchant_id, cart_id, customer_id,

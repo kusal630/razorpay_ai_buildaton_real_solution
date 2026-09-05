@@ -125,6 +125,7 @@ export async function handleChatMessage(
       marginPaise: marginPaise,
     },
     cartItems: chatItems,
+    merchantId: MERCHANT_ID,
   });
 
   const brain = await callBrain("chat", brainContext);

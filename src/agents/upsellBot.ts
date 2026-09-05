@@ -119,6 +119,7 @@ export async function processPaidOrder(pl: {
     candidates: shortlist,
     feasibleDiscounts: feasibleDiscounts.map(d => d * 100), // convert to paise for schema
     maxDiscountPct: MAX_DISCOUNT_PCT,
+    merchantId: MERCHANT_ID,
   });
 
   const brain = await callBrain("upsell", brainContext);

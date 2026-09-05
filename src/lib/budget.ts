@@ -42,6 +42,18 @@ export async function reserveBudget(
 }
 
 /**
+ * Rollover ensure: today's budget row for every merchant (INSERT ... ON
+ * CONFLICT DO NOTHING — one cheap query per scheduler pass).
+ */
+export async function ensureTodayBudget(): Promise<void> {
+  await query(
+    `INSERT INTO daily_budget (day, merchant_id, cap_paise)
+     SELECT CURRENT_DATE, m.id, 500000 FROM merchants m
+     ON CONFLICT (day, merchant_id) DO NOTHING`
+  );
+}
+
+/**
  * Release reserved budget (on skip, fail, or expiry).
  */
 export async function releaseBudget(

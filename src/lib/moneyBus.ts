@@ -533,6 +533,12 @@ export async function resolvePayment(pl: {
 
     await client.query("UPDATE payment_links SET status = 'paid', paid_at = NOW() WHERE id = $1", [pl.id]);
 
+    // F4 (v5.1 fix): a paid cart exits the scan set — the scheduler's
+    // due-cart query filters status='abandoned', so flip it here in-txn.
+    if (pl.cart_id) {
+      await client.query("UPDATE carts SET status = 'converted', updated_at = NOW() WHERE id::text = $1::text", [pl.cart_id]);
+    }
+
     // Order upsert (once)
     const { rows: existingOrders } = await client.query(
       "SELECT id FROM orders WHERE ext_ref = (SELECT ext_ref FROM payment_links WHERE id = $1)",
@@ -772,7 +778,7 @@ async function sendReassurance(pl: {
 export async function sweepExpiredLinks(): Promise<{ expired: number }> {
   // Enforced deadline = the offer window when shorter than the gateway floor.
   const { rows: due } = await query(
-    `SELECT id, merchant_id, razorpay_link_id, incentive_paise FROM payment_links
+    `SELECT id, merchant_id, razorpay_link_id, incentive_paise, customer_id FROM payment_links
      WHERE status = 'live'
      AND LEAST(expire_by, COALESCE(offer_expires_by, expire_by)) <= NOW()
      AND expire_by IS NOT NULL
@@ -785,6 +791,14 @@ export async function sweepExpiredLinks(): Promise<{ expired: number }> {
         try { await cancelRazorpayLink(link.razorpay_link_id); } catch { /* best effort */ }
       }
       await query("UPDATE payment_links SET status = 'expired' WHERE id = $1", [link.id]);
+      // T4: cart lapsed unresolved to expiry → abandonment cycle. Payments
+      // (resolvePayment) and save-for-later paths never touch this counter.
+      if (link.customer_id) {
+        await query(
+          "UPDATE customers SET abandonment_cycles = abandonment_cycles + 1 WHERE id = $1",
+          [link.customer_id]
+        ).catch(() => {});
+      }
       const incentive = Number(link.incentive_paise || 0);
       if (incentive > 0) {
         const { releaseBudget } = await import("./budget.js");

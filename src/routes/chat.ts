@@ -86,6 +86,24 @@ chatRouter.get("/pay/:token", async (req: Request, res: Response) => {
         }
       } catch { /* table may not exist yet — omit */ }
     }
+    // T1: trust strip — returns policy + delivery estimate, resolver-gated:
+    // unconfigured sources simply omit the line (never a bare claim).
+    let returns_policy: string | undefined;
+    let delivery_estimate: string | undefined;
+    if (link?.merchant_id) {
+      try {
+        const { rows: cfgRows } = await query(
+          "SELECT key, value_jsonb FROM merchant_config WHERE merchant_id = $1 AND key IN ('returns_policy', 'shipping')",
+          [link.merchant_id]
+        );
+        const cfg: Record<string, any> = {};
+        for (const r of cfgRows) cfg[r.key] = r.value_jsonb;
+        const summary = String(cfg.returns_policy?.summary || "").slice(0, 80);
+        if (summary) returns_policy = summary;
+        const eta = Number(cfg.shipping?.eta_days ?? NaN);
+        if (Number.isFinite(eta) && eta > 0) delivery_estimate = `delivery in ~${Math.round(eta)} days`;
+      } catch { /* omit trust lines */ }
+    }
     res.json({
       token, amount_paise: resolved.amountPaise, masked_pii: resolved.maskedPii,
       pay_url: link?.short_url || "", incentive_paise: link?.incentive_paise || 0,
@@ -97,6 +115,8 @@ chatRouter.get("/pay/:token", async (req: Request, res: Response) => {
       trust: {
         ...(merchant_name ? { merchant_name } : {}),
         secured_by: "Razorpay",
+        ...(returns_policy ? { returns_policy } : {}),
+        ...(delivery_estimate ? { delivery_estimate } : {}),
       },
       ...(social_proof ? { social_proof } : {}),
     });

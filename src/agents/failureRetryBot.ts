@@ -126,6 +126,7 @@ export async function processFailedOrder(orderId: string): Promise<void> {
     feasibleOptions: [{ action: "send_plain_link", bucket_paise: 0, ev_paise: 0, theta: 0.1 }],
     maxIncentivePaise: 0, marginPaise: Math.floor(cartTotal * 0.4),
     thetaEstimates: { "0": 0.1 },
+    merchantId: MERCHANT_ID,
   }));
 
   const frame = methodSwitchSentence(order.payment_method);

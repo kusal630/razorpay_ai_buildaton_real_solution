@@ -205,3 +205,26 @@ alerts beyond save-for-later, replenishment (when catalog gains consumables).
 measurement improvements, and integration wiring for the integration-gated
 items. Any new feature idea → ROADMAP.md with the MIT-filter question: "which
 lever, what evidence tier, what falsification plan, what gate?"
+
+---
+
+## v5.6 additions (posture, triggers, timing, certification)
+
+- POSTURE DIMENSION (graduation-gated, after bucket/type/strategy): full
+  browsing/comparing classification from the event stream; route browsers to
+  off-ramps, comparers to all-in + social proof at ₹0. Gate: lift vs uniform
+  ladder at minimum-n (kill criterion: no lift). NOTE: posture-lite already
+  ships (checkout_started segment split + save-for-later + price-watch).
+- BACK-IN-STOCK token + trigger (composes with price-watch). Gate: real
+  restock event fires a marketing-gated ping; no event → silence.
+- SESSION-RESTORE / GUEST-CHECKOUT: merchant checklist item. Note: the
+  payment link already IS the prefilled session-restore deep link; guest
+  checkout is merchant-site architecture.
+- UPI-INTENT DEEP LINK: REJECTED (parallel payment rail, money-bus
+  violation). Roadmap note only: verify Razorpay's native UPI-intent
+  deep-link support before considering.
+- TIMING DIMENSION (ladder T+1h/24h/72h as a bandit arm): sequential
+  graduation after existing dimensions. Gate: per-arm minimum-n.
+- AP2 FORMAL CERTIFICATION: compliance roadmap item (patterns implemented
+  natively — see docs/PROTOCOLS.md; certification requires ecosystem
+  participation).

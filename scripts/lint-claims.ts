@@ -9,6 +9,7 @@ const files = process.argv.slice(2).length > 0
   ? process.argv.slice(2)
   : ["README.md", "CONTRIBUTING.md", "docs/DEMO.md", "docs/GO_LIVE.md",
      "docs/ARCHITECTURE.md", "docs/SECURITY.md", "docs/PRODUCT_ROADMAP.md",
+     "docs/PROTOCOLS.md",
      "src/public/dashboard/index.html"];
 
 let failed = 0;

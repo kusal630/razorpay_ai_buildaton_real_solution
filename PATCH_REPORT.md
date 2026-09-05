@@ -1,0 +1,112 @@
+# PATCH_REPORT v5.6 — LLM brain revival + trust tokens & funnel-abstain + competitive intelligence
+
+Suite: 146/146 tests (11 files). `npm run verify` 21/21 exit 0. Typecheck
+clean. Claims linter green over all shipped files. MODEL PIN honored:
+LLM_MODEL=bonsai-8b in .env and .env.example (verified against the
+provider list, never rewritten).
+
+## Root-cause confirmation (REQUIRED DIAGNOSTIC)
+
+After F1 made fallbacks loud, the live feed showed:
+`BRAIN_FALLBACK reason=llm_model_unavailable, model=bonsai-8b,
+error="fetch failed", available=[]`.
+Verdict: Root Cause 1 as literally suspected (name mismatch) is REFUTED —
+the pin was correct; the provider endpoint was DOWN (connection refused).
+The silence was the bug: the client fell back without a trace. Environment
+repair: restarted a local GPU server (llama-server + on-disk Bonsai-8B
+weights) on :1234 as `bonsai-8b`; then `checkModelAvailable` green,
+`brain-test` mode:llm, live AGENT_THOUGHT mode:llm observed. Root Cause 2
+(no eligible triggers) is a standing property of a worked demo dataset —
+addressed structurally by F4's always-fresh injector, not by weakening
+dedupe or fatigue.
+
+## Part A — hard checkpoint: SIGNED OFF (all six acceptance items)
+
+1. Doctor all-green INCLUDING model-in-list (`pinned model 'bonsai-8b'
+   available`) — observed live.
+2. brain-test → mode:llm + parsed output, POST /v1/chat/completions in the
+   provider log — observed (exit 0). Bogus-model fixture → named
+   llm_model_unavailable, zero POSTs.
+3. Fresh inject → full chain to AGENT_THOUGHT mode:llm with strategy +
+   token-bearing copy (observed live: loss_framed + reminder_choice,
+   resolver-filled values in the expanded row).
+4. Pay → REAL tick → cart flips to converted, exits the scan set
+   (resolvePayment sets carts.status='converted' — proven by fixture;
+   no re-trigger loops observed).
+5. Full suite green; kill switch OFF persists (DB-backed, boot-synced);
+   demo clean.
+6. Root cause reported above.
+
+Per-fix evidence (all gates PASS):
+- F1 U-LOUD: 5 fixtures (kill_switch_active, llm_model_unavailable with
+  model+list and zero POSTs, llm_transport_error→open, validation_failed
+  without trip, llm_no_api_key contract) + live feed rows.
+- F2 U-MODELDOC: bogus-model doctor subprocess → RED with available list;
+  pin-verification unit test; README doctor line added.
+- F3 U-BRAINTEST: live exit-0 run; QA button + route; deterministic fixture
+  test (gwp arm resolves to COGS 5900).
+- F4 U-FRESHINJECT: injector mints uuid cart + bound identity + consent +
+  checkout flag (live-tested); converted-on-pay proven by fixture;
+  reset-content + dedupe-key tests; same-id re-scan → DUPLICATE_SKIPPED
+  (observed live).
+- F5 U-BREAKERVIS: trip→open+reason, reset→closed, validation→no-trip;
+  dashboard widget + reset control live.
+
+## Part B — gate sign-off BEFORE Part C: SIGNED OFF
+
+- U-RETURNS / U-DELIVERY: configured renders ("7-day easy returns",
+  "delivery in ~3 days"); unconfigured strips + falls back, ledgered.
+- U-GSM7: post-resolution cap rejects grown copy; SMS renders "Rs 100",
+  web renders "₹100" (pipeline order fixed: resolve → normalize →
+  channel-compose → length check).
+- U-COLLAPSE: 20 starts/0 converts above baseline → suspend + banner +
+  ledger; converts next window → auto re-arm; quiet-hours volume → silent.
+- U-CYCLE: cycles in context + rationale; sweeper is the sole writer
+  (resolvePayment and price-watch paths asserted untouched).
+- U-BRAINTEST re-run with trust-flagged fixture: still passes.
+
+## Part C — gates green
+
+- U-BENCH: merchant vs seeded Metorik-2026 rows with source + as_of;
+  honest label enforced by test + linter phrasing.
+- U-TARGET: outperform → reduce advisory; trail → raise advisory; both
+  ledgered on transition; policy matrix provably untouched (suggester
+  takes no policy object).
+- U-CARTVAL: $158/$117 fixture fires with "recorded, pre-settlement";
+  equal values silent.
+- U-PROTOCOLS: docs/PROTOCOLS.md + README Agentic Commerce section;
+  the unqualified certification claim is banned, "AP2-aligned" required.
+
+## Part D — U-NARR2 green
+
+All four D1 narrative lines present in README (linter-clean); roadmap
+entries added with gates + kill criteria + the UPI-intent rejection;
+linter additions live (survey phrasing, AP2 rule, source/date labels).
+
+## Dispositions
+
+- Accepted and built: F1–F5, T1–T4, P1–P4, D1–D3 (evidence above).
+- Stale-with-receipt: the "295-event loop / zero POST" diagnosis describes
+  the pre-repair environment (dead :1234); current receipts show live
+  chains + llm lands. Cart-<uuid-suffix> injector naming adapted to full
+  UUIDs (carts.id is UUID-typed) — same freshness guarantee.
+- Roadmap-with-reason: posture classification, back-in-stock, timing
+  bandit, AP2 certification (docs/PRODUCT_ROADMAP.md); UPI-intent
+  REJECTED (money-bus violation).
+
+## Residuals (updated)
+
+- Industry benchmarks are priors, the holdout is the truth (labeled
+  everywhere they appear).
+- Ledger canonicalization fixed (undefined/function/symbol now mirror
+  JSONB storage) and unified on ledger.js; auditLedger2 (dead, divergent)
+  removed. Chains written before the fix cannot verify — live chain
+  re-genesis via reset+seed; verifyChain green since.
+- Local-model operations: :1234 served from on-disk weights by a manually
+  started server; if it dies, fallbacks go loud (llm_model_unavailable)
+  and rules mode carries the demo.
+- Small-model pass rate is stochastic (~1 in 2–4 attempts land llm);
+  validation is never weakened to compensate — rules fallback is the
+  designed degraded path, and every fallback names its reason.
+
+FREEZE RESUMES: bug fixes, tests, measurement, integration wiring only.

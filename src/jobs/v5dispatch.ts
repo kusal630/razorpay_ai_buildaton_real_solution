@@ -112,6 +112,46 @@ export async function dispatchReviewRequests(): Promise<{ requested: number }> {
   return { requested };
 }
 
+/** T3: hourly conversion-collapse watch (throttled; idempotent while suspended). */
+let lastFunnelRun = 0;
+export async function runFunnelWatch(): Promise<{ fired: boolean }> {
+  if (Date.now() - lastFunnelRun < 3600_000) return { fired: false };
+  lastFunnelRun = Date.now();
+  const { detectCollapse, readFunnelWindow, suspendRecovery, resumeRecovery, isRecoverySuspended } =
+    await import("../lib/v5funnel.js");
+  const { rows: merchants } = await query("SELECT id FROM merchants");
+  let fired = false;
+  for (const m of merchants) {
+    const mid = m.id;
+    try {
+      const window = await readFunnelWindow(query, mid);
+      const suspended = await isRecoverySuspended(query, mid);
+      if (!suspended) {
+        const verdict = detectCollapse(window);
+        if (verdict.fired) {
+          const { appendLedger } = await import("../lib/ledger.js");
+          const { appendActivity } = await import("../lib/activity.js");
+          await suspendRecovery(
+            { q: query, ledgerAppend: (e) => (appendLedger as any)(e), activityAppend: appendActivity },
+            mid, verdict.reason || "funnel anomaly"
+          );
+          fired = true;
+        }
+      } else if (window.converts2h > 0) {
+        const { appendLedger } = await import("../lib/ledger.js");
+        const { appendActivity } = await import("../lib/activity.js");
+        await resumeRecovery(
+          { q: query, ledgerAppend: (e) => (appendLedger as any)(e), activityAppend: appendActivity },
+          mid, "auto"
+        );
+      }
+    } catch (err: any) {
+      log.warn({ merchant: mid, error: err?.message }, "Funnel watch failed for merchant");
+    }
+  }
+  return { fired };
+}
+
 /** Single entry: runs every scheduler pass, never throws. */
 export async function runV5Dispatch(): Promise<void> {
   for (const [name, fn] of [
@@ -119,6 +159,7 @@ export async function runV5Dispatch(): Promise<void> {
     ["reminders", dispatchReminders],
     ["priceWatches", dispatchPriceWatches],
     ["reviews", dispatchReviewRequests],
+    ["funnelWatch", runFunnelWatch],
   ] as const) {
     try {
       const r = await (fn as () => Promise<unknown>)();

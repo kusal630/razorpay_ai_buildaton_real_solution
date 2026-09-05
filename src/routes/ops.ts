@@ -83,6 +83,9 @@ opsRouter.get("/api/state", requireAuth, async (_req: Request, res: Response) =>
       query(`SELECT simulated_revenue_paise FROM backtest_runs ORDER BY ran_at DESC LIMIT 1`).catch(() => ({ rows: [] })),
     ]);
     const { getActiveBanners } = await import("../lib/refundAlarm.js");
+    const { getCircuitStatus, getLastTrip, breakerOpensLastHour } = await import("../lib/sharedBrain.js");
+    const circuit = getCircuitStatus();
+    const trip = getLastTrip();
     res.json({
       alerts: await getActiveBanners(),
       revenue: { real: Number(rev.rows[0]?.total_revenue || 0), orders: Number(rev.rows[0]?.order_count || 0), sim: Number((simRev as any).rows[0]?.simulated_revenue_paise || 0) },
@@ -90,6 +93,8 @@ opsRouter.get("/api/state", requireAuth, async (_req: Request, res: Response) =>
       approvals: approvals.rows,
       budget: budget.rows[0] || { cap_paise: 500000, reserved_paise: 0, realized_paise: 0, settled_paise: 0, released_paise: 0 },
       kill_switch: killSwitch.rows[0]?.enabled || false,
+      // F5: breaker visibility (state, last trip reason, opens/hour).
+      breaker: { state: circuit.state, failures: circuit.consecutiveFailures, last_trip_reason: trip.reason, opens_last_hour: breakerOpensLastHour() },
       segments: segments.rows,
       doctor: await runDoctorChecks(),
       mode: getConfig().RAZORPAY_MODE,
@@ -200,6 +205,18 @@ opsRouter.post("/api/kill-switch", requireAuth, csrfCheck, async (req: Request, 
   res.json({ success: true, enabled });
 });
 
+// Circuit breaker reset (F5: manual control, ledgered like the kill switch)
+opsRouter.post("/api/breaker/reset", requireAuth, csrfCheck, async (_req: Request, res: Response) => {
+  const { resetBreaker } = await import("../lib/sharedBrain.js");
+  resetBreaker("dashboard");
+  await appendActivity({
+    merchant_id: MERCHANT_ID, actor: "Admin", type: "POLICY_EVAL",
+    summary: "Circuit breaker manually reset",
+    data: { breaker_reset: true },
+  });
+  res.json({ success: true });
+});
+
 // Policy preset
 opsRouter.post("/api/policy/preset", requireAuth, csrfCheck, async (req: Request, res: Response) => {
   const { preset } = req.body;
@@ -241,22 +258,37 @@ opsRouter.post("/api/reconcile", requireAuth, async (_req: Request, res: Respons
 
 // QA Tools
 opsRouter.post("/api/qa/inject-abandoned", requireAuth, csrfCheck, async (req: Request, res: Response) => {
+  // F4: EVERY invocation mints a brand-new cart AND customer (uuid ids):
+  // bound identity + encrypted contact, marketing consent event, transactional
+  // anchor, checkout-start flag, catalog items, abandoned 25h, zero intents,
+  // zero touches. (Carts.id is UUID-typed, so full UUIDs — not text prefixes.)
+  const { findOrCreateCustomer } = await import("../lib/identity.js");
+  const { recordConsentEvidence } = await import("../lib/v5privacy.js");
   const id = crypto.randomUUID();
-  const total = req.body.total_paise || 159800;
-  const customerId = req.body.customer_id || null;
+  const phone = `+91981${String(Math.floor(Math.random() * 900000) + 100000)}`;
+  const { customerId } = await findOrCreateCustomer(MERCHANT_ID, { phone, segment: "first_visit_high_intent" });
+  // Catalog items (default: priciest active product so EV math is interesting).
   let items = req.body.items;
+  let total = Number(req.body.total_paise || 0);
   if (!items) {
-    // Default to a real catalog product so margin/EV math works
     const { rows: prod } = await query(
-      "SELECT id, price_paise FROM products WHERE active = true ORDER BY price_paise DESC LIMIT 1"
+      "SELECT id, price_paise FROM products WHERE active = true AND is_gift = false ORDER BY price_paise DESC LIMIT 1"
     );
     if (!prod[0]) { res.status(400).json({ error: "No active products" }); return; }
     items = [{ id: prod[0].id, qty: 1 }];
+    total = Number(prod[0].price_paise);
   }
+  if (!total) {
+    for (const item of items) {
+      const { rows: prod } = await query("SELECT price_paise FROM products WHERE id = $1", [item.id]);
+      if (prod[0]) total += Number(prod[0].price_paise) * (item.qty || 1);
+    }
+  }
+  const abandonedAt = new Date(Date.now() - 25 * 3600e3);
   await query(
-    `INSERT INTO carts (id, merchant_id, customer_id, total_paise, status, abandoned_at, updated_at)
-     VALUES ($1, $2, $3, $4, 'abandoned', NOW() - INTERVAL '2 hours', NOW())`,
-    [id, MERCHANT_ID, customerId, total]
+    `INSERT INTO carts (id, merchant_id, customer_id, total_paise, status, abandoned_at, updated_at, checkout_started_at)
+     VALUES ($1, $2, $3, $4, 'abandoned', $5, $5, $5)`,
+    [id, MERCHANT_ID, customerId, total, abandonedAt]
   );
   // Remote schema: line items live in cart_items (no items_json on carts)
   for (const item of items) {
@@ -268,12 +300,24 @@ opsRouter.post("/api/qa/inject-abandoned", requireAuth, csrfCheck, async (req: R
       [id, item.id, item.qty || 1, Number(prod[0].price_paise)]
     );
   }
+  // Consent: marketing opt-in (incentives allowed) + transactional anchor.
+  await recordConsentEvidence(query, {
+    merchantId: MERCHANT_ID, customerId, klass: "marketing", optIn: true,
+    source: "qa_injector", evidenceRef: `qa:${id}`, channel: "ops_qa",
+  });
+  await query(
+    `UPDATE customers SET consent_transactional = jsonb_build_object(
+       'anchor_cart_ids', jsonb_build_array($2::text),
+       'latest_anchor_at', NOW()::text, 'expires_at', (NOW() + INTERVAL '7 days')::text)
+     WHERE id = $1`,
+    [customerId, id]
+  );
   await appendActivity({
     merchant_id: MERCHANT_ID, actor: "Admin", type: "TRIGGER_DETECTED",
     summary: `QA: Injected abandoned cart ${id}`,
-    data: { cart_id: id, injected: true },
+    data: { cart_id: id, customer_id: customerId, injected: true },
   });
-  res.json({ success: true, cart_id: id });
+  res.json({ success: true, cart_id: id, customer_id: customerId });
 });
 
 opsRouter.post("/api/qa/inject-payment-failure", requireAuth, csrfCheck, async (req: Request, res: Response) => {

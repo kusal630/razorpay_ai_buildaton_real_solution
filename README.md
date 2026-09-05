@@ -113,7 +113,9 @@ encryption key `openssl rand -base64 32`); `LLM_BASE_URL` / `LLM_API_KEY` /
 `LLM_MODEL` if available.
 
 Scripts, one line each: `setup` (migrate + seed a fresh DB); `doctor`
-(environment health: DB, Razorpay, LLM, migrations, seed); `dev` (server +
+(environment health: DB, Razorpay, LLM, migrations, seed — run
+`npm run doctor` to list your provider's available models and confirm the
+pinned model is among them); `dev` (server +
 15s scheduler); `verify` (21 acceptance gates); `reset:sample` (wipe sample
 data); `seed` (reload sample data); `demo:buyer` (AI-buyer escalation drill);
 `backtest` (simulated-day replay via the dashboard route; needs a logged-in
@@ -194,6 +196,32 @@ simulated activity is badged everywhere and never touches the real counter.
 - Integration-gated (machinery ready, external signal needed): COD-save live
   operation, NDR automation via courier webhooks, full settlement
   reconciliation wiring.
+
+## Agentic Commerce
+
+Our protocol endpoints (`/agent/sessions`, signed cart mandates, ledgered
+receipts) are AP2-aligned: they implement AP2 patterns natively, ready for
+the emerging agent-commerce ecosystem. See `docs/PROTOCOLS.md` for the
+pattern map. Formal certification is a compliance roadmap item.
+
+## Why This Shape (notes from the field)
+
+Industry survey research (Baymard) reports roughly half of abandoned carts
+are browsers, not interrupted buyers — which is why Sellable's honest
+off-ramps (save-for-later, price-watch, first-touch plain) are features,
+not compromises.
+
+Industry survey research reports top performers recover 10-14% of abandoned
+carts (Metorik 2026). Sellable measures incremental lift — recovery we
+caused, not recovery that would have happened anyway — because a holdout
+control group receives no AI touches.
+
+Abandoned carts average higher value than completed carts (industry survey
+research reports ≈ $141 vs $117, Metorik 2026) — larger baskets hesitate
+more. Sellable's EV pricing already accounts for this.
+
+Google's Agent Payments Protocol (AP2) launched with 60+ partners in 2025.
+Sellable's buyer-agent channel implements AP2's core patterns natively.
 
 ## Repository Structure
 

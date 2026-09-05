@@ -136,11 +136,13 @@ export async function processAbandonedCart(
   }
 
   const { rows: custRows } = await query(
-    "SELECT id, segment, identity_hash FROM customers WHERE id = $1",
+    "SELECT id, segment, identity_hash, abandonment_cycles FROM customers WHERE id = $1",
     [customerId]
   );
   const segment = custRows[0]?.segment || "default";
   const identityToken = custRows[0]?.identity_hash || customerId;
+  // T4: abandonment-cycle covariate (record now, graduate later — NO θ math).
+  const abandonmentCycles = Number((custRows[0] as any)?.abandonment_cycles || 0);
 
   const today = new Date().toISOString().slice(0, 10);
   const { rows: touchRows } = await query(
@@ -181,6 +183,21 @@ export async function processAbandonedCart(
     marginPaise = Math.floor(cartTotal * CONSTANTS.MARGIN_PERCENT);
   }
   if (!marginPaise) marginPaise = Math.floor(cartTotal * CONSTANTS.MARGIN_PERCENT);
+
+  // T3: funnel suspension — proactive persuasion into a broken funnel stays
+  // out. Transactional paths (failure retry) never check this flag.
+  const { isRecoverySuspended } = await import("../lib/v5funnel.js");
+  if (await isRecoverySuspended(query, MERCHANT_ID)) {
+    await appendActivity({
+      merchant_id: MERCHANT_ID,
+      actor: "RecoveryBot",
+      type: "SUSPENDED",
+      summary: `Recovery held — funnel anomaly suspension active (cart ${cartId})`,
+      data: { cart_id: cartId, reason: "funnel_anomaly_suspended" },
+      severity: "warn",
+    });
+    return;
+  }
 
   const intent = await createIntent({
     merchantId: MERCHANT_ID,
@@ -418,23 +435,32 @@ export async function processAbandonedCart(
     maxIncentivePaise: config.DAILY_INCENTIVE_BUDGET_PAISE,
     marginPaise,
     thetaEstimates,
+    merchantId: MERCHANT_ID,
+    abandonmentCycles,
   });
 
   // ── M18/M21 (v5): feature-aware extension — case_type, token whitelist,
   // copy constraints, secondary-CTA availability. All pseudonymized.
   const shippingCfg = await query(
-    "SELECT value_jsonb FROM merchant_config WHERE merchant_id = $1 AND key = 'shipping'", [MERCHANT_ID]
+    "SELECT key, value_jsonb FROM merchant_config WHERE merchant_id = $1 AND key IN ('shipping', 'returns_policy')", [MERCHANT_ID]
   ).catch(() => ({ rows: [] as any[] }));
-  const ship = shippingCfg.rows[0]?.value_jsonb || null;
+  const cfgByKey: Record<string, any> = {};
+  for (const r of shippingCfg.rows || []) cfgByKey[r.key] = r.value_jsonb;
+  const ship = cfgByKey.shipping || null;
   const shippingPaise = ship ? Number(ship.flat_fee_paise || 0) : 0;
+  const shippingEta = ship?.eta_days ?? null;
   const freeThreshold = ship?.free_threshold_paise ?? null;
   const gapPaise = freeThreshold != null && cartTotal < freeThreshold ? freeThreshold - cartTotal : null;
+  // T1: returns policy (trust claim — stripped when unconfigured).
+  const retSummary = String(cfgByKey.returns_policy?.summary || "").slice(0, 80) || null;
   (brainContext as any).case_type = "recovery";
   (brainContext as any).copy_constraints = { max_length: 320 };
   (brainContext as any).available_tokens = [
     `all_in_total:${cartId}`,
     ...(gapPaise != null ? [`threshold_gap:${cartId}`] : []),
     `expiry:${cartId}`,
+    ...(retSummary ? ["returns_policy:merchant"] : []),
+    ...(shippingEta != null ? [`delivery_estimate:${cartId}`] : []),
   ];
   // Reminder choice offered from the 2nd touch on; save-for-later on the 3rd.
   (brainContext as any).allow_reminder_choice = touchHistory >= 1;
@@ -463,6 +489,9 @@ export async function processAbandonedCart(
     // M7/M13: live shipping arithmetic — pay page and copy share these facts.
     shipping_paise: shippingPaise,
     threshold_gap_paise: gapPaise,
+    // T1: trust-claim facts (null → tokens strip per I-2).
+    returns_policy: retSummary ? { summary: retSummary, days: null } : null,
+    shipping_eta_days: shippingEta,
   };
   const finalized = brain.mode === "llm"
     ? await finalizeCopy({
@@ -536,9 +565,11 @@ export async function processAbandonedCart(
       message_strategy: messageStrategy,
       strategy_explored: strategyExplored,
       // M21: brain-decision surfaces on the feed's expanded row.
+      // F1: fallback cause travels here too (null on the green path).
       secondary_cta: secondaryCta,
       incentive_token: incentiveToken,
       case_type: "recovery",
+      fallback_reason: (brain as any).fallback_reason || null,
     },
   });
 
@@ -659,9 +690,13 @@ export async function processAbandonedCart(
       message_strategy: messageStrategy,
       strategy_explored: strategyExplored,
       // M21 + M33: decision surfaces + prompt provenance on the ledger row.
+      // F1: fallback cause in the rationale (null on the green path).
       secondary_cta: secondaryCta,
       incentive_token: incentiveToken,
       case_type: "recovery",
+      fallback_reason: (brain as any).fallback_reason || null,
+      // T4: covariate in the rationale (no learning weight yet).
+      abandonment_cycles: abandonmentCycles,
       prompt_version: "v5.0",
       model: getConfig().LLM_MODEL || "rules",
     },

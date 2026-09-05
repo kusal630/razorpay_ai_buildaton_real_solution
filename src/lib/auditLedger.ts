@@ -1,5 +1,5 @@
 import { query } from "../db.js";
-import crypto from "node:crypto";
+import { computeHash } from "./ledger.js";
 
 interface AuditRow {
   seq: number;
@@ -18,14 +18,11 @@ interface AuditRow {
 
 type HashableAuditRow = Omit<AuditRow, "hash" | "seq">;
 
-function canonicalJson(row: HashableAuditRow): string {
-  return JSON.stringify(row, Object.keys(row).sort());
-}
-
-function computeHash(prevHash: string, row: HashableAuditRow): string {
-  const canonical = canonicalJson(row);
-  return crypto.createHash("sha256").update(prevHash + canonical).digest("hex");
-}
+// Single canonicalization lives in ledger.js (recursive key sort,
+// undefined/function/symbol dropped to match JSONB storage). This module
+// delegates so every writer hashes identically and one verifyChain holds.
+// NOTE: rows written by the pre-unification canonical CANNOT verify — none
+// exist on any live chain (reset re-genesis covers this).
 
 export async function appendAudit(params: {
   actor: string;

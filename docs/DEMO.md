@@ -36,3 +36,9 @@ Ledger tab → Verify Chain (PASS + head hash). Feed → verified purchase badge
 → resolves to a ledger sequence. Settings → set ₹79 shipping → pay page
 all-in total updates. Close: "an AI that can propose, but cannot spend — and
 can prove every rupee it moved."
+
+## Optional: industry moment (30s)
+
+Industry tab → "show the industry comparison — your recovery vs industry,
+and your incremental lift is the number that matters." Point at the survey
+label (source + date): benchmarks are priors, the holdout is the truth.

@@ -31,14 +31,28 @@ async function doctor() {
     results.razorpay = { status: "red", detail };
   }
 
-  // LLM
+  // LLM: endpoint reachable AND the pinned model listed (F2 — the pin is
+  // verified, never rewritten).
   try {
     const url = process.env.LLM_BASE_URL;
+    const pinned = process.env.LLM_MODEL || "bonsai-8b";
     if (!url) { results.llm = { status: "yellow", detail: "RULES mode (no LLM)" }; }
     else {
-      const resp = await fetch(`${url}/models`, { headers: { Authorization: `Bearer ${process.env.LLM_API_KEY}` }, signal: AbortSignal.timeout(3000) }).catch(() => null);
+      const resp = await fetch(`${url}/models`, { headers: { Authorization: `Bearer ${process.env.LLM_API_KEY}` }, signal: AbortSignal.timeout(5000) }).catch(() => null);
       if (!resp) { results.llm = { status: "yellow", detail: "RULES mode (LLM unreachable)" }; }
-      else { results.llm = { status: resp.ok ? "green" : "yellow", detail: resp.ok ? "LLM OK" : `RULES mode (HTTP ${resp.status})` }; }
+      else if (!resp.ok) { results.llm = { status: "yellow", detail: `RULES mode (HTTP ${resp.status})` }; }
+      else {
+        const data = await resp.json().catch(() => ({})) as any;
+        const models: string[] = Array.isArray(data?.data)
+          ? data.data.map((m: any) => String(m.id))
+          : Array.isArray(data?.models)
+            ? data.models.map((m: any) => String(m.model || m.name || m.id))
+            : [];
+        console.log(`  provider models: [${models.join(", ")}]`);
+        results.llm = models.includes(pinned)
+          ? { status: "green", detail: `LLM OK (pinned model '${pinned}' available)` }
+          : { status: "red", detail: `model '${pinned}' not available — provider offers: [${models.join(", ")}]` };
+      }
     }
   } catch (err: any) {
     results.llm = { status: "yellow", detail: "RULES mode (LLM unreachable)" };

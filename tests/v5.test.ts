@@ -3,7 +3,7 @@
  * without a DB; DB-backed gates (trigger append-only, mandate jti, reviews
  * badge) run against the live DB when reachable, else skip gracefully.
  */
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
   deriveKey, hmacWith, hmacLegacy, identityTokenV2, identityTokenLegacy,
   matchIdentityHash, signMandate, verifyMandate, opaqueExtRef, holdoutBucket,
@@ -47,6 +47,162 @@ import {
   recordConsentEvidence, revokeConsent, eraseCustomer, hashField,
   CONSENT_TEXT_VERSION,
 } from "../src/lib/v5privacy.js";
+
+// ── v5.6 F1 U-LOUD: every fallback cause emits its named event ──
+describe("U-LOUD loud fallbacks", () => {
+  const baseCtx: any = {
+    agent: "recovery",
+    customer: { pseudonym: "cust_x", segment: "cart_only", touch_history: 1, consent_state: "t", experiment_arm: "a" },
+    cart: [{ id: "c1", name: "Buds", price_paise: 500000 }],
+    feasible_options: [{ action: "send_plain_link", bucket_paise: 0, ev_paise: 10, theta: 0.1 }],
+    policy_numbers: { max_incentive_paise: 15000, margin_paise: 200000, max_discount_pct: 15 },
+    theta_estimates: {}, known_ids: ["c1", "cust_x"],
+    merchant_id: "m1",
+  };
+  let events: any[] = [];
+
+  beforeEach(async () => {
+    events = [];
+    // callBrain needs config; dummy values suffice (fetch is stubbed).
+    process.env.DATABASE_URL = process.env.DATABASE_URL || "postgres://test:test@localhost:5432/test";
+    process.env.REDIS_URL = process.env.REDIS_URL || "redis://localhost:6379";
+    process.env.RAZORPAY_KEY_ID = process.env.RAZORPAY_KEY_ID || "rzp_test_x";
+    process.env.RAZORPAY_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET || "x";
+    process.env.RAZORPAY_WEBHOOK_SECRET = process.env.RAZORPAY_WEBHOOK_SECRET || "x";
+    process.env.APP_ENCRYPTION_KEY = process.env.APP_ENCRYPTION_KEY || Buffer.alloc(32).toString("base64");
+    process.env.SESSION_SECRET = process.env.SESSION_SECRET || "test-session-secret";
+    process.env.LLM_BASE_URL = process.env.LLM_BASE_URL || "http://127.0.0.1:1234/v1";
+    process.env.LLM_API_KEY = "not-needed";
+    process.env.LLM_MODEL = "bonsai-8b";
+    const cfg = await import("../src/config.js");
+    cfg.loadConfig();
+    const sb = await import("../src/lib/sharedBrain.js");
+    sb.setFallbackSink(async (e: any) => { events.push(e); });
+    sb.resetBreaker("test");
+    sb.clearModelCheckCache();
+    vi.unstubAllGlobals();
+  });
+  afterEach(async () => {
+    const sb = await import("../src/lib/sharedBrain.js");
+    sb.setFallbackSink(null);
+    sb.resetBreaker("test");
+    sb.clearModelCheckCache();
+    vi.unstubAllGlobals();
+    try { sb.setKillSwitch(false); } catch {}
+  });
+
+  it("kill_switch_active fires when the switch is on", async () => {
+    const sb = await import("../src/lib/sharedBrain.js");
+    sb.setKillSwitch(true);
+    const r = await sb.callBrain("recovery", baseCtx);
+    expect(r.mode).toBe("rules");
+    expect(r.fallback_reason).toBe("kill_switch_active");
+    expect(events.map((e) => e.data.reason)).toContain("kill_switch_active");
+  });
+
+  it("llm_model_unavailable names the model + provider list (no POST attempted)", async () => {
+    let posts = 0;
+    vi.stubGlobal("fetch", async (url: any) => {
+      if (String(url).includes("/models")) {
+        return { ok: true, json: async () => ({ data: [{ id: "other-model" }] }) };
+      }
+      posts++;
+      return { ok: true, json: async () => ({}) };
+    });
+    const sb = await import("../src/lib/sharedBrain.js");
+    const r = await sb.callBrain("recovery", baseCtx);
+    expect(r.mode).toBe("rules");
+    expect(r.fallback_reason).toBe("llm_model_unavailable");
+    expect(posts).toBe(0);
+    expect(events[0].data.available_models).toEqual(["other-model"]);
+  });
+
+  it("llm_transport_error trips only on transport; validation never trips (M32)", async () => {
+    vi.stubGlobal("fetch", async (url: any) => {
+      if (String(url).includes("/models")) {
+        return { ok: true, json: async () => ({ data: [{ id: "bonsai-8b" }] }) };
+      }
+      throw Object.assign(new Error("timeout"), { name: "TimeoutError" });
+    });
+    const sb = await import("../src/lib/sharedBrain.js");
+    for (let i = 0; i < 3; i++) {
+      const r = await sb.callBrain("recovery", baseCtx);
+      expect(r.fallback_reason).toBe("llm_transport_error");
+    }
+    const r4 = await sb.callBrain("recovery", baseCtx);
+    expect(r4.fallback_reason).toBe("circuit_breaker_open");
+    expect(r4.fallback_data).toHaveProperty("opens_last_hour");
+    sb.resetBreaker("test");
+    // validation rejections: 3x double-fail → still closed
+    vi.stubGlobal("fetch", async (url: any) => {
+      if (String(url).includes("/models")) {
+        return { ok: true, json: async () => ({ data: [{ id: "bonsai-8b" }] }) };
+      }
+      return { ok: true, json: async () => ({ choices: [{ message: { content: "not json at all" } }] }) };
+    });
+    for (let i = 0; i < 3; i++) {
+      const r = await sb.callBrain("recovery", baseCtx);
+      expect(r.fallback_reason).toBe("validation_failed");
+    }
+    expect(sb.isCircuitOpen()).toBe(false);
+  });
+
+  it("green path returns mode llm with parsed output", async () => {
+    const good = JSON.stringify({
+      strategy: "send_plain_link", incentive_bucket_paise: 0, message_tone: "neutral",
+      message_copy: "Hi! You left something in your cart. Complete your purchase here.",
+      rationale: { reasoning: "r", evidence_ids: ["c1"] },
+    });
+    vi.stubGlobal("fetch", async (url: any) => {
+      if (String(url).includes("/models")) {
+        return { ok: true, json: async () => ({ data: [{ id: "bonsai-8b" }] }) };
+      }
+      return { ok: true, json: async () => ({ choices: [{ message: { content: good } }], usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 } }) };
+    });
+    const sb = await import("../src/lib/sharedBrain.js");
+    const r = await sb.callBrain("recovery", baseCtx);
+    expect(r.mode).toBe("llm");
+    expect(r.fallback_reason).toBe(undefined);
+    expect(events.length).toBe(0);
+  });
+
+  it("llm_no_api_key emits its named event (direct contract)", async () => {
+    const sb = await import("../src/lib/sharedBrain.js");
+    await sb.emitFallbackEvent("recovery", "llm_no_api_key", { missing: ["LLM_API_KEY"] }, "m1");
+    expect(events.map((e) => e.data.reason)).toContain("llm_no_api_key");
+  });
+});
+
+// ── v5.6 F2 U-MODELDOC: doctor proves the pin against the provider list ──
+describe("U-MODELDOC doctor model pin", () => {
+  it("bogus model name → RED with the available list (fixture only, .env untouched)", async () => {
+    const { spawnSync } = await import("node:child_process");
+    const r = spawnSync("npx", ["tsx", "doctor.ts"], {
+      env: { ...process.env, LLM_MODEL: "bogus-model-xyz" },
+      encoding: "utf8",
+      timeout: 90000,
+    });
+    const out = (r.stdout || "") + (r.stderr || "");
+    expect(r.status).not.toBe(0);
+    expect(out).toMatch(/not available/);
+    expect(out).toMatch(/provider offers:/);
+  }, 120000);
+
+  it("checkModelAvailable verifies the pin without rewriting it", async () => {
+    vi.stubGlobal("fetch", async () => ({
+      ok: true,
+      json: async () => ({ data: [{ id: "bonsai-8b" }, { id: "other" }] }),
+    }));
+    const sb = await import("../src/lib/sharedBrain.js");
+    sb.clearModelCheckCache();
+    const good = await sb.checkModelAvailable("bonsai-8b");
+    expect(good.available).toBe(true);
+    expect(good.models).toContain("bonsai-8b");
+    const bad = await sb.checkModelAvailable("bogus-model-xyz");
+    expect(bad.available).toBe(false);
+    vi.unstubAllGlobals();
+  });
+});
 
 // ── M7/M14 resolver: all_in_total + offer grounding ──
 describe("U-ALLIN + U-OFFERS resolver", () => {
@@ -525,5 +681,256 @@ describe("U-CONSENT-EV2 + U-ERASE", () => {
     // (4) consent rows retained: SELECTed, never DELETEd
     expect(log.some((s) => s.startsWith("SELECT id FROM consent_events"))).toBe(true);
     expect(log.some((s) => s.startsWith("DELETE"))).toBe(false);
+  });
+});
+
+// ── v5.6 F3: smoke fixture covers the gwp arm; token resolves to COGS ──
+describe("U-BRAINTEST fixture", () => {
+  it("gwp token resolves into the menu (5900) and validates", async () => {
+    const { buildSmokeFixture } = await import("../src/lib/brainFixture.js");
+    const { validateBrainOutput } = await import("../src/lib/sharedBrain.js");
+    const fx: any = buildSmokeFixture();
+    expect(fx.feasible_options.map((o: any) => o.bucket_paise)).toContain(5900);
+    const out = JSON.stringify({
+      strategy: "send_link_with_incentive",
+      incentive_token: { type: "gwp", ref: "" },
+      message_strategy: "loss_framed",
+      message_tone: "warm",
+      message_copy: "Reserved earbuds release tonight via {{expiry:smoke-cart-1}}. No rush either way.",
+      secondary_cta: "none",
+      rationale: { reasoning: "r", evidence_ids: ["smoke-cart-1"] },
+    });
+    const v = validateBrainOutput(out, fx, "recovery");
+    expect(v.valid).toBe(true);
+    expect(v.output.incentive_bucket_paise).toBe(5900);
+  });
+});
+
+// ── v5.6 F4: reset clears intents + touches; dedupe key still unique ──
+describe("U-FRESHINJECT reset + dedupe", () => {
+  it("reset:sample truncates action_intents and touches", async () => {
+    const fs = await import("node:fs");
+    const src = fs.readFileSync("scripts/reset.ts", "utf8");
+    for (const t of ["action_intents", "touches", "carts", "payment_links", "audit_log"]) {
+      expect(src).toContain(`"${t}"`);
+    }
+  });
+  it("dedupe holds: same cart id twice → identical key (second is a duplicate)", async () => {
+    const { generateDedupeKey } = await import("../src/lib/intentExecutor.js");
+    const base: any = { merchantId: "m", customerId: "c", actionType: "recovery", targetId: "cart9" };
+    expect(generateDedupeKey(base, "2026-09-04")).toBe(generateDedupeKey(base, "2026-09-04"));
+    expect(generateDedupeKey(base, "2026-09-04")).not.toBe(
+      generateDedupeKey({ ...base, targetId: "cart10" }, "2026-09-04"));
+  });
+});
+
+// ── v5.6 F5 U-BREAKERVIS: state visible, reset closes, validation never trips ──
+describe("U-BREAKERVIS", () => {
+  it("3 transport failures → open with trip reason; reset → closed", async () => {
+    const sb = await import("../src/lib/sharedBrain.js");
+    sb.resetBreaker("test");
+    expect(sb.isCircuitOpen()).toBe(false);
+    expect(sb.getCircuitStatus().state).toBe("closed");
+    const ctx: any = {
+      agent: "recovery",
+      customer: { pseudonym: "c", segment: "s", touch_history: 0, consent_state: "t", experiment_arm: "a" },
+      cart: [], feasible_options: [], policy_numbers: { max_incentive_paise: 0, margin_paise: 0, max_discount_pct: 15 },
+      theta_estimates: {}, known_ids: [], merchant_id: "m1",
+    };
+    const realFetch = globalThis.fetch;
+    (globalThis as any).fetch = async (url: any) => {
+      if (String(url).includes("/models")) return { ok: true, json: async () => ({ data: [{ id: "bonsai-8b" }] }) };
+      throw Object.assign(new Error("boom"), { name: "TimeoutError" });
+    };
+    try {
+      const { loadConfig } = await import("../src/config.js");
+      try { loadConfig(); } catch {}
+      for (let i = 0; i < 3; i++) await sb.callBrain("recovery", ctx);
+      expect(sb.isCircuitOpen()).toBe(true);
+      expect(sb.getCircuitStatus().state).toBe("open");
+      expect(sb.getLastTrip().reason).toMatch(/boom|timeout/i);
+      sb.resetBreaker("dashboard-test");
+      expect(sb.isCircuitOpen()).toBe(false);
+      expect(sb.getCircuitStatus().state).toBe("closed");
+    } finally {
+      (globalThis as any).fetch = realFetch;
+      sb.resetBreaker("test");
+      sb.clearModelCheckCache();
+    }
+  });
+});
+
+// ── v5.6 T1 U-RETURNS + U-DELIVERY: trust tokens grounded or stripped ──
+describe("U-RETURNS + U-DELIVERY", () => {
+  it("configured returns renders; unconfigured strips + falls back", async () => {
+    const { groundCopy } = await import("../src/lib/claims.js");
+    const ok = await groundCopy("Easy shopping with {{returns_policy:merchant}} on every order today.", {
+      returns_policy: { summary: "7-day easy returns", days: 7 },
+    }, "llm");
+    expect(ok.fallback).toBe(false);
+    expect(ok.copy).toContain("7-day easy returns");
+    const missing = await groundCopy("Easy shopping with {{returns_policy:merchant}} on every order today.", {}, "llm");
+    expect(missing.stripped.length).toBe(1);
+    expect(missing.copy).not.toContain("{{");
+  });
+  it("eta_days=3 renders estimate; null suppresses", async () => {
+    const { groundCopy } = await import("../src/lib/claims.js");
+    const ok = await groundCopy("Order now, {{delivery_estimate:cart1}} for your complete setup at home.", { shipping_eta_days: 3 }, "llm");
+    expect(ok.copy).toContain("delivery in ~3 days");
+    const none = await groundCopy("Order now, {{delivery_estimate:cart1}} for your complete setup at home.", { shipping_eta_days: null }, "llm");
+    expect(none.stripped.length).toBe(1);
+  });
+  it("trust tokens coexist with one persuasion token (transparency set)", async () => {
+    const { distinctPersuasionTokens } = await import("../src/lib/v5brain.js");
+    expect(distinctPersuasionTokens("Total {{all_in_total:c}} plus {{expiry:h}} tonight")).toEqual(["expiry"]);
+    expect(distinctPersuasionTokens("Grab {{offer:HDFC}} with {{returns_policy:merchant}} included free")).toEqual(["offer"]);
+    expect(distinctPersuasionTokens("A {{expiry:h}} and {{stock:p}} left")).toHaveLength(2);
+  });
+});
+
+// ── v5.6 T2 U-GSM7: post-resolution length + channel composition ──
+describe("U-GSM7", () => {
+  it("(a) resolved copy exceeding the cap is rejected post-resolution", async () => {
+    const { finalizeCopy } = await import("../src/lib/claims.js");
+    const long = "Your all-in total is {{all_in_total:cart1}} for this order.";
+    const r = await finalizeCopy({
+      copy: long, facts: { cart_total_paise: 500000 }, source: "llm",
+      fallbackTemplate: "Complete your purchase here.", maxLength: 20,
+    });
+    expect(r.copy).toBe("Complete your purchase here.");
+  });
+  it("(b) SMS renders Rs 100; (c) web renders ₹100", async () => {
+    const { finalizeCopy, toSmsSafe } = await import("../src/lib/claims.js");
+    expect(toSmsSafe("You saved ₹100 today")).toBe("You saved Rs 100 today");
+    const sms = await finalizeCopy({
+      copy: "Paid! You saved {{saved_amount:order9}} on this order today.",
+      facts: { order_incentive_paise: 10000, order_paid: true },
+      source: "llm", fallbackTemplate: "Payment confirmed.", channel: "sms",
+    });
+    expect(sms.copy).toContain("Rs 100");
+    expect(sms.copy).not.toContain("₹");
+    const web = await finalizeCopy({
+      copy: "Paid! You saved {{saved_amount:order9}} on this order today.",
+      facts: { order_incentive_paise: 10000, order_paid: true },
+      source: "llm", fallbackTemplate: "Payment confirmed.", channel: "web",
+    });
+    expect(web.copy).toContain("₹100");
+  });
+});
+
+// ── v5.6 T3 U-COLLAPSE: detector fires, re-arms, ignores quiet hours ──
+describe("U-COLLAPSE", () => {
+  it("20 starts / 0 converts above baseline → suspend; paid next window → re-arm", async () => {
+    const v5f = await import("../src/lib/v5funnel.js");
+    const fire = v5f.detectCollapse({ starts2h: 24, converts2h: 0, baselineBuckets: Array(12).fill(20) });
+    expect(fire.fired).toBe(true);
+    const calm = v5f.detectCollapse({ starts2h: 24, converts2h: 3, baselineBuckets: Array(12).fill(20) });
+    expect(calm.fired).toBe(false);
+    const quiet = v5f.detectCollapse({ starts2h: 21, converts2h: 0, baselineBuckets: Array(12).fill(60) });
+    expect(quiet.fired).toBe(false); // 21 < 50% of 60 → quiet hours, no fire
+    expect(v5f.baselineMedian([60, 60, 60, 60])).toBe(60);
+  });
+  it("suspend/resume write flag + ledger (advisory suspension, policy untouched)", async () => {
+    const v5f = await import("../src/lib/v5funnel.js");
+    const log: string[] = [];
+    let flag: any = null;
+    const q = async (sql: string, params?: any[]) => {
+      log.push(sql.split("\n").join(" ").slice(0, 80));
+      if (sql.startsWith("SELECT value_jsonb")) return { rows: flag ? [{ value_jsonb: flag }] : [] };
+      if (sql.startsWith("INSERT INTO merchant_config")) { flag = JSON.parse(params[1]); return { rows: [] }; }
+      return { rows: [] };
+    };
+    expect(await v5f.isRecoverySuspended(q, "m")).toBe(false);
+    let appended: any = null;
+    const deps = { q, ledgerAppend: async (e: any) => { appended = e; return { seq: 7 }; }, activityAppend: async () => {} };
+    await v5f.suspendRecovery(deps, "m", "fixture");
+    expect(await v5f.isRecoverySuspended(q, "m")).toBe(true);
+    expect(appended.action).toBe("recovery_suspended");
+    expect(appended.rationale.reason).toBe("funnel_anomaly_suspended");
+    await v5f.resumeRecovery(deps, "m", "manual");
+    expect(await v5f.isRecoverySuspended(q, "m")).toBe(false);
+    expect(log.join(" ")).not.toMatch(/UPDATE policy_rules|UPDATE.*policy/i);
+  });
+});
+
+// ── v5.6 T4 U-CYCLE: lapse increments; payment/save do not ──
+describe("U-CYCLE", () => {
+  it("context + rationale carry cycles; no θ math attached", async () => {
+    const sb = await import("../src/lib/sharedBrain.js");
+    const ctx: any = sb.buildRecoveryContext({
+      customerId: "c1", segment: "s", touchHistory: 0, consentState: "t",
+      experimentArm: "a", cartId: "cart1", cartItems: [],
+      feasibleOptions: [], maxIncentivePaise: 0, marginPaise: 0,
+      thetaEstimates: {}, abandonmentCycles: 2,
+    });
+    expect(ctx.customer.abandonment_cycles).toBe(2);
+    // default is 0 and the field is informational only (no theta input exists)
+    const ctx0: any = sb.buildRecoveryContext({
+      customerId: "c1", segment: "s", touchHistory: 0, consentState: "t",
+      experimentArm: "a", cartId: "cart1", cartItems: [],
+      feasibleOptions: [], maxIncentivePaise: 0, marginPaise: 0, thetaEstimates: {},
+    });
+    expect(ctx0.customer.abandonment_cycles).toBe(0);
+  });
+  it("sweeper is the sole writer (resolvePayment + price-watch paths untouched)", async () => {
+    const fs = await import("node:fs");
+    const moneyBus = fs.readFileSync("src/lib/moneyBus.ts", "utf8");
+    expect(moneyBus).toMatch(/abandonment_cycles = abandonment_cycles \+ 1/);
+    // resolvePayment must not touch the counter (payment → no increment)
+    const start = moneyBus.indexOf("export async function resolvePayment");
+    const end = moneyBus.indexOf("export async function sweepExpiredLinks");
+    const resolveBody = moneyBus.slice(start, end > start ? end : undefined);
+    expect(resolveBody).not.toMatch(/abandonment_cycles/);
+    // save-for-later path must not touch it either
+    const v5dispatch = fs.readFileSync("src/jobs/v5dispatch.ts", "utf8");
+    expect(v5dispatch).not.toMatch(/abandonment_cycles/);
+  });
+});
+
+// ── v5.6 ledger canonical: undefined/function/symbol mirror JSONB storage ──
+describe("U-LEDG-CANON", () => {
+  it("hash ignores undefined/function/symbol exactly like storage does", async () => {
+    const { computeHash } = await import("../src/lib/ledger.js");
+    const withUndef: any = { a: 1, u: undefined, f: () => 1, nested: { x: 2, u2: undefined } };
+    const dropped: any = { a: 1, nested: { x: 2 } };
+    expect(computeHash("prev", withUndef)).toBe(computeHash("prev", dropped));
+    expect(computeHash("prev", { arr: [1, undefined, 3] })).toBe(computeHash("prev", { arr: [1, null, 3] }));
+    expect(computeHash("prev", { a: 1 })).not.toBe(computeHash("prev", { a: 2 }));
+  });
+});
+
+// ── v5.6 Part C: U-BENCH + U-TARGET + U-CARTVAL (pure intelligence math) ──
+describe("U-BENCH + U-TARGET + U-CARTVAL", () => {
+  it("U-TARGET: outperform → reduce advisory; trail → raise advisory; policy untouched", async () => {
+    const intel = await import("../src/lib/v5intel.js");
+    const over = intel.suggestTarget({ targetPct: 10, measuredPct: 16, attempts: 400, daysObserved: 31 });
+    expect(over.suggestion).toBe("reduce_caps");
+    const under = intel.suggestTarget({ targetPct: 10, measuredPct: 7, attempts: 120, daysObserved: 20 });
+    expect(under.suggestion).toBe("raise_caps");
+    const collecting = intel.suggestTarget({ targetPct: 10, measuredPct: null, attempts: 5, daysObserved: 2 });
+    expect(collecting.suggestion).toBe(null);
+    const band = intel.suggestTarget({ targetPct: 10, measuredPct: 11, attempts: 200, daysObserved: 40 });
+    expect(band.suggestion).toBe(null);
+    // advisory-only is structural: suggestTarget takes no policy object
+    expect(Object.keys(intel)).not.toContain("applySuggestion");
+    const prog = intel.recoveryProgress(14, 200, 10);
+    expect(prog.state).toBe("ready");
+    expect(prog.lo).toBeLessThan(prog.ratePct!);
+    expect(intel.recoveryProgress(1, 5, 10).state).toBe("collecting");
+  });
+  it("U-CARTVAL: abandoned $158 vs completed $117 → alert; equal → silent", async () => {
+    const intel = await import("../src/lib/v5intel.js");
+    const fire = intel.cartValueAlert({ avgAbandoned: 15800, avgCompleted: 11700 });
+    expect(fire.fires).toBe(true);
+    expect(fire.message).toMatch(/recorded, pre-settlement/);
+    expect(intel.cartValueAlert({ avgAbandoned: 11700, avgCompleted: 11700 }).fires).toBe(false);
+    expect(intel.cartValueAlert({ avgAbandoned: null, avgCompleted: 11700 }).fires).toBe(false);
+  });
+  it("U-BENCH: honest labels name survey + source + date", async () => {
+    const intel = await import("../src/lib/v5intel.js");
+    const label = intel.industryLabel("Electronics", "Metorik 2026 (survey)", "2026-01-15");
+    expect(label).toMatch(/Industry survey research reports/);
+    expect(label).toMatch(/Metorik 2026 \(survey\)/);
+    expect(label).toMatch(/2026-01-15/);
   });
 });

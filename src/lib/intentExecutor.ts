@@ -38,7 +38,7 @@ function getBusinessDayIST(windowDay?: string): string {
  * W2: Generate dedupe key with identity token and target_id.
  * Format: {merchant}:{identity_token}:{target_id}:{action_type}:{business_day_IST}
  */
-function generateDedupeKey(params: IntentParams, businessDay: string): string {
+export function generateDedupeKey(params: IntentParams, businessDay: string): string {
   return [
     params.merchantId,
     params.identityToken || params.customerId || "anon",
@@ -195,12 +195,28 @@ export async function expireIntent(intentId: string): Promise<void> {
 export async function runJanitor(): Promise<number> {
   let resolved = 0;
 
-  // 1. Dispatch deferred intents with resume_at due
-  const { rows: deferred } = await query(
-    `UPDATE action_intents SET status = 'pending'
-     WHERE status = 'deferred' AND resume_at <= NOW()
-     RETURNING id`
-  );
+  // 1. Dispatch deferred intents with resume_at due. T3: suspended
+  // merchants' intents stay deferred (held with reason, not cancelled).
+  let deferred: any[];
+  try {
+    ({ rows: deferred } = await query(
+      `UPDATE action_intents SET status = 'pending'
+       WHERE status = 'deferred' AND resume_at <= NOW()
+       AND merchant_id NOT IN (
+         SELECT merchant_id FROM merchant_config
+         WHERE key = 'recovery_suspended'
+         AND (value_jsonb->>'suspended')::boolean IS TRUE
+       )
+       RETURNING id`
+    ));
+  } catch {
+    // Pre-T3 schema without merchant_config: resume as before.
+    ({ rows: deferred } = await query(
+      `UPDATE action_intents SET status = 'pending'
+       WHERE status = 'deferred' AND resume_at <= NOW()
+       RETURNING id`
+    ));
+  }
   resolved += deferred.length;
 
   // 2. Reset stale awaiting_gateway intents (>90s, lease presumably lost)

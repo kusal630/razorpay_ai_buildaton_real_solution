@@ -24,6 +24,7 @@
     "doctor": "npx tsx --env-file=.env doctor.ts",
     "verify": "npx tsx --env-file=.env verify.ts",
     "demo:buyer": "npx tsx --env-file=.env scripts/demo-buyer.ts",
+    "brain-test": "npx tsx --env-file=.env scripts/brain-test.ts",
     "backtest": "npx tsx --env-file=.env scripts/backtest.ts"
   },
   "dependencies": {

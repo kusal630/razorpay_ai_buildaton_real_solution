@@ -13,7 +13,7 @@ export interface PersuasionContext {
   emi: { available: boolean; months: number[] };
   hold: { has_reservation: boolean; expires_hours: number | null };
   all_in_total: { available: boolean };
-  customer_signals: { engagement_hour: number | null; prior_saves: boolean; chosen_reminder: boolean };
+  customer_signals: { engagement_hour: number | null; prior_saves: boolean; chosen_reminder: boolean; abandonment_cycles: number };
 }
 
 export function emptyPersuasionContext(): PersuasionContext {
@@ -25,7 +25,7 @@ export function emptyPersuasionContext(): PersuasionContext {
     emi: { available: false, months: [] },
     hold: { has_reservation: false, expires_hours: null },
     all_in_total: { available: false },
-    customer_signals: { engagement_hour: null, prior_saves: false, chosen_reminder: false },
+    customer_signals: { engagement_hour: null, prior_saves: false, chosen_reminder: false, abandonment_cycles: 0 },
   };
 }
 
@@ -55,7 +55,12 @@ export function defaultBrainExtension(caseType: CaseType): BrainExtension {
 
 /** {{token:ref}} inline emission form (M19/M20-V1). */
 export const INLINE_TOKEN_RE = /\{\{([a-z_]+):([^}]*)\}\}/g;
-export const PERSUASION_TOKENS = new Set(["expiry", "stock", "social_proof", "saved_amount", "offer", "threshold_gap", "all_in_total", "price"]);
+export const PERSUASION_TOKENS = new Set(["expiry", "stock", "social_proof", "saved_amount", "offer", "price"]);
+/**
+ * T1 transparency set: TRUST claims (price transparency + policy facts),
+ * never persuasion. They may coexist with ONE persuasion claim (I-3).
+ */
+export const TRUST_TOKENS = new Set(["all_in_total", "threshold_gap", "returns_policy", "delivery_estimate"]);
 
 /** V1: every inline token must be in available claims. Returns unknown tokens. */
 export function unknownTokens(copy: string, available: string[]): string[] {
@@ -69,17 +74,16 @@ export function unknownTokens(copy: string, available: string[]): string[] {
   return out;
 }
 
-/** V2: >1 distinct persuasion token → claim_stacking (all_in_total+threshold_gap exempt). */
+/** V2: distinct PERSUASION tokens only — trust tokens (I-3 transparency set)
+ * never count toward the one-claim limit. >1 distinct persuasion → stacking. */
 export function distinctPersuasionTokens(copy: string): string[] {
   const set = new Set<string>();
   INLINE_TOKEN_RE.lastIndex = 0;
   let m: RegExpExecArray | null;
   while ((m = INLINE_TOKEN_RE.exec(copy)) !== null) {
-    if (PERSUASION_TOKENS.has(m[1])) set.add(m[1]);
+    if (PERSUASION_TOKENS.has(m[1]) && !TRUST_TOKENS.has(m[1])) set.add(m[1]);
   }
-  const arr = [...set];
-  if (arr.length === 2 && arr.includes("all_in_total") && arr.includes("threshold_gap")) return [];
-  return arr;
+  return [...set];
 }
 
 /** V4: humor scope — playful banned for failure_retry/ndr. */

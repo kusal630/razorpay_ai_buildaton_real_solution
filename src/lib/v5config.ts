@@ -7,8 +7,11 @@ export interface BankOffer { bank: string; description: string; discount_paise: 
 export interface PaymentMethodsConfig { emi_enabled: boolean; emi_tenure_months: number[]; offers: BankOffer[] }
 export interface CodConfig { enabled: boolean; token_confirm_paise: number; delivery_trigger: "manual" }
 export interface ReviewRequestConfig { enabled: boolean; delay_days: number }
+export interface ReturnsPolicyConfig { summary: string; days: number | null }
+export interface RecoveryTargetConfig { rate_pct: number; basis: "incremental" }
+export interface IndustryConfig { industry: string }
 
-export const CONFIG_KEYS = ["shipping", "payment_methods", "cod", "review_request"] as const;
+export const CONFIG_KEYS = ["shipping", "payment_methods", "cod", "review_request", "returns_policy", "recovery_target", "industry"] as const;
 export type ConfigKey = (typeof CONFIG_KEYS)[number];
 export function isConfigKey(k: string): k is ConfigKey {
   return (CONFIG_KEYS as readonly string[]).includes(k);

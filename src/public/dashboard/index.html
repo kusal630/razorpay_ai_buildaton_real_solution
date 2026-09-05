@@ -74,6 +74,7 @@
   </div>
 
   <div id="app" class="hidden">
+    <div id="funnel-banner" style="display:none"></div>
     <div class="tabs">
       <div class="tab active" data-tab="overview">Overview</div>
       <div class="tab" data-tab="feed">Live Agent Console</div>
@@ -81,6 +82,7 @@
       <div class="tab" data-tab="approvals">Approvals</div>
       <div class="tab" data-tab="qa">Buyers & QA</div>
       <div class="tab" data-tab="settings">Settings</div>
+      <div class="tab" data-tab="industry">Industry</div>
     </div>
 
     <div id="tab-overview" class="panel active">
@@ -101,6 +103,12 @@
         <span id="kill-status" style="margin-left:12px"></span>
       </div>
       <div class="card">
+        <h3>Circuit Breaker</h3>
+        <span id="breaker-status" style="margin-right:12px">—</span>
+        <button class="btn" onclick="resetBreaker()">Reset breaker</button>
+        <p class="muted">Trips on transport errors only — validation rejections never trip it. Opens/hour shown; alarm at 3+.</p>
+      </div>
+      <div class="card">
         <h3>Copy Strategy — which psychology pays (min-n honest)</h3>
         <div style="margin-top:12px">
           <table id="strategy-table">
@@ -119,6 +127,11 @@
           </table>
         </div>
         <p class="muted">The learner pre-filters proposals; it never edits policy. <button class="btn" onclick="resetPatterns()">Reset patterns</button></p>
+      </div>
+      <div class="card">
+        <h3>Abandonment Cycles — recorded covariate</h3>
+        <div id="cycles-dist" style="margin-top:8px">—</div>
+        <p class="muted">Increments when a cart lapses unresolved to expiry. Enters learning at posture graduation.</p>
       </div>
     </div>
 
@@ -158,6 +171,8 @@
         <button class="btn" onclick="qaInjectFailure()">Inject Payment Failure</button>
         <button class="btn" onclick="qaPolicyDrill()">Policy Drill (20%→15%)</button>
         <button class="btn" onclick="qaFastForward()">Fast-Forward Deferred</button>
+        <button class="btn btn-primary" onclick="qaBrainTest()">Test LLM Brain</button>
+        <div id="brain-result" style="margin-top:10px"></div>
       </div>
       <div class="card">
         <h3>Reconcile</h3>
@@ -177,9 +192,43 @@
         <p class="muted">Every change writes an admin-audit row and a ledger row. The pay page all-in total updates live.</p>
       </div>
       <div class="card">
+        <h3>Returns Policy (trust strip + copy token)</h3>
+        <label>Summary (≤80 chars) <input type="text" id="ret-summary" value="" maxlength="80" style="width:320px"></label>
+        <label>Days (empty = none) <input type="number" id="ret-days" value="" min="1"></label>
+        <button class="btn btn-primary" onclick="saveReturns()">Save returns policy</button>
+        <span id="ret-status" style="margin-left:12px"></span>
+        <p class="muted">Unconfigured → the pay-page line and the copy token are suppressed, never rendered bare.</p>
+      </div>
+      <div class="card">
         <h3>Platform Ceilings (merchant cannot exceed)</h3>
         <div id="ceilings-list"></div>
         <p class="muted">Lowering a mapped cap applies immediately; raising needs 1h cooldown + step-up.</p>
+      </div>
+      <div class="card">
+        <h3>Recovery Target (advisory — suggestions never change policy)</h3>
+        <label>Target rate % <input type="number" id="target-rate" value="10" min="0" max="100" step="0.5"></label>
+        <button class="btn btn-primary" onclick="saveTarget()">Save target</button>
+        <span id="target-status" style="margin-left:12px"></span>
+        <div id="target-progress" style="margin-top:8px">—</div>
+      </div>
+      <div class="card">
+        <h3>Industry (manual override for benchmark comparison)</h3>
+        <label>Industry <input type="text" id="industry-name" value="Electronics" maxlength="40"></label>
+        <button class="btn btn-primary" onclick="saveIndustry()">Save industry</button>
+        <span id="industry-status" style="margin-left:12px"></span>
+      </div>
+    </div>
+
+    <div id="tab-industry" class="panel">
+      <div class="card">
+        <h3>Industry Comparison</h3>
+        <div id="industry-body">Loading...</div>
+        <p class="muted" id="industry-label"></p>
+      </div>
+      <div class="card">
+        <h3>Cart Values <span class="muted">(recorded, pre-settlement)</span></h3>
+        <div id="cartval-body">Loading...</div>
+        <div id="cartval-alert" style="margin-top:8px"></div>
       </div>
     </div>
   </div>
@@ -208,7 +257,30 @@
       });
     });
 
-    async function init() { loadState(); startSSE(); loadLedger(); loadApprovals(); loadStrategies(); loadPatterns(); loadSettings(); }
+    async function init() { loadState(); startSSE(); loadLedger(); loadApprovals(); loadStrategies(); loadPatterns(); loadSettings(); loadFunnel(); loadCycles(); loadIndustry(); }
+    async function loadCycles() {
+      try {
+        const res = await fetch('/api/abandonment/distribution');
+        const d = await res.json();
+        document.getElementById('cycles-dist').textContent =
+          ((d.distribution || []).map((r: any) => `${r.cycles}×: ${r.n}`).join(' · ')) || 'No data yet.';
+      } catch {}
+    }
+    async function loadFunnel() {
+      try {
+        const res = await fetch('/api/funnel/status');
+        const d = await res.json();
+        const el = document.getElementById('funnel-banner');
+        if (d.suspended) {
+          el.style.display = 'block';
+          el.innerHTML = `<div class="card" style="border-left:4px solid #d33"><h3>checkout funnel anomaly — recovery suspended</h3><div>Proactive touches held; transactional retries unaffected. <button class="btn" onclick="resumeFunnel()">Resume manually</button></div></div>`;
+        } else { el.style.display = 'none'; el.innerHTML = ''; }
+      } catch {}
+    }
+    async function resumeFunnel() {
+      await fetch('/api/funnel/resume', { method: 'POST', headers: { 'X-CSRF-Token': csrfToken } });
+      loadFunnel();
+    }
     async function loadPatterns() {
       try {
         const res = await fetch('/api/patterns');
@@ -248,6 +320,54 @@
       const res = await fetch('/api/config/shipping', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
       document.getElementById('ship-status').textContent = res.ok ? 'Saved (audited + ledgered).' : 'Save failed.';
     }
+    async function saveReturns() {
+      const daysRaw = document.getElementById('ret-days').value;
+      const body = { value: {
+        summary: document.getElementById('ret-summary').value || '',
+        days: daysRaw === '' ? null : Number(daysRaw),
+      }};
+      const res = await fetch('/api/config/returns_policy', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      document.getElementById('ret-status').textContent = res.ok ? 'Saved (audited + ledgered).' : 'Save failed (1–80 chars).';
+    }
+    async function saveTarget() {
+      const body = { value: { rate_pct: Number(document.getElementById('target-rate').value || 10), basis: 'incremental' } };
+      const res = await fetch('/api/config/recovery_target', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      document.getElementById('target-status').textContent = res.ok ? 'Saved (audited + ledgered).' : 'Save failed.';
+      loadIndustry();
+    }
+    async function saveIndustry() {
+      const body = { value: { industry: document.getElementById('industry-name').value || 'Electronics' } };
+      const res = await fetch('/api/config/industry', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      document.getElementById('industry-status').textContent = res.ok ? 'Saved.' : 'Save failed.';
+      loadIndustry();
+    }
+    async function loadIndustry() {
+      try {
+        const res = await fetch('/api/industry');
+        const d = await res.json();
+        const b = d.benchmark || {};
+        document.getElementById('industry-body').innerHTML =
+          `<div>Your recovery: <b>${d.merchant?.progress?.state === 'ready' ? d.merchant.progress.ratePct.toFixed(1) + '%' : 'collecting'}</b> (${d.merchant?.recovered || 0}/${d.merchant?.abandoned || 0}) vs industry recovery <b>${(Number(b.recovery_rate) * 100).toFixed(0)}%</b> (${d.industry})</div>` +
+          `<div>Abandonment: industry ${(Number(b.abandonment_rate) * 100).toFixed(0)}% · Avg cart: industry $${b.avg_cart_value} / abandoned $${b.avg_abandoned_value}</div>`;
+        document.getElementById('industry-label').textContent = (d.label || '') + ' — ' + (d.note || '');
+      } catch { document.getElementById('industry-body').textContent = 'Unavailable.'; }
+      try {
+        const res = await fetch('/api/recovery/target');
+        const d = await res.json();
+        const p = d.progress || {};
+        document.getElementById('target-progress').innerHTML =
+          `Incremental recovery: <b>${p.state === 'ready' ? p.ratePct.toFixed(1) + '% (CI ' + p.lo.toFixed(1) + '–' + p.hi.toFixed(1) + ')' : 'collecting'}</b> vs target ${d.target?.rate_pct}%` +
+          (d.suggestion?.suggestion ? `<div>Advisory: ${d.suggestion.reason} (policy unchanged)</div>` : '');
+      } catch {}
+      try {
+        const res = await fetch('/api/cart-values');
+        const d = await res.json();
+        const fmt = (p) => '₹' + (Number(p) / 100).toFixed(0);
+        document.getElementById('cartval-body').textContent =
+          `Completed ${fmt(d.avg_completed_paise)} (n=${d.n_completed}) · Abandoned ${fmt(d.avg_abandoned_paise)} (n=${d.n_abandoned}) · Recovered ${fmt(d.avg_recovered_paise)}`;
+        document.getElementById('cartval-alert').textContent = d.alert || '';
+      } catch {}
+    }
     async function loadStrategies() {
       try {
         const res = await fetch('/api/strategy-stats');
@@ -267,6 +387,10 @@
       document.getElementById('orders-count').textContent = s.revenue?.orders || 0;
       document.getElementById('budget-gauge').textContent = `${(s.budget?.reserved_paise || 0) / 100} / ${(s.budget?.cap_paise || 0) / 100}`;
       document.getElementById('kill-status').innerHTML = s.kill_switch ? '<span class="badge badge-red">KILLED</span>' : '<span class="badge badge-green">ACTIVE</span>';
+      const b = s.breaker || {};
+      document.getElementById('breaker-status').innerHTML =
+        `state: <b>${b.state || 'closed'}</b> · opens/h: ${b.opens_last_hour ?? 0}` +
+        (b.last_trip_reason ? ` · last trip: ${b.last_trip_reason}` : '');
 
       // S4 (v4.2): refund-anomaly banner (alarm only)
       const bannerEl = document.getElementById('alert-banner');
@@ -357,6 +481,11 @@
       loadState();
     }
 
+    async function resetBreaker() {
+      await fetch('/api/breaker/reset', { method: 'POST', headers: { 'X-CSRF-Token': csrfToken } });
+      loadState();
+    }
+
     async function qaInjectAbandoned() {
       await fetch('/api/qa/inject-abandoned', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken }, body: JSON.stringify({}) });
       alert('Abandoned cart injected — watch the Live Agent Console');
@@ -375,6 +504,14 @@
     async function qaFastForward() {
       await fetch('/api/qa/fast-forward', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken }, body: JSON.stringify({}) });
       alert('Deferred intents fast-forwarded');
+    }
+
+    async function qaBrainTest() {      const el = document.getElementById('brain-result');
+      el.textContent = 'Calling brain...';
+      const t0 = Date.now();
+      const res = await fetch('/api/qa/brain-test', { method: 'POST', headers: { 'X-CSRF-Token': csrfToken } });
+      const d = await res.json();
+      el.innerHTML = `<div>mode: <b>${d.mode}</b> (${Date.now() - t0}ms) · model: ${d.request?.model} · validation: ${d.validation}</div><div style="margin-top:6px">${(d.message_copy || d.error || '').slice(0, 300)}</div>`;
     }
 
     async function reconcile() {

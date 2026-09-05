@@ -40,6 +40,33 @@ v5Router.get("/api/config/:key", requireAuth, async (req: Request, res: Response
 v5Router.put("/api/config/:key", requireAuth, async (req: Request, res: Response) => {
   const key = req.params.key;
   if (!isConfigKey(key)) { res.status(404).json({ error: "unknown config key" }); return; }
+  // T1: returns_policy shape guard (summary ≤80 chars, days int|null).
+  if (key === "returns_policy") {
+    const v = req.body?.value ?? {};
+    if (typeof v.summary !== "string" || v.summary.length === 0 || v.summary.length > 80) {
+      res.status(422).json({ error: "returns_policy.summary must be 1–80 chars" }); return;
+    }
+    if (v.days !== null && v.days !== undefined && !Number.isInteger(v.days)) {
+      res.status(422).json({ error: "returns_policy.days must be int or null" }); return;
+    }
+  }
+  // P2: recovery_target guard (0–100 float, incremental basis only).
+  if (key === "recovery_target") {
+    const v = req.body?.value ?? {};
+    if (!Number.isFinite(Number(v.rate_pct)) || Number(v.rate_pct) < 0 || Number(v.rate_pct) > 100) {
+      res.status(422).json({ error: "recovery_target.rate_pct must be 0–100" }); return;
+    }
+    if (v.basis !== undefined && v.basis !== "incremental") {
+      res.status(422).json({ error: "recovery_target.basis must be 'incremental'" }); return;
+    }
+  }
+  // P1: industry override (free text, recorded as asserted).
+  if (key === "industry") {
+    const v = req.body?.value ?? {};
+    if (typeof v.industry !== "string" || v.industry.length === 0 || v.industry.length > 40) {
+      res.status(422).json({ error: "industry.industry must be 1–40 chars" }); return;
+    }
+  }
   await query(
     `INSERT INTO merchant_config (merchant_id, key, value_jsonb, updated_by)
      VALUES ($1, $2, $3, $4)
@@ -288,6 +315,171 @@ v5Router.delete("/api/privacy/customer/:id", requireAuth, async (req: Request, r
   await query("INSERT INTO admin_audit (admin_id, action, params_json, ip) VALUES ($1, 'customer_erased', $2, $3)",
     [(req as any).userId || null, JSON.stringify({ customer_id: req.params.id, seq: r.seq }), req.ip || null]);
   res.json({ ok: true, audit_seq: r.seq });
+});
+
+// ── F3 brain smoke test (QA button) ──
+v5Router.post("/api/qa/brain-test", requireAuth, async (_req: Request, res: Response) => {
+  const { callBrain } = await import("../lib/sharedBrain.js");
+  const { buildSmokeFixture } = await import("../lib/brainFixture.js");
+  const { getConfig } = await import("../config.js");
+  const config = getConfig();
+  const t0 = Date.now();
+  try {
+    const brain = await callBrain("recovery", buildSmokeFixture());
+    res.json({
+      ok: true,
+      request: { url: `${config.LLM_BASE_URL}/chat/completions`, model: config.LLM_MODEL, messages: 2 },
+      mode: brain.mode,
+      latency_ms: Date.now() - t0,
+      usage: brain.usage,
+      parsed: brain.raw || null,
+      validation: brain.mode === "llm" ? "PASS" : `FALLBACK reason=${(brain as any).fallback_reason}`,
+      message_copy: brain.message_copy,
+      fallback_reason: (brain as any).fallback_reason || null,
+    });
+  } catch (err: any) {
+    res.status(500).json({ ok: false, error: String(err?.message || err) });
+  }
+});
+
+// ── T4 abandonment-cycle distribution ──
+v5Router.get("/api/abandonment/distribution", requireAuth, async (_req: Request, res: Response) => {
+  const { rows } = await query(
+    `SELECT abandonment_cycles AS cycles, COUNT(*) AS n FROM customers
+      WHERE merchant_id = $1 GROUP BY 1 ORDER BY 1 LIMIT 20`,
+    [MERCHANT_ID]
+  ).catch(() => ({ rows: [] as any[] }));
+  res.json({ distribution: rows, note: "recorded covariate — enters learning at posture graduation" });
+});
+
+// ── P1 industry benchmarks vs merchant metrics ──
+v5Router.get("/api/industry", requireAuth, async (_req: Request, res: Response) => {
+  const { industryLabel, recoveryProgress } = await import("../lib/v5intel.js");
+  const ind = await query(
+    "SELECT value_jsonb FROM merchant_config WHERE merchant_id = $1 AND key = 'industry'", [MERCHANT_ID]
+  ).catch(() => ({ rows: [] as any[] }));
+  const industry = String(ind.rows[0]?.value_jsonb?.industry || "Electronics");
+  const { rows: bench } = await query("SELECT * FROM industry_benchmarks WHERE industry = $1", [industry]);
+  const b = bench[0] || null;
+  const abandoned = await query(
+    "SELECT COUNT(*) AS n FROM carts WHERE merchant_id = $1 AND status = 'abandoned' AND abandoned_at > NOW() - INTERVAL '30 days'", [MERCHANT_ID]);
+  const recovered = await query(
+    `SELECT COUNT(DISTINCT o.id) AS n FROM orders o WHERE o.merchant_id = $1 AND o.status = 'paid'
+      AND EXISTS (SELECT 1 FROM action_intents ai WHERE ai.target_id::text = o.cart_id::text AND ai.action_type LIKE 'recovery%')`,
+    [MERCHANT_ID]);
+  const a = Number((abandoned.rows[0] as any)?.n || 0);
+  const r = Number((recovered.rows[0] as any)?.n || 0);
+  res.json({
+    industry,
+    merchant: { recovered: r, abandoned: a, progress: recoveryProgress(r, a, 10) },
+    benchmark: b,
+    label: b ? industryLabel(industry, b.source, String(b.as_of).slice(0, 10)) : null,
+    note: "Benchmarks are survey priors, never your measurements; your incremental lift is the number that matters.",
+  });
+});
+
+// ── P2 recovery-rate governance target (advisory only — never modifies policy) ──
+v5Router.get("/api/recovery/target", requireAuth, async (_req: Request, res: Response) => {
+  const { suggestTarget, recoveryProgress } = await import("../lib/v5intel.js");
+  const { appendLedger } = await import("../lib/ledger.js");
+  const cfg = await query("SELECT value_jsonb FROM merchant_config WHERE merchant_id = $1 AND key = 'recovery_target'", [MERCHANT_ID])
+    .catch(() => ({ rows: [] as any[] }));
+  const target = { rate_pct: Number(cfg.rows[0]?.value_jsonb?.rate_pct ?? 10), basis: "incremental" };
+  const abandoned = await query(
+    "SELECT COUNT(*) AS n, MIN(abandoned_at) AS first FROM carts WHERE merchant_id = $1 AND status = 'abandoned' AND abandoned_at > NOW() - INTERVAL '30 days'", [MERCHANT_ID]);
+  const recovered = await query(
+    `SELECT COUNT(DISTINCT o.id) AS n FROM orders o WHERE o.merchant_id = $1 AND o.status = 'paid'
+      AND EXISTS (SELECT 1 FROM action_intents ai WHERE ai.target_id::text = o.cart_id::text AND ai.action_type LIKE 'recovery%')`,
+    [MERCHANT_ID]);
+  const a = Number((abandoned.rows[0] as any)?.n || 0);
+  const r = Number((recovered.rows[0] as any)?.n || 0);
+  const first = (abandoned.rows[0] as any)?.first ? new Date((abandoned.rows[0] as any).first).getTime() : Date.now();
+  const days = Math.max(1, Math.round((Date.now() - first) / 86400e3));
+  const progress = recoveryProgress(r, a, target.rate_pct);
+  const suggestion = suggestTarget({
+    targetPct: target.rate_pct,
+    measuredPct: progress.ratePct,
+    attempts: a,
+    daysObserved: progress.state === "ready" ? 30 : days,
+  });
+  // Ledger the suggestion on transition only (advisory record, policy untouched).
+  if (suggestion.suggestion) {
+    const last = await query("SELECT value_jsonb FROM merchant_config WHERE merchant_id = $1 AND key = 'recovery_target_last'", [MERCHANT_ID])
+      .catch(() => ({ rows: [] as any[] }));
+    if ((last.rows[0]?.value_jsonb as any)?.suggestion !== suggestion.suggestion) {
+      await query(
+        `INSERT INTO merchant_config (merchant_id, key, value_jsonb, updated_by) VALUES ($1, 'recovery_target_last', $2, 'target_advisor')
+         ON CONFLICT (merchant_id, key) DO UPDATE SET value_jsonb = $2, updated_at = NOW()`,
+        [MERCHANT_ID, JSON.stringify({ suggestion: suggestion.suggestion, at: new Date().toISOString() })]);
+      await appendLedger({
+        merchantId: MERCHANT_ID, actor: "TargetAdvisor", action: "target_suggestion",
+        params: {}, decision: "ALLOW", policy_checks: { advisory: true },
+        rationale: { reason: suggestion.reason, policy_unchanged: true },
+        outcome: "SUCCESS",
+      } as any);
+    }
+  }
+  res.json({ target, progress, suggestion, advisory: true, ceilings_respected: true });
+});
+
+// ── P3 cart-value analytics + high-value alert ──
+v5Router.get("/api/cart-values", requireAuth, async (_req: Request, res: Response) => {
+  const { cartValueAlert } = await import("../lib/v5intel.js");
+  const { appendActivity } = await import("../lib/activity.js");
+  const done = await query(
+    "SELECT COALESCE(AVG(amount_paise),0) AS avg, COUNT(*) AS n FROM orders WHERE merchant_id = $1 AND status = 'paid'", [MERCHANT_ID]);
+  const aband = await query(
+    "SELECT COALESCE(AVG(total_paise),0) AS avg, COUNT(*) AS n FROM carts WHERE merchant_id = $1 AND status = 'abandoned'", [MERCHANT_ID]);
+  const rec = await query(
+    `SELECT COALESCE(AVG(o.amount_paise),0) AS avg, COUNT(*) AS n FROM orders o WHERE o.merchant_id = $1 AND o.status = 'paid'
+      AND EXISTS (SELECT 1 FROM action_intents ai WHERE ai.target_id::text = o.cart_id::text AND ai.action_type LIKE 'recovery%')`,
+    [MERCHANT_ID]);
+  const avgCompleted = Number((done.rows[0] as any)?.avg || 0);
+  const avgAbandoned = Number((aband.rows[0] as any)?.avg || 0);
+  const avgRecovered = Number((rec.rows[0] as any)?.avg || 0);
+  const alert = cartValueAlert({ avgAbandoned: avgAbandoned || null, avgCompleted: avgCompleted || null });
+  if (alert.fires) {
+    const flag = await query("SELECT value_jsonb FROM merchant_config WHERE merchant_id = $1 AND key = 'cartval_alerted'", [MERCHANT_ID])
+      .catch(() => ({ rows: [] as any[] }));
+    if (!(flag.rows[0]?.value_jsonb as any)?.on) {
+      await query(
+        `INSERT INTO merchant_config (merchant_id, key, value_jsonb, updated_by) VALUES ($1, 'cartval_alerted', '{"on":true}', 'cartval')
+         ON CONFLICT (merchant_id, key) DO UPDATE SET value_jsonb = '{"on":true}', updated_at = NOW()`, [MERCHANT_ID]);
+      await appendActivity({
+        merchant_id: MERCHANT_ID, actor: "IntelBot", type: "CARTVAL_ALERT",
+        summary: alert.message, data: { avg_abandoned_paise: avgAbandoned, avg_completed_paise: avgCompleted }, severity: "warn",
+      } as any);
+    }
+  } else {
+    await query("DELETE FROM merchant_config WHERE merchant_id = $1 AND key = 'cartval_alerted'", [MERCHANT_ID]).catch(() => {});
+  }
+  res.json({
+    avg_completed_paise: avgCompleted, avg_abandoned_paise: avgAbandoned, avg_recovered_paise: avgRecovered,
+    n_completed: Number((done.rows[0] as any)?.n || 0), n_abandoned: Number((aband.rows[0] as any)?.n || 0),
+    alert: alert.fires ? alert.message : null,
+    labels: "recorded, pre-settlement",
+  });
+});
+
+// ── T3 funnel status + manual resume ──
+v5Router.get("/api/funnel/status", requireAuth, async (_req: Request, res: Response) => {
+  const { isRecoverySuspended, readFunnelWindow, baselineMedian } = await import("../lib/v5funnel.js");
+  const suspended = await isRecoverySuspended(query, MERCHANT_ID);
+  const window = await readFunnelWindow(query, MERCHANT_ID).catch(() => null);
+  res.json({ suspended, window, baseline_note: "24h baseline median guards quiet hours" });
+});
+
+v5Router.post("/api/funnel/resume", requireAuth, async (req: Request, res: Response) => {
+  const { resumeRecovery } = await import("../lib/v5funnel.js");
+  const { appendLedger } = await import("../lib/ledger.js");
+  const { appendActivity } = await import("../lib/activity.js");
+  const { seq } = await resumeRecovery(
+    { q: query, ledgerAppend: (e) => (appendLedger as any)(e), activityAppend: appendActivity },
+    MERCHANT_ID, "manual"
+  );
+  await query("INSERT INTO admin_audit (admin_id, action, params_json, ip) VALUES ($1, 'funnel_resume', $2, $3)",
+    [(req as any).userId || null, JSON.stringify({ seq }), req.ip || null]);
+  res.json({ ok: true, audit_seq: seq });
 });
 
 // ── M16 COD QA trigger ──

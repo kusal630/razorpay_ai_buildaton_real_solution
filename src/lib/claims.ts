@@ -16,9 +16,9 @@ const log = createLogger("claims");
  * stripped; bare numbers that match no grounded value reject the copy.
  */
 
-export const TOKEN_RE = /\[claim:(stock|expiry|social_proof|saved_amount|all_in_total|threshold_gap|offer|price):([^\]]*)\]/g;
+export const TOKEN_RE = /\[claim:(stock|expiry|social_proof|saved_amount|all_in_total|threshold_gap|offer|price|returns_policy|delivery_estimate):([^\]]*)\]/g;
 /** M19/M20-V1: inline LLM emission form {{type:ref}} — same types, same grounding. */
-export const INLINE_TOKEN_RE = /\{\{(stock|expiry|social_proof|saved_amount|all_in_total|threshold_gap|offer|price):([^}]*)\}\}/g;
+export const INLINE_TOKEN_RE = /\{\{(stock|expiry|social_proof|saved_amount|all_in_total|threshold_gap|offer|price|returns_policy|delivery_estimate):([^}]*)\}\}/g;
 export const SOCIAL_STATS_FRESH_HOURS = 26;
 
 export interface ClaimFact {
@@ -37,6 +37,9 @@ export interface ClaimFact {
   threshold_gap_paise?: number | null;
   /** M14: live bank offers the copy may reference (resolver checks live=true). */
   live_offers?: { bank: string; description: string }[];
+  /** T1: returns policy + ship ETA (null/absent → tokens strip per I-2). */
+  returns_policy?: { summary: string; days: number | null } | null;
+  shipping_eta_days?: number | null;
 }
 
 export interface ResolvedClaim {
@@ -139,6 +142,19 @@ async function resolveToken(
     const item = (facts.items || []).find((i) => i.id === ref);
     if (!item) return { unresolvable: `no price source for ${ref}` };
     return { rendered: rupees(Number(item.price_paise)), value: Number(item.price_paise) };
+  }
+  // T1: returns policy — merchant-configured summary only; else stripped.
+  if (type === "returns_policy") {
+    const summary = String(facts.returns_policy?.summary || "").slice(0, 80);
+    if (!summary) return { unresolvable: "returns policy unconfigured" };
+    return { rendered: summary, value: summary };
+  }
+  // T1: delivery estimate — derived from shipping.eta_days; null strips.
+  if (type === "delivery_estimate") {
+    const eta = Number(facts.shipping_eta_days ?? NaN);
+    if (!Number.isFinite(eta) || eta <= 0) return { unresolvable: "no delivery eta configured" };
+    const text = `delivery in ~${Math.round(eta)} days`;
+    return { rendered: text, value: text };
   }
   return { unresolvable: `unknown claim type ${type}` };
 }
@@ -308,15 +324,47 @@ export interface FinalizeCopyInput {
   source: "llm" | "code";
   fallbackTemplate: string;
   ledger?: { merchantId: string; actor: string; action: string } | null;
+  /** T2: post-resolution cap (resolved text can grow past the brain-time cap). */
+  maxLength?: number;
+  /** T2: output channel — sms folds ₹ to Rs (UCS-2 halves segments). */
+  channel?: "sms" | "web";
+}
+
+/**
+ * T2: SMS-bound composition — "Rs" over "₹" (the glyph forces UCS-2),
+ * plus common non-GSM-7 folding. Web surfaces keep ₹.
+ */
+export function toSmsSafe(copy: string): string {
+  return copy
+    .replace(/₹/g, "Rs ")
+    .replace(/[–—]/g, "-")
+    .replace(/[‘’]/g, "'")
+    .replace(/[“”]/g, '"')
+    .replace(/…/g, "...")
+    .replace(/ /g, " ")
+    .replace(/Rs\s{2,}/g, "Rs ")
+    .trim();
 }
 
 /**
  * Ground copy; on fallback, use the template and ledger the refusal with
  * claim_ungrounded / bare-number notes. Returns the sendable copy.
+ * T2 pipeline order: resolve → normalize → channel-compose → length check.
  */
 export async function finalizeCopy(input: FinalizeCopyInput): Promise<{ copy: string; result: GroundResult }> {
   const result = await groundCopy(input.copy, input.facts, input.source);
-  if (!result.fallback) return { copy: result.copy, result };
+  const { normalizeForFilters } = await import("./v5harden.js");
+  let sendable = normalizeForFilters(result.copy);
+  if (input.channel === "sms") sendable = toSmsSafe(sendable);
+  // T2: post-resolution length check (substitution can grow past the cap).
+  const maxLength = input.maxLength ?? 320;
+  const tooLong = sendable.length > maxLength;
+  if (!result.fallback && !tooLong) {
+    if (sendable !== result.copy) {
+      return { copy: sendable, result: { ...result, copy: sendable } };
+    }
+    return { copy: result.copy, result };
+  }
   if (input.ledger) {
     try {
       await appendLedger({
@@ -327,9 +375,10 @@ export async function finalizeCopy(input: FinalizeCopyInput): Promise<{ copy: st
         decision: "BLOCK",
         policy_checks: { grounded_claims: "FALLBACK" },
         rationale: {
-          reason: "claim_ungrounded",
+          reason: tooLong ? "length_exceeded_post_resolution" : "claim_ungrounded",
           stripped: result.stripped,
           violations: result.violations,
+          ...(tooLong ? { resolved_length: sendable.length, max_length: maxLength } : {}),
         },
         outcome: "SKIPPED",
       });
@@ -337,7 +386,7 @@ export async function finalizeCopy(input: FinalizeCopyInput): Promise<{ copy: st
       log.warn({ error: err?.message }, "Fallback ledger write failed (non-critical)");
     }
   } else {
-    log.info({ stripped: result.stripped.length, violations: result.violations }, "Copy fell back to template");
+    log.info({ stripped: result.stripped.length, violations: result.violations, tooLong }, "Copy fell back to template");
   }
   return { copy: input.fallbackTemplate, result };
 }

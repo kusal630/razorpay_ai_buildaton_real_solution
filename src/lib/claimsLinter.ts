@@ -37,6 +37,7 @@ const BANNED_PATTERNS = [
   /\bphysically cannot\b/i,
   /(?<!externally anchored, never )(?<!with external anchoring.{0,80})\btamper-proof\b/i,
   /\b0 mismatches\b/i,
+  /\bAP2 certified\b/i,
 ];
 
 // C6: REQUIRED phrases (at least one must appear in scanned files)
@@ -54,6 +55,8 @@ const REQUIRED_PATTERNS = [
   /go-live gate/i,
   /externally anchored/i,
   /zero unresolved critical exceptions/i,
+  /Industry survey research reports/i,
+  /AP2-aligned/i,
 ];
 
 // C6: Allowlist file
