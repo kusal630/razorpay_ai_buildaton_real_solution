@@ -359,7 +359,7 @@ function startScheduler() {
               await query("UPDATE payment_links SET status = $1 WHERE id = $2", [rpLink.status, link.id]);
             }
           } catch (err: any) {
-            log.error({ linkId: link.razorpay_link_id, error: err.message }, "Poller error");
+            log.error({ linkId: link.razorpay_link_id, error: err.message, status: err.statusCode, detail: err.error }, "Poller error");
           }
         }
       }

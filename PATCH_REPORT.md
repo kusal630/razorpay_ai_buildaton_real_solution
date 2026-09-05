@@ -129,3 +129,16 @@ FREEZE RESUMES: bug fixes, tests, measurement, integration wiring only.
   chain green including live pipeline rows. Regression gate U-LEDG-CANON.
 - Budget rollover ensure added (day-boundary had dropped the verify
   budget gate); `carts.status='converted'` on payment proven by fixture.
+
+## Correctness-audit fixes (post-Part C review, all gated)
+
+- Near-miss token brackets `<{type:ref}>` fold to canonical form in BOTH
+  validation and resolver (U-Brackets) — resolve per I-2, never ship raw.
+- Expiry/stock resolver lookups hardened: `id::text` cast (uuid mismatch
+  crashed live lookups) + DB-error fallback to caller-supplied facts.
+- V7 pressure exemption implemented exactly as specified (ungrounded
+  only); CTA over-eagerness fixed via explicit per-context CTA rule.
+- Suspension feed-spam guard (one note per cart/hour); industry inference
+  with manual override winning; poller errors now log status + detail.
+- notification_outbox merchant_id drift noted (vestigial table, no
+  readers; insert already non-blocking).
