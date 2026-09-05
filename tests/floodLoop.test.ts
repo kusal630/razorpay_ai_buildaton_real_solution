@@ -61,6 +61,13 @@ describe("flood loop-proofing static contract", () => {
     expect(track.match(/anchorTransactional/g)?.length).toBeGreaterThanOrEqual(2);
   });
 
+  it("app pool fits the managed pooler (never wedges logins with EMAXCONNSESSION)", () => {
+    const db = fs.readFileSync(path.join(process.cwd(), "src", "db.ts"), "utf8");
+    const m = db.match(/max:\s*(\d+)/);
+    expect(m).toBeTruthy();
+    expect(Number(m![1])).toBeLessThanOrEqual(10);
+  });
+
   it("gateway calls are time-bounded (a hung socket cannot wedge the tick)", () => {
     expect(srv).toContain("withTimeout");
     expect(srv).toContain("GATEWAY_TIMEOUT_MS");

@@ -16,8 +16,14 @@ export function getPool(): pg.Pool {
     pool = new Pool({
       connectionString,
       ...(needsSSL ? { ssl: { rejectUnauthorized: false } } : {}),
-      max: 20,
-      idleTimeoutMillis: 30000,
+      // Pool budget: managed session poolers (Supabase pool_size: 15) count
+      // EVERY session, including zombies from crashed/clients that vanished
+      // without pool.end(). A 20-client app pool can wedge the whole
+      // database (EMAXCONNSESSION — logins included). Cap well below the
+      // pooler limit; this workload (one scheduler + request handlers)
+      // is idle 99% of the time and never needs more.
+      max: 6,
+      idleTimeoutMillis: 10000,
       connectionTimeoutMillis: 15000,
     });
     pool.on("error", (err) => {
