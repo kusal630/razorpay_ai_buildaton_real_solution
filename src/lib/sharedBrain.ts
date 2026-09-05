@@ -544,6 +544,23 @@ export function validateBrainOutput(
     }
   }
 
+  // §2.4 upsell pre-normalization (BEFORE schema): incentive_token is
+  // advisory context (money comes from the validated discount_pct), so a
+  // malformed token drops to null — the allowed value — with a note.
+  // A string rationale wraps to {reasoning, evidence_ids: []} (empty cites
+  // are traceable-but-empty, matching the array schema; never invented).
+  if (agentType === "upsell" && parsed && typeof parsed === "object") {
+    const tok = (parsed as any).incentive_token;
+    if (tok != null && (typeof tok !== "object" || typeof tok.type !== "string" || typeof (tok as any).ref !== "string")) {
+      (parsed as any).incentive_token = null;
+      (parsed as any)._dropped_token = true;
+    }
+    if (typeof (parsed as any).rationale === "string") {
+      (parsed as any).rationale = { reasoning: (parsed as any).rationale, evidence_ids: [] };
+      (parsed as any)._wrapped_rationale = true;
+    }
+  }
+
   // 2. SCHEMA (§2.4: unknown EXTRA fields tolerated with warn+log; MISSING
   // required fields fail).
   const schemaMap: Record<string, z.ZodSchema> = {
@@ -1190,6 +1207,8 @@ export function buildUpsellContext(params: {
     known_ids: [params.orderId, `cust_${pseudonym}`, ...params.candidates.map(c => c.id)],
     ...(params.merchantId ? { merchant_id: params.merchantId } : {}),
     ...(params.caseType ? { case_type: params.caseType } : {}),
+    // Spec cap: upsell copy ≤220 chars (enforced as the copy constraint).
+    copy_constraints: { max_length: 220 },
   };
 }
 
@@ -1230,5 +1249,7 @@ export function buildChatContext(params: {
     known_ids: [params.token],
     ...(params.merchantId ? { merchant_id: params.merchantId } : {}),
     ...(params.caseType ? { case_type: params.caseType } : {}),
+    // Spec cap: chat replies ≤200 chars.
+    copy_constraints: { max_length: 200 },
   };
 }

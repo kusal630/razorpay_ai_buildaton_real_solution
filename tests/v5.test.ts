@@ -1037,3 +1037,43 @@ describe("U-Parse247", () => {
     vi.unstubAllGlobals();
   });
 });
+
+// ── LLM-audit: token-bearing recovery copy validates + resolves end-to-end ──
+describe("U-TrustResolve", () => {
+  it("llm-shaped copy with trust tokens validates, then resolves to real values", async () => {
+    const sb = await import("../src/lib/sharedBrain.js");
+    const { groundCopy } = await import("../src/lib/claims.js");
+    const ctx: any = {
+      agent: "recovery",
+      customer: { pseudonym: "c", segment: "s", touch_history: 1, consent_state: "t", experiment_arm: "a" },
+      cart: [{ id: "p1", name: "Buds", price_paise: 500000 }],
+      feasible_options: [
+        { action: "send_link_with_incentive", bucket_paise: 10000, ev_paise: 100, theta: 0.3 },
+        { action: "send_plain_link", bucket_paise: 0, ev_paise: 50, theta: 0.1 },
+      ],
+      policy_numbers: { max_incentive_paise: 15000, margin_paise: 200000, max_discount_pct: 15 },
+      theta_estimates: {}, known_ids: ["cart1", "c", "p1"],
+      case_type: "recovery", copy_constraints: { max_length: 320 },
+      available_tokens: ["expiry:cart1", "returns_policy:merchant", "delivery_estimate:cart1"],
+      allow_reminder_choice: true,
+    };
+    const out = JSON.stringify({
+      strategy: "send_link_with_incentive", incentive_token: { type: "cash", ref: "" },
+      message_strategy: "loss_framed", message_tone: "warm",
+      message_copy: "Your reserved earbuds release tonight via {{expiry:cart1}}. Easy returns as always: {{returns_policy:merchant}}. Arriving {{delivery_estimate:cart1}}.",
+      secondary_cta: "reminder_choice",
+      rationale: { reasoning: "r", evidence_ids: ["cart1", "c"] },
+    });
+    const v = sb.validateBrainOutput(out, ctx, "recovery");
+    expect(v.valid).toBe(true);
+    const g = await groundCopy(v.output.message_copy, {
+      cart_total_paise: 500000, incentive_paise: 10000,
+      link_expiry_iso: new Date(Date.now() + 3600e3).toISOString(),
+      returns_policy: { summary: "7-day easy returns", days: 7 }, shipping_eta_days: 3,
+    }, "llm");
+    expect(g.fallback).toBe(false);
+    expect(g.copy).toContain("7-day easy returns");
+    expect(g.copy).toContain("delivery in ~3 days");
+    expect(g.resolved.map((r: any) => r.type).sort()).toEqual(["delivery_estimate", "expiry", "returns_policy"]);
+  });
+});

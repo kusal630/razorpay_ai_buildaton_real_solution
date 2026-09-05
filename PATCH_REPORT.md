@@ -142,3 +142,22 @@ FREEZE RESUMES: bug fixes, tests, measurement, integration wiring only.
   with manual override winning; poller errors now log status + detail.
 - notification_outbox merchant_id drift noted (vestigial table, no
   readers; insert already non-blocking).
+
+## Phase 3 evidence (acceptance runs against the live pinned model)
+
+- 8f fallback meter: 10 consecutive live calls → 10/10 llm, 0% fallback
+  (strategies loss_framed + endowment); retries visibly rescuing invalid
+  first attempts. Meter + alarm live in /api/state.
+- 8c: two differing valid llm copies captured in one session.
+- 8d: kill OFF→ON→OFF via API (modes llm→rules/kill_switch_active→llm);
+  ON persisted across a server restart (DB-backed); restored OFF.
+- 8b: real plink_ links created live; converted-on-resolve proven by
+  fixture; UpsellBot fired end-to-end on a real paid order with
+  mode:llm (Power Bank, 15%). The payment click itself (success@razorpay
+  UPI approval) is an operator step and is openly BLOCKED here.
+- U-RETURNS/U-DELIVERY live emission unobserved (model choice);
+  integration path (validate → resolve to real values) tested.
+- Timeout deviation stands: 30s (measured full-prompt latency 5–15s,
+  one 26s outlier); 8s would abort legitimate calls and trip the
+  breaker. Unreachable endpoint reports yellow (RULES honestly
+  available); wrong-name reports RED per spec.
