@@ -182,16 +182,82 @@ npm install
 
 ```bash
 cp .env.example .env
-# Fill in:
-#   DATABASE_URL         → Supabase session-pooler URI (add ?sslmode=require)
-#   RAZORPAY_KEY_ID      → rzp_test_...
-#   RAZORPAY_KEY_SECRET  → your test secret
-#   ADMIN_EMAIL          → your dashboard login (e.g. admin@sellable.dev)
-#   ADMIN_PASSWORD       → your dashboard password
-#   SERVER_KEY / SITE_KEY → demo defaults work out of the box
-#   APP_SECRET, APP_ENCRYPTION_KEY → generate: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
-#   LLM_API_KEY          → optional (RULES mode without it)
+# → now fill in .env (full variable guide below — every line explained)
+```
 
+#### The `.env` file, variable by variable
+
+Copy-paste this block over your `.env` and replace only the marked values. Everything else works as-shipped for a local demo.
+
+```bash
+# ── Server ────────────────────────────────────────────────
+PORT=3000                    # dashboard + API listen port → http://localhost:3000
+PROCESS_ROLE=all             # all = API + scheduler in one process (keep it)
+BASE_URL=http://localhost:3000  # must match PORT; the simulator + scripts call back into it
+
+# ── Infrastructure ────────────────────────────────────────
+# Supabase (free tier works): Project → Settings → Database → URI.
+# Use the SESSION POOLER URI (port 6543) and append ?sslmode=require
+# (or ?pgbouncer=true). Example:
+# postgres://postgres.PROJECTREF:PASSWORD@aws-0-region.pooler.supabase.com:6543/postgres?sslmode=require
+DATABASE_URL=postgres://sellable:sellable@localhost:5432/sellable
+# Redis: optional. WITHOUT it the queue-backed BullMQ workers stay dormant
+# and the in-process 15s scheduler owns those duties (verified working).
+# With docker-compose's redis service: redis://redis:6379
+REDIS_URL=redis://localhost:6379
+
+# ── Razorpay (TEST mode — no real money can move) ─────────
+# Dashboard → Settings → API Keys → generate TEST keys:
+# https://razorpay.com/docs/payments/dashboard/account-settings/api-keys
+RAZORPAY_KEY_ID=rzp_test_...        # ← REPLACE (starts with rzp_test_)
+RAZORPAY_KEY_SECRET=...             # ← REPLACE (your test secret)
+RAZORPAY_WEBHOOK_SECRET=...         # ← REPLACE (any random string YOU make up,
+                                    #   then paste the same value in the Razorpay
+                                    #   dashboard webhook config — only needed
+                                    #   if you expose webhooks publicly)
+RAZORPAY_MODE=test                  # keep test. live requires LIVE_MODE_ACK=true
+LIVE_MODE_ACK=false                  # + ENABLE_DEV_TOOLS=false + ABANDON_MINUTES>=60
+ENABLE_DEV_TOOLS=true                # QA endpoints (/api/qa/*) — REQUIRED true for the demo
+
+# ── Secrets (generate fresh — one command below) ──────────
+# node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+APP_ENCRYPTION_KEY=...              # ← REPLACE (base64 or hex 32-byte key; encrypts contacts)
+SESSION_SECRET=...                  # ← REPLACE (long random string; signs dashboard logins)
+APP_SECRET=...                      # ← REPLACE (long random string; signs mandate/ext-ref HMACs)
+
+# ── Dashboard login (seed.ts upserts exactly these) ───────
+ADMIN_EMAIL=admin@sellable.dev      # your login email
+ADMIN_PASSWORD=...                  # ← REPLACE with your password
+
+# ── LLM brain (OPTIONAL — RULES mode works fully without it) ──
+# Any OpenAI-compatible endpoint. Without a key the agents run labeled
+# rules fallbacks (the console shows brain_mode "rules" — the honesty).
+LLM_BASE_URL=https://api.openai.com/v1
+LLM_API_KEY=                        # ← leave empty for RULES mode, or your key
+LLM_MODEL=gpt-4o-mini              # must exist on YOUR provider (doctor checks
+                                    # this exact name against /models — if you use
+                                    # a local server, set its model name here)
+
+# ── Ingestion keys (demo defaults work out of the box) ────
+# seed.ts (re)seeds these exact values into track_keys, so the defaults
+# below match automatically. Only change if you rotate the DB rows too.
+SERVER_KEY=sellable-server-key-demo-2024   # secret: merchant server → bind-customer
+SITE_KEY=sellable-track-key-demo-2024      # public: browser → anonymous cart events
+
+# ── Tuning ────────────────────────────────────────────────
+ABANDON_MINUTES=5               # cart-idle time before "abandoned". 1440 = prod-like;
+                                # 1–5 = demo fires fast. (Seeded stories carry their
+                                # own timestamps, so they fire regardless.)
+RETRY_TTL_MIN=10                # retry-link lifetime for failed payments
+HOLD_TTL_MIN=15                 # stock-hold window behind recovery links
+POLL_INTERVAL_SEC=60            # documented poll cadence
+DAILY_INCENTIVE_BUDGET_PAISE=500000  # ₹5,000/day incentive cap (also tunable live in-app)
+ALERT_WEBHOOK_URL=              # optional: checkpoint/alarms webhook (empty = logs only)
+```
+
+Then boot the system:
+
+```bash
 npm run setup      # applies the 14 migrations, in order (idempotent — safe to re-run)
 npm run seed       # sample catalog + the 12 demo people (idempotent; prints a buyer API key ONCE — save it as SELLABLE_BUYER_KEY)
 npm run doctor     # expect: db ✓ Razorpay ✓ LLM ✓ migrations 14/14 ✓ seed ✓
@@ -200,15 +266,26 @@ npm run dev        # → http://localhost:3000
 
 Log in with your `ADMIN_EMAIL` / `ADMIN_PASSWORD`. **Within 15 seconds, the console shows Riya's abandoned cart firing the full pipeline.**
 
-### Verify it
+> Stuck? Run `npm run doctor` first — it tells you exactly which layer is red (DB auth, Razorpay keys, LLM name, migrations, seed) instead of failing mysteriously at boot.
+
+### How to test it (prove it works, layer by layer)
 
 ```bash
-npm test           # vitest unit suite (230 tests, 18 files)
+npm test           # vitest unit suite (230+ tests, 19 files) — pure logic, no DB needed
 npm run verify     # 21 acceptance gates against the live DB — expect 21/21
 npm run lint:claims # claims linter over docs + dashboard copy — expect GREEN
 npm run typecheck  # strict tsc — expect clean
 npm run build && npm start  # production build + start (instead of npm run dev)
 ```
+
+Then prove it live in the dashboard (takes ~5 minutes):
+
+1. **Login** → Overview tab is green, revenue counters visible.
+2. **Fire a trigger yourself** → Buyers & QA tab → *Inject Abandoned Cart* → watch the Live Agent Console: `TRIGGER_DETECTED → INTENT → AGENT_THOUGHT → LINK_CREATED → MESSAGE_SENT` within ~60 seconds.
+3. **Move real (test) money** → open Riya's payment link from the feed → pay with UPI `success@razorpay` (or card `4111 1111 1111 1111`, any future expiry) → within 15 seconds the console shows `PAYMENT_PAID (REAL) → REVENUE_TICK` and the revenue counter ticks up.
+4. **Watch a refusal** → *Policy Drill* → a 20% upsell proposal gets BLOCKED in red, the 15% fallback fires.
+5. **Verify the books** → Ledger tab → *Verify Chain* (expect PASS + head hash) → *Run Reconcile* (expect 0 critical).
+6. **Fail a payment on purpose** → pay with UPI `failure@razorpay` → the poller spots the failed attempt → console shows `PAYMENT_FAILED` + a calm retry nudge reusing the same link.
 
 ### Buyer key (for the AI-buyer demo)
 
@@ -342,7 +419,7 @@ Stated on the dashboard, not hidden:
 - **Protocol alignment is directional** — AP2-aligned patterns, formal certification is a roadmap item
 - **Industry benchmarks are priors** — "Industry survey research reports" phrasing is linter-enforced
 - **BullMQ workers need Redis** — without `REDIS_URL` the queue-backed jobs (cart scanner, pollers, janitor workers) stay dormant; the in-process 15s scheduler owns those duties instead
-- **Browser e2e was retired** — the Playwright spec tested pre-v5 API shapes and is removed; coverage lives in `npm test` (vitest, 230 tests) and `npm run verify` (21 live-DB gates)
+- **Browser e2e was retired** — the Playwright spec tested pre-v5 API shapes and is removed; coverage lives in `npm test` (vitest, 242 tests) and `npm run verify` (21 live-DB gates)
 
 The production go-live is a gated checklist (`docs/GO_LIVE.md`): scoped live keys in a secrets manager, live webhook verification, refund/chargeback testing, consent service, MFA, external ledger anchoring, reconciliation monitoring, incident runbooks, legal sign-off.
 
@@ -375,7 +452,7 @@ sellable/
                            # demo-buyer, backtest, brain-test, reset, lint-claims
   seed.ts                  # idempotent sample dataset (catalog + 12 people)
   doctor.ts / verify.ts    # 5 health checks / 21 acceptance gates
-  tests/                   # 18 vitest files, 230 tests
+  tests/                   # 19 vitest files, 242 tests
   docs/                    # DEMO.md, GO_LIVE.md, ARCHITECTURE.md, SECURITY.md,
                            # PROTOCOLS.md, PRODUCT_ROADMAP.md
 ```
