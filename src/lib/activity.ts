@@ -25,7 +25,7 @@ export type SourceTag = (typeof SOURCE_TAGS)[number];
 export function extractCartId(data: unknown): string | null {
   if (!data || typeof data !== "object") return null;
   const d = data as Record<string, unknown>;
-  for (const k of ["cart_id", "cartId", "cartID"]) {
+  for (const k of ["cart_id", "cartId", "cartID", "cart_or_order_ref"]) {
     const v = d[k];
     if (typeof v === "string" && v.length > 0) return v;
   }

@@ -60,9 +60,10 @@ describe("U-MODE data_mode state", () => {
 });
 
 describe("source_tag inference (pure)", () => {
-  it("extractCartId finds cart_id/cartId", () => {
+  it("extractCartId finds cart_id/cartId/cart_or_order_ref", () => {
     expect(extractCartId({ cart_id: "c1" })).toBe("c1");
     expect(extractCartId({ cartId: "c2" })).toBe("c2");
+    expect(extractCartId({ cart_or_order_ref: "c3" })).toBe("c3");
     expect(extractCartId({})).toBe(null);
     expect(extractCartId(null)).toBe(null);
   });

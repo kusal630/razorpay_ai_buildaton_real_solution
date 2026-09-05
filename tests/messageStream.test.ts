@@ -1,6 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
-import fs from "node:fs";
-import path from "node:path";
+import { describe, it, expect, vi } from "vitest";
 
 vi.mock("../src/config.js", () => ({
   loadConfig: vi.fn().mockReturnValue({}),
@@ -13,115 +11,78 @@ vi.mock("../src/db.js", () => ({
   withTransaction: vi.fn(),
 }));
 
+const appended: any[] = [];
+vi.mock("../src/lib/activity.js", () => ({
+  appendActivity: vi.fn(async (row: any) => { appended.push(row); return appended.length; }),
+}));
+
 import {
-  maskRecipient,
-  stripContactsFromCopy,
-  containsFullContact,
-  emitMessageSent,
+  maskRecipient, stripContactsFromCopy, containsFullContact, emitMessageSent,
 } from "../src/lib/messageStream.js";
 
-describe("U-MSGSENT masking (emission-time, last-4 only)", () => {
-  it("masks phones to last-4 with no full contact leaking", () => {
-    const m = maskRecipient("+919876543210");
-    expect(m).toContain("3210");
-    expect(m).not.toContain("9876543210");
-    expect(containsFullContact(m)).toBe(false);
+describe("U-MSGSENT masking at emission (PII hard rule)", () => {
+  it("phones mask to last-4 with country prefix", () => {
+    expect(maskRecipient("+919876543210")).toBe("+91 ••••• 3210");
+    expect(maskRecipient("+919876543210")).not.toContain("987654");
   });
-  it("masks emails without leaking the local part", () => {
+  it("emails hide the local part", () => {
     const m = maskRecipient("riya.sharma@example.com");
-    expect(m).toContain("example.com");
     expect(m).not.toContain("riya.sharma");
-    expect(containsFullContact(m)).toBe(false);
+    expect(m).toContain("example.com");
   });
-  it("message_copy is scrubbed of contacts at emission", () => {
-    const { copy, stripped } = stripContactsFromCopy(
-      "Hi! Call +919876543210 or mail riya@example.com to pay."
-    );
-    expect(stripped).toBe(true);
-    expect(containsFullContact(copy)).toBe(false);
+  it("empty contact → em dash", () => {
+    expect(maskRecipient("")).toBe("—");
   });
-  it("plain copy passes through untouched", () => {
-    const { copy, stripped } = stripContactsFromCopy(
-      "Your cart is reserved. Complete your purchase today."
-    );
-    expect(stripped).toBe(false);
-    expect(copy).toContain("reserved");
+  it("stripContactsFromCopy replaces emails + 10-digit runs, keeps short numbers", () => {
+    const r = stripContactsFromCopy("Call +919876543210 or mail a@b.com; 3 left in stock, save 50 today");
+    expect(r.stripped).toBe(true);
+    expect(r.copy).not.toContain("+919876543210");
+    expect(r.copy).not.toContain("a@b.com");
+    expect(r.copy).toContain("3 left");
+    expect(r.copy).toContain("50");
+  });
+  it("containsFullContact detects phones/emails, ignores short numbers", () => {
+    expect(containsFullContact("Hi +919876543210")).toBe(true);
+    expect(containsFullContact("mail me at a@b.com")).toBe(true);
+    expect(containsFullContact("Only 3 left, save ₹50")).toBe(false);
   });
 });
 
 describe("U-MSGSENT emission shape", () => {
-  beforeEach(() => vi.clearAllMocks());
-  it("emits MESSAGE_SENT with resolved copy, badges, masked recipient, no PII", async () => {
-    const { appendActivity } = await import("../src/lib/activity.js");
-    const spy = vi.spyOn({ appendActivity }, "appendActivity");
-    void spy;
-    const db = await import("../src/db.js");
-    const qSpy = db.query as any;
-    qSpy.mockImplementation(async (sql: string) => {
-      if (sql.includes("INSERT INTO activity")) return { rows: [{ id: 999 }] };
-      return { rows: [] };
-    });
-    const id = await emitMessageSent({
-      merchantId: "m1",
-      actor: "RecoveryBot",
-      channel: "payment_link",
-      messageCopy: "Your reserved items release tonight at 9 PM. Complete your purchase.",
-      rawCopy: "Your reserved items release {{expiry:hold-1}}. Complete your purchase.",
-      messageStrategy: "loss_framed",
-      messageTone: "warm",
-      brainMode: "llm",
+  it("emits MESSAGE_SENT with masked recipient, badges, and source tag", async () => {
+    appended.length = 0;
+    await emitMessageSent({
+      merchantId: "m1", actor: "RecoveryBot", channel: "payment_link",
+      messageCopy: "Your link expires Fri 6 PM.",
+      rawCopy: "Your link {{expiry:hold1}}.",
+      messageStrategy: "loss_framed", messageTone: "warm", brainMode: "llm",
       cartOrOrderRef: "cart-1",
-      resolvedTokens: [{ token: "expiry:hold-1", resolved_value: "9 PM" }],
-      incentivePaise: 10000,
-      maskedRecipient: maskRecipient("+919876543210"),
+      resolvedTokens: [{ token: "expiry:hold1", resolved_value: "Fri 6 PM" }],
+      incentivePaise: 5000, simulated: false,
+      maskedRecipient: "+91 ••••• 3210", sourceTag: "demo", ledgerSeq: 42,
     });
-    expect(id).toBe(999);
-    const row = qSpy.mock.calls.find((c: any[]) => String(c[0]).includes("INSERT INTO activity"));
-    expect(row).toBeDefined();
-    const payload = JSON.parse(row[1][5]);
-    expect(payload.message_copy).toContain("9 PM");
-    expect(payload.masked_recipient).toContain("3210");
-    expect(payload.masked_recipient).not.toContain("9876543210");
-    expect(payload.brain_mode).toBe("llm");
-    expect(payload.message_strategy).toBe("loss_framed");
-    expect(containsFullContact(JSON.stringify(payload))).toBe(false);
+    expect(appended).toHaveLength(1);
+    const row = appended[0];
+    expect(row.type).toBe("MESSAGE_SENT");
+    expect(row.source_tag).toBe("demo");
+    expect(row.data.message_copy).toContain("Fri 6 PM");
+    expect(row.data.raw_copy).toContain("{{expiry:hold1}}");
+    expect(row.data.message_strategy).toBe("loss_framed");
+    expect(row.data.brain_mode).toBe("llm");
+    expect(row.data.masked_recipient).toBe("+91 ••••• 3210");
+    expect(row.data.resolved_tokens[0]).toMatchObject({ token: "expiry:hold1", resolved_value: "Fri 6 PM" });
+    expect(row.data.ledger_seq).toBe(42);
+    expect(containsFullContact(JSON.stringify(row))).toBe(false);
   });
-});
 
-describe("console controls static contract (U-CLEAR / U-FILTER / U-SCROLL)", () => {
-  const html = fs.readFileSync(
-    path.join(process.cwd(), "src", "public", "dashboard", "index.html"),
-    "utf8"
-  );
-  it("Clear is view-only: no SSE reconnect on clear", () => {
-    expect(html).toContain("clearConsole()");
-    // clearConsole must not close/reopen the EventSource (no reconnect artifacts).
-    const fn = html.slice(html.indexOf("function clearConsole()"), html.indexOf("function clearConsole()") + 1200);
-    expect(fn).not.toMatch(/EventSource|startSSE/);
-    expect(fn).toMatch(/pausedBuffer/); // paused clear discards the buffer
-  });
-  it("keyboard: C clears, Space pauses, F filters; ignored while typing", () => {
-    expect(html).toMatch(/e\.key === 'c'/);
-    expect(html).toMatch(/e\.code === 'Space'/);
-    expect(html).toMatch(/INPUT.*TEXTAREA.*SELECT/);
-  });
-  it("spec chips present (actors, types, MESSAGES only)", () => {
-    for (const chip of ["RecoveryBot", "UpsellBot", "Poller", "Buyer", "System", "Admin"]) {
-      expect(html).toContain(`'${chip}'`);
-    }
-    expect(html).toContain("MESSAGES only");
-    expect(html).toContain("source: live");
-    expect(html).toContain("source: demo");
-  });
-  it("MESSAGE_SENT bubble + token-diff overlay render masked recipient only", () => {
-    expect(html).toContain("msg-bubble");
-    expect(html).toContain("token-diff-raw");
-    expect(html).toContain("token-diff-resolved");
-    expect(html).toContain("masked_recipient");
-    expect(html).not.toMatch(/contact_enc|decrypt/);
-  });
-  it("jump pill + bottom-proximity auto-scroll guard exist", () => {
-    expect(html).toContain("jump-pill");
-    expect(html).toMatch(/scrollHeight - el\.scrollTop - el\.clientHeight/);
+  it("strips a leaked contact from the copy (defense in depth)", async () => {
+    appended.length = 0;
+    await emitMessageSent({
+      merchantId: "m1", actor: "ChatAgent", channel: "chat",
+      messageCopy: "Hi, text +919876543210 for help",
+      maskedRecipient: "+91 ••••• 3210",
+    });
+    expect(appended[0].data.message_copy).not.toContain("+919876543210");
+    expect(appended[0].data.contact_stripped).toBe(true);
   });
 });

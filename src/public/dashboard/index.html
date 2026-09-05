@@ -534,7 +534,7 @@
       switch (chip) {
         case 'BLOCKED only': return r.severity === 'warning';
         case 'ESCALATED only': return /ESCALAT/i.test(text);
-        case 'mode:"llm" only': return /"mode"\s*:\s*"llm"|mode:["']?llm/i.test(text);
+        case 'mode:"llm" only': return /"brain_mode"\s*:\s*"llm"|"mode"\s*:\s*"llm"|mode:["']?llm/i.test(text);
         case 'SIMULATED only': return !!r.simulated;
         case 'REAL only': return !r.simulated;
         case 'source: live': return (r.source_tag || 'system') === 'live';
