@@ -266,6 +266,27 @@ npm run dev        # → http://localhost:3000
 
 Log in with your `ADMIN_EMAIL` / `ADMIN_PASSWORD`. **Within 15 seconds, the console shows Riya's abandoned cart firing the full pipeline.**
 
+### Login credentials (explicit)
+
+The dashboard login form comes **pre-filled** — in most cases you just press Login:
+
+| Field | Default value | Where it comes from |
+|---|---|---|
+| Email | `admin@sellable.dev` | `ADMIN_EMAIL` in `.env` (or the built-in default) |
+| Password | `admin123` | `ADMIN_PASSWORD` in `.env` |
+
+How it works: `npm run seed` upserts exactly these values into `merchant_admins`, so **whatever is in your `.env` is the truth**. If your `.env` has no `ADMIN_PASSWORD` line (like the shipped example), the seeded default `admin123` stays valid. To change them: set both lines in `.env`, re-run `npm run seed`, log in with the new values.
+
+If login fails with correct credentials, check in order:
+
+1. **Server running?** `curl http://localhost:3000/` must return the dashboard (or restart it — see *Server* note below).
+2. **Retried several times?** Login is rate-limited (5 attempts per 15 min per IP) — "Invalid credentials" after 5 quick tries can mean the limiter, not your password. Wait 15 minutes, try once.
+3. **Database reachable?** `npm run doctor` — if `db` is red (e.g. pooler connection cap on Supabase free tier), logins fail with a server error. Restarting the server frees its pooled sessions.
+
+> Server note: start it detached so it survives your terminal session —
+> `setsid nohup npx tsx --env-file=.env src/server.ts > /tmp/opencode/sellable-server.log 2>&1 < /dev/null &`
+> then open http://localhost:3000
+
 > Stuck? Run `npm run doctor` first — it tells you exactly which layer is red (DB auth, Razorpay keys, LLM name, migrations, seed) instead of failing mysteriously at boot.
 
 ### How to test it (prove it works, layer by layer)
