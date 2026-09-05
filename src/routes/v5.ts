@@ -354,11 +354,14 @@ v5Router.get("/api/abandonment/distribution", requireAuth, async (_req: Request,
 
 // ── P1 industry benchmarks vs merchant metrics ──
 v5Router.get("/api/industry", requireAuth, async (_req: Request, res: Response) => {
-  const { industryLabel, recoveryProgress } = await import("../lib/v5intel.js");
+  const { industryLabel, recoveryProgress, inferIndustry } = await import("../lib/v5intel.js");
   const ind = await query(
     "SELECT value_jsonb FROM merchant_config WHERE merchant_id = $1 AND key = 'industry'", [MERCHANT_ID]
   ).catch(() => ({ rows: [] as any[] }));
-  const industry = String(ind.rows[0]?.value_jsonb?.industry || "Electronics");
+  const override = (ind.rows[0]?.value_jsonb as any)?.industry || null;
+  const prods = await query("SELECT name FROM products WHERE merchant_id = $1 AND active = true", [MERCHANT_ID])
+    .catch(() => ({ rows: [] as any[] }));
+  const industry = inferIndustry(prods.rows.map((r: any) => String(r.name || "")), override);
   const { rows: bench } = await query("SELECT * FROM industry_benchmarks WHERE industry = $1", [industry]);
   const b = bench[0] || null;
   const abandoned = await query(

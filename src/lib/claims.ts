@@ -1,6 +1,7 @@
 import { query } from "../db.js";
 import { appendLedger } from "./ledger.js";
 import { checkDarkPatterns } from "./darkPatternFilter.js";
+import { foldTokenBrackets } from "./v5brain.js";
 import { createLogger } from "../logger.js";
 
 const log = createLogger("claims");
@@ -81,7 +82,8 @@ async function resolveToken(
   facts: ClaimFact
 ): Promise<{ rendered: string; value: number | string } | { unresolvable: string }> {
   if (type === "stock") {
-    const { rows } = await query("SELECT stock FROM products WHERE id = $1", [ref]);
+    const { rows } = await query("SELECT stock FROM products WHERE id = $1", [ref])
+      .catch(() => ({ rows: [] as any[] }));
     const stock = rows[0] != null ? Number(rows[0].stock) : NaN;
     if (!Number.isFinite(stock) || stock <= 0) return { unresolvable: `stock unknown/exhausted for ${ref}` };
     return { rendered: String(stock), value: stock };
@@ -89,10 +91,12 @@ async function resolveToken(
   if (type === "expiry") {
     let iso: string | null = null;
     if (ref) {
+      // A DB hiccup must not nuke the claim when the caller supplied the
+      // exact ISO — fall through to facts on query error.
       const { rows } = await query(
-        "SELECT expire_by FROM payment_links WHERE id = $1 OR razorpay_link_id = $1 OR ext_ref = $1",
+        "SELECT expire_by FROM payment_links WHERE id::text = $1 OR razorpay_link_id = $1 OR ext_ref = $1",
         [ref]
-      );
+      ).catch(() => ({ rows: [] as any[] }));
       if (rows[0]?.expire_by) iso = new Date(rows[0].expire_by).toISOString();
     }
     iso = iso || facts.link_expiry_iso || null;
@@ -219,6 +223,8 @@ export async function groundCopy(
 
   // M19: accept the inline {{type:ref}} emission form by normalizing it to
   // the canonical [claim:type:ref] form — identical grounding either way.
+  // Near-miss <{...}> brackets fold first (same helper as validation).
+  copy = foldTokenBrackets(copy);
   copy = copy.replace(INLINE_TOKEN_RE, (_m, t, r) => `[claim:${t}:${r}]`);
   INLINE_TOKEN_RE.lastIndex = 0;
 

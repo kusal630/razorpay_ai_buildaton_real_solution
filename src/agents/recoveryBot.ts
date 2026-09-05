@@ -188,14 +188,22 @@ export async function processAbandonedCart(
   // out. Transactional paths (failure retry) never check this flag.
   const { isRecoverySuspended } = await import("../lib/v5funnel.js");
   if (await isRecoverySuspended(query, MERCHANT_ID)) {
-    await appendActivity({
-      merchant_id: MERCHANT_ID,
-      actor: "RecoveryBot",
-      type: "SUSPENDED",
-      summary: `Recovery held — funnel anomaly suspension active (cart ${cartId})`,
-      data: { cart_id: cartId, reason: "funnel_anomaly_suspended" },
-      severity: "warn",
-    });
+    // One SUSPENDED note per cart per hour (no feed flood during incidents).
+    const { rows: recent } = await query(
+      `SELECT 1 FROM activity WHERE merchant_id = $1 AND type = 'SUSPENDED'
+        AND data->>'cart_id' = $2 AND ts > NOW() - INTERVAL '1 hour' LIMIT 1`,
+      [MERCHANT_ID, cartId]
+    ).catch(() => ({ rows: [] as any[] }));
+    if (recent.length === 0) {
+      await appendActivity({
+        merchant_id: MERCHANT_ID,
+        actor: "RecoveryBot",
+        type: "SUSPENDED",
+        summary: `Recovery held — funnel anomaly suspension active (cart ${cartId})`,
+        data: { cart_id: cartId, reason: "funnel_anomaly_suspended" },
+        severity: "warn",
+      });
+    }
     return;
   }
 

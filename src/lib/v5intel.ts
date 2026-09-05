@@ -67,3 +67,19 @@ export function cartValueAlert(params: { avgAbandoned: number | null; avgComplet
 export function industryLabel(industry: string, source: string, asOf: string): string {
   return `measured on your traffic vs Industry survey research reports ≈ (${industry}, ${source}, as of ${asOf})`;
 }
+
+/**
+ * P1: infer industry from catalog product names; explicit manual override
+ * always wins. Keyword sniffing is a prior, not a measurement.
+ */
+export function inferIndustry(productNames: string[], override?: string | null): string {
+  if (override && override.trim()) return override.trim().slice(0, 40);
+  const text = productNames.join(" ").toLowerCase();
+  if (/(phone|audio|earbud|laptop|camera|charger|power bank|mouse|keyboard|electronic|gadget|watch|tablet)/.test(text)) {
+    return "Electronics";
+  }
+  if (/(shirt|dress|jean|apparel|clothing|shoe|sneaker|jacket|fashion)/.test(text)) {
+    return "Clothing";
+  }
+  return "Other";
+}

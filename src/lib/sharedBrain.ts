@@ -6,6 +6,7 @@ import { findBareNumbers } from "./claims.js";
 import {
   validateV20,
   unknownTokens,
+  foldTokenBrackets,
   INLINE_TOKEN_RE,
   defaultBrainExtension,
   type SecondaryCta,
@@ -421,6 +422,8 @@ function checkV20Stripped(parsed: any, context: BrainContext, agentType: string)
     case_type: ((context.case_type as any) || base.case_type),
   };
   const noWhitelist = (context.available_tokens ?? []).length === 0;
+  // Fold near-miss brackets first so validation and the resolver agree.
+  parsed.message_copy = foldTokenBrackets(String(parsed.message_copy));
   if (!noWhitelist) {
     const stripped: string[] = unknownTokens(String(parsed.message_copy), ext.available_tokens);
     if (stripped.length > 0) {

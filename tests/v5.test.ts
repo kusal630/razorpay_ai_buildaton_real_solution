@@ -934,3 +934,28 @@ describe("U-BENCH + U-TARGET + U-CARTVAL", () => {
     expect(label).toMatch(/2026-01-15/);
   });
 });
+
+// ── v5.6 token-bracket folding: near-miss markup resolves, never ships ──
+describe("U-Brackets", () => {
+  it("<{expiry:x}> folds and resolves identically in validation + resolver", async () => {
+    const { foldTokenBrackets } = await import("../src/lib/v5brain.js");
+    expect(foldTokenBrackets("tonight <{expiry:h1}> ok")).toBe("tonight {{expiry:h1}} ok");
+    expect(foldTokenBrackets("plain {not_a_token} text")).toBe("plain {not_a_token} text");
+    const { groundCopy } = await import("../src/lib/claims.js");
+    const r = await groundCopy("Pay by <{expiry:h1}> tonight for sure, please complete soon.", {
+      link_expiry_iso: new Date(Date.now() + 3600e3).toISOString(),
+    }, "llm");
+    expect(r.copy).not.toContain("<{");
+    expect(r.resolved.length).toBe(1);
+  });
+});
+
+describe("U-BENCH inference", () => {
+  it("infers Electronics/Clothing from catalog; override always wins", async () => {
+    const intel = await import("../src/lib/v5intel.js");
+    expect(intel.inferIndustry(["Wireless Earbuds", "Phone Case"], null)).toBe("Electronics");
+    expect(intel.inferIndustry(["Denim Jacket", "Sneakers"], null)).toBe("Clothing");
+    expect(intel.inferIndustry(["Mystery Box"], null)).toBe("Other");
+    expect(intel.inferIndustry(["Wireless Earbuds"], "Clothing")).toBe("Clothing");
+  });
+});

@@ -56,7 +56,17 @@ export function defaultBrainExtension(caseType: CaseType): BrainExtension {
 /** {{token:ref}} inline emission form (M19/M20-V1). */
 export const INLINE_TOKEN_RE = /\{\{([a-z_]+):([^}]*)\}\}/g;
 export const PERSUASION_TOKENS = new Set(["expiry", "stock", "social_proof", "saved_amount", "offer", "price"]);
+
 /**
+ * Fold near-miss token brackets into canonical form BEFORE any whitelist or
+ * resolution step: `<{type:ref}>` → `{{type:ref}}`. Small models emit the
+ * angle-wrapped form; the intent is unambiguous markup, so resolve it
+ * (I-2) instead of shipping it literally. Both callers (validation +
+ * resolver) apply this first, so they always agree.
+ */
+export function foldTokenBrackets(copy: string): string {
+  return copy.replace(/<\{\s*([a-z_]+:[^<>{}]*)\s*\}>/g, "{{$1}}");
+}/**
  * T1 transparency set: TRUST claims (price transparency + policy facts),
  * never persuasion. They may coexist with ONE persuasion claim (I-3).
  */
