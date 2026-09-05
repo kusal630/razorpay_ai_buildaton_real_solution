@@ -213,3 +213,88 @@ export async function processFailedOrder(orderId: string): Promise<void> {
     throw err;
   }
 }
+
+/**
+ * Link-attempt failure nudge (first sighting only — the caller gates on
+ * linkFailures.recordLinkPaymentFailure isNew). The link stays LIVE (the
+ * customer may be retrying on it right now), so — unlike the failed-order
+ * retry — this NEVER mints a replacement link: it re-points at the existing
+ * short_url in a calm, rules-mode message. Transactional class (their own
+ * attempted purchase), ₹0, ledgered + MESSAGE_SENT like every send.
+ */
+export async function sendLinkFailureNudge(
+  link: {
+    id: string; merchant_id: string; razorpay_link_id: string;
+    cart_id: string | null; customer_id: string | null;
+    amount_paise: number; short_url?: string | null;
+  },
+  payment: any,
+  orderId: string | null
+): Promise<void> {
+  const customerId = link.customer_id;
+  if (!customerId) return;
+  const method = payment?.method || payment?.payment_method || null;
+
+  // The attempt itself anchors transactional consent (same as the retry path).
+  await anchorTransactional(customerId, link.cart_id || `link:${link.id}`);
+  const hasTransactional = await checkTransactionalConsent(customerId);
+  if (!hasTransactional) {
+    await appendActivity({
+      merchant_id: MERCHANT_ID, actor: "FailureRetryBot", type: "DUPLICATE_SKIPPED",
+      summary: `Link-failure nudge skipped — no transactional consent (link ${link.razorpay_link_id})`,
+      data: { razorpay_link_id: link.razorpay_link_id, reason: "no_transactional_consent" },
+    });
+    return;
+  }
+
+  // Velocity accounting: a nudge is a customer contact.
+  const today = new Date().toISOString().slice(0, 10);
+  const { rows: linkRows } = await query("SELECT merchant_id FROM payment_links WHERE id = $1", [link.id]);
+  await query(
+    `INSERT INTO touches (merchant_id, customer_id, day, count) VALUES ($1, $2, $3, 1)
+     ON CONFLICT (customer_id, day) DO UPDATE SET count = touches.count + 1`,
+    [linkRows[0]?.merchant_id || MERCHANT_ID, customerId, today]
+  );
+
+  const frame = methodSwitchSentence(method);
+  const liveLine = link.short_url
+    ? ` Your payment link is still active — you can try again here: ${link.short_url}`
+    : ` Your payment link is still active — please try again.`;
+  const rawCopy = `${frame}${liveLine}`;
+  const finalized = await finalizeCopy({
+    copy: rawCopy,
+    facts: { incentive_paise: 0, cart_total_paise: Number(link.amount_paise || 0), items: [] },
+    source: "code",
+    fallbackTemplate: "Your payment didn't go through — your link is still active, please try again.",
+    ledger: { merchantId: MERCHANT_ID, actor: "FailureRetryBot", action: "link_payment_failed_nudge" },
+  });
+
+  const { appendLedger } = await import("../lib/ledger.js");
+  const { seq } = await appendLedger({
+    merchantId: MERCHANT_ID, actor: "FailureRetryBot", action: "link_payment_failed_nudge",
+    params: {
+      razorpay_link_id: link.razorpay_link_id, cart_id: link.cart_id,
+      order_id: orderId, failed_method: method, short_url: link.short_url || null,
+    },
+    decision: "ALLOW",
+    policy_checks: { consent_class: "transactional", link_reuse: "no_new_link_minted" },
+    rationale: {
+      reason: "failed attempt on a live link; nudge re-points at the existing link",
+      brain_mode: "rules",
+    },
+    outcome: "SUCCESS",
+  } as any);
+
+  const { emitMessageSent } = await import("../lib/messageStream.js");
+  await emitMessageSent({
+    merchantId: MERCHANT_ID, actor: "FailureRetryBot", channel: "retry",
+    messageCopy: finalized.copy, rawCopy,
+    messageStrategy: "functional", messageTone: "helpful",
+    brainMode: "rules", cartOrOrderRef: link.cart_id,
+    resolvedTokens: (finalized as any).result?.resolved || [],
+    incentivePaise: 0, customerId, ledgerSeq: seq,
+  });
+  const { markNudged } = await import("../lib/linkFailures.js");
+  await markNudged(undefined, String(payment?.id || ""));
+  log.info({ linkId: link.razorpay_link_id, seq }, "Link-failure nudge sent (existing link reused)");
+}

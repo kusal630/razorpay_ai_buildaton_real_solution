@@ -297,9 +297,13 @@ opsRouter.post("/api/policy/preset", requireAuth, csrfCheck, async (req: Request
 opsRouter.post("/api/reconcile", requireAuth, async (_req: Request, res: Response) => {
   try {
     const { rows: links } = await query(
-      "SELECT razorpay_link_id, ext_ref, status, created_at FROM payment_links WHERE razorpay_link_id IS NOT NULL"
+      `SELECT pl.razorpay_link_id, pl.ext_ref, pl.status, pl.created_at,
+              COALESCE(o.simulated, false) AS order_simulated
+       FROM payment_links pl
+       LEFT JOIN orders o ON o.ext_ref = pl.ext_ref
+       WHERE pl.razorpay_link_id IS NOT NULL`
     );
-    let matched = 0;
+    let matched = 0, simulatedCount = 0;
     const exceptions: Array<{
       razorpay_link_id: string; status_local: string; status_remote: string;
       age_min: number; severity: "critical" | "warn";
@@ -330,9 +334,13 @@ opsRouter.post("/api/reconcile", requireAuth, async (_req: Request, res: Respons
         const rpLink = await fetchRemote();
         // Vocabulary-normalized compare: local 'live' == remote 'created' /
         // 'partially_paid' (both mean awaiting payment) — not a divergence.
+        // Simulated settlements (gateway never saw money by design) are an
+        // expected divergence — counted separately, never critical.
         const { classifyLink } = await import("../lib/reconcile.js");
-        const verdict = classifyLink(link.status, rpLink.status, false);
-        if (verdict.matched) {
+        const verdict = classifyLink(link.status, rpLink.status, false, link.order_simulated === true);
+        if (verdict.simulated) {
+          simulatedCount++;
+        } else if (verdict.matched) {
           matched++;
         } else {
           exceptions.push({
@@ -385,6 +393,7 @@ opsRouter.post("/api/reconcile", requireAuth, async (_req: Request, res: Respons
     res.json({
       matched, pending, pending_oldest_min: pendingOldestMin,
       exceptions_critical: critical, exceptions_warn: warn,
+      simulated: simulatedCount,
       exceptions, total: rowsChecked, rows_checked: rowsChecked,
     });
   } catch (err: any) { res.status(500).json({ error: err.message }); }

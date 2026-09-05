@@ -62,6 +62,14 @@ async function main() {
     log.warn({ error: err.message }, "Data-mode schema ensure failed (toggle may be unavailable)");
   }
 
+  // Link-attempt sightings (failed-payment detection). Idempotent.
+  try {
+    const { ensureLinkAttemptsTable } = await import("./lib/linkFailures.js");
+    await ensureLinkAttemptsTable();
+  } catch (err: any) {
+    log.warn({ error: err.message }, "Link-attempts schema ensure failed (lazy ensure on first detection)");
+  }
+
   // First-boot auto-seed: empty merchants table + test mode only.
   // DB-direct seed.ts first (history/catalog, no HTTP needed), then the
   // API-path identity bind once listening (same code as npm run seed-bind,
@@ -478,7 +486,7 @@ function startScheduler() {
       // Poll payment links
       const { rows: liveLinks } = await query(
         `SELECT id, razorpay_link_id, merchant_id, cart_id, customer_id,
-                amount_paise, incentive_paise, audit_seq
+                amount_paise, incentive_paise, short_url, audit_seq
          FROM payment_links
          WHERE status = 'live' AND razorpay_link_id IS NOT NULL
          AND created_at > NOW() - INTERVAL '25 hours'
@@ -487,6 +495,7 @@ function startScheduler() {
       if (liveLinks.length > 0) {
         const { fetchPaymentLink, resolvePayment } = await import("./lib/moneyBus.js");
         const { withTimeout, GATEWAY_TIMEOUT_MS } = await import("./lib/timeout.js");
+        const { appendActivity } = await import("./lib/activity.js");
         let throttled = false;
         for (const link of liveLinks) {
           if (throttled) break;
@@ -508,6 +517,33 @@ function startScheduler() {
               log.info({ linkId: link.razorpay_link_id }, "Poller resolved as PAID");
             } else if (rpLink.status === "expired" || rpLink.status === "cancelled") {
               await query("UPDATE payment_links SET status = $1 WHERE id = $2", [rpLink.status, link.id]);
+            }
+
+            // Failed-attempt detection: a link reports 'created' even after
+            // attempts fail — failures live on link.payments[]. First
+            // sighting records + nudges (existing link reused); re-sightings
+            // are silent (dedupe by payment id).
+            try {
+              const { extractFailedAttempts, recordLinkPaymentFailure, ensureLinkAttemptsTable } = await import("./lib/linkFailures.js");
+              const failed = extractFailedAttempts(rpLink);
+              if (failed.length > 0) {
+                await ensureLinkAttemptsTable();
+                const { sendLinkFailureNudge } = await import("./agents/failureRetryBot.js");
+                for (const payment of failed) {
+                  const rec = await recordLinkPaymentFailure(undefined, link, payment);
+                  if (!rec.isNew) continue;
+                  await appendActivity({
+                    merchant_id: link.merchant_id || "5a3ac6ce-b2c7-4b1f-a9db-45296841f30b",
+                    actor: "MoneyBus", type: "PAYMENT_FAILED",
+                    summary: `Payment failed on link ${link.razorpay_link_id} (${payment.method || "unknown method"}) — retry nudge armed`,
+                    data: { razorpay_link_id: link.razorpay_link_id, razorpay_payment_id: rec.paymentId, method: payment.method || null, order_id: rec.orderId },
+                    severity: "warning",
+                  });
+                  await sendLinkFailureNudge(link, payment, rec.orderId);
+                }
+              }
+            } catch (detectErr: any) {
+              log.error({ linkId: link.razorpay_link_id, error: detectErr?.message }, "Link-failure detection error");
             }
           } catch (err: any) {
             const status = err?.statusCode ?? err?.status;

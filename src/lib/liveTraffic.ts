@@ -163,8 +163,10 @@ export async function trafficTick(deps: TrafficDeps = {}): Promise<string> {
       const link = await d.store.randomLiveLink();
       if (!link) return trafficTick({ ...deps, rng: () => 0 });
       const { resolvePayment } = await import("./moneyBus.js");
-      await resolvePayment({ ...link, merchant_id: link.merchant_id || MERCHANT_ID });
+      // Spec: simulated=true and badged, unless the operator deliberately
+      // flips LIVE_PAYMENTS_REAL (real success@razorpay money flow).
       const real = process.env.LIVE_PAYMENTS_REAL === "true";
+      await resolvePayment({ ...link, merchant_id: link.merchant_id || MERCHANT_ID }, { simulated: !real });
       await note(d, "pay_success", `link ${String(link.razorpay_link_id).slice(0, 12)} settled (gateway-unconfirmed test recording, real=${real})`, { razorpay_link_id: link.razorpay_link_id, real });
       return "pay_success";
     }

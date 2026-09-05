@@ -30,16 +30,23 @@ export interface LinkVerdict {
   severity: "critical" | "warn";
   status_local: string;
   status_remote: string;
+  /** Gateway never saw money by design (simulated settlement). */
+  simulated?: boolean;
 }
 
 /**
  * Compare one link. Returns matched=true when both sides agree
  * (after vocabulary normalization). Unreachable remote → warn.
+ * A simulated settlement that disagrees is EXPECTED (the gateway was
+ * never supposed to see money) → matched, flagged simulated, never
+ * critical. Pass simulated=true only when the linked order is
+ * simulated (reconciler joins orders on ext_ref).
  */
 export function classifyLink(
   local: LinkStatus | null | undefined,
   remote: LinkStatus | null | undefined,
-  remoteUnreachable: boolean
+  remoteUnreachable: boolean,
+  simulated = false
 ): LinkVerdict {
   const status_local = String(local || "unknown");
   const status_remote = remoteUnreachable ? "unreachable" : String(remote || "unknown");
@@ -47,6 +54,9 @@ export function classifyLink(
     return { matched: false, severity: "warn", status_local, status_remote };
   }
   const same = canonicalLinkStatus(local) === canonicalLinkStatus(remote);
+  if (!same && simulated) {
+    return { matched: true, severity: "warn", status_local, status_remote, simulated: true };
+  }
   return {
     matched: same,
     severity: same ? "warn" : "critical",

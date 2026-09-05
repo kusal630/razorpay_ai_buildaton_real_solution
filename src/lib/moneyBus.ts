@@ -544,6 +544,13 @@ export async function fetchPaymentsList(options?: { from?: number; to?: number; 
 /**
  * I8: Dual-path idempotent resolution. Both the 15s poller and the webhook
  * converge here. First path wins, second is a no-op.
+ *
+ * opts.simulated: gateway-unconfirmed test recording (LIVE traffic simulator
+ * with LIVE_PAYMENTS_REAL=false). The link still settles locally so demo
+ * flows complete, but NOTHING counts it as real: the order is
+ * simulated=true, revenue ticks are SIMULATED-badged, learning signals
+ * (segment/strategy/chat stats, touches, engagement) are skipped, and no
+ * customer comms (upsell/reassurance) fire for a non-event.
  */
 export async function resolvePayment(pl: {
   id: string;
@@ -554,7 +561,8 @@ export async function resolvePayment(pl: {
   incentive_paise: number;
   cart_id: string | null;
   customer_id: string | null;
-}): Promise<void> {
+}, opts?: { simulated?: boolean }): Promise<void> {
+  const simulated = opts?.simulated === true;
   await withTransaction(async (client) => {
     // Serialize with ledger appends: the inline rehash + cascade below must
     // not interleave with a concurrent append (v4.2 N2 race fix).
@@ -591,9 +599,9 @@ export async function resolvePayment(pl: {
     } else {
       const { rows } = await client.query(
         `INSERT INTO orders (merchant_id, source, cart_id, customer_id, amount_paise, incentive_paise, status, audit_seq, simulated, paid_at, fee_basis)
-         VALUES ($1, 'recovery', $2, $3, $4, $5, 'paid', $6, false, NOW(), 'modeled')
+         VALUES ($1, 'recovery', $2, $3, $4, $5, 'paid', $6, $7, NOW(), 'modeled')
          RETURNING id`,
-        [pl.merchant_id, pl.cart_id, pl.customer_id, pl.amount_paise, pl.incentive_paise, pl.audit_seq]
+        [pl.merchant_id, pl.cart_id, pl.customer_id, pl.amount_paise, pl.incentive_paise, pl.audit_seq, simulated]
       );
       orderId = rows[0].id;
 
@@ -629,39 +637,42 @@ export async function resolvePayment(pl: {
 
     // Activity rows (broadcast post-commit — raw SQL bypasses appendActivity).
     const rupees = formatINR(pl.amount_paise);
+    const paidLabel = simulated ? `Payment of ${rupees} marked paid (SIMULATED test recording)` : `Payment of ${rupees} marked paid (REAL)`;
+    const tickLabel = simulated ? `SIMULATED revenue +${rupees}` : `REAL revenue +${rupees}`;
     const pendingFeed: Record<string, unknown>[] = [];
     const { rows: paidAct } = await client.query(
       `INSERT INTO activity (merchant_id, actor, type, summary, amount_paise, data, simulated, severity)
-       VALUES ($1, 'MoneyBus', 'PAYMENT_PAID', $2, $3, $4, false, 'info') RETURNING id, ts`,
-      [pl.merchant_id, `Payment of ${rupees} marked paid (REAL)`, pl.amount_paise, JSON.stringify({ order_id: orderId })]
+       VALUES ($1, 'MoneyBus', 'PAYMENT_PAID', $2, $3, $4, $5, 'info') RETURNING id, ts`,
+      [pl.merchant_id, paidLabel, pl.amount_paise, JSON.stringify({ order_id: orderId, simulated }), simulated]
     );
     if (paidAct[0]) {
       pendingFeed.push({
         id: paidAct[0].id, ts: paidAct[0].ts, merchant_id: pl.merchant_id,
         actor: "MoneyBus", type: "PAYMENT_PAID",
-        summary: `Payment of ${rupees} marked paid (REAL)`,
-        amount_paise: pl.amount_paise, data: { order_id: orderId },
-        simulated: false, severity: "info",
+        summary: paidLabel,
+        amount_paise: pl.amount_paise, data: { order_id: orderId, simulated },
+        simulated, severity: "info",
       });
     }
     const { rows: tickAct } = await client.query(
       `INSERT INTO activity (merchant_id, actor, type, summary, amount_paise, data, simulated, severity)
-       VALUES ($1, 'MoneyBus', 'REVENUE_TICK', $2, $3, $4, false, 'info') RETURNING id, ts`,
-      [pl.merchant_id, `REAL revenue +${rupees}`, pl.amount_paise, JSON.stringify({ order_id: orderId, simulated: false })]
+       VALUES ($1, 'MoneyBus', 'REVENUE_TICK', $2, $3, $4, $5, 'info') RETURNING id, ts`,
+      [pl.merchant_id, tickLabel, pl.amount_paise, JSON.stringify({ order_id: orderId, simulated }), simulated]
     );
     if (tickAct[0]) {
       pendingFeed.push({
         id: tickAct[0].id, ts: tickAct[0].ts, merchant_id: pl.merchant_id,
         actor: "MoneyBus", type: "REVENUE_TICK",
-        summary: `REAL revenue +${rupees}`,
-        amount_paise: pl.amount_paise, data: { order_id: orderId, simulated: false },
-        simulated: false, severity: "info",
+        summary: tickLabel,
+        amount_paise: pl.amount_paise, data: { order_id: orderId, simulated },
+        simulated, severity: "info",
       });
     }
     (pl as any).__pendingFeed = pendingFeed;
 
-    // Segment stats update
-    if (pl.customer_id) {
+    // Segment stats update — real settlements only. A simulated recording
+    // must not teach θ that fake conversions convert.
+    if (pl.customer_id && !simulated) {
       const { rows: cust } = await client.query("SELECT segment FROM customers WHERE id = $1", [pl.customer_id]);
       const segment = cust[0]?.segment || "default";
       const bucket = pl.incentive_paise;
@@ -676,6 +687,8 @@ export async function resolvePayment(pl: {
 
     // N4 (v4.2): chat-segment learning — a paid chat-discount link is a success
     // for the granted bucket (attempt was recorded at ask time).
+    // Real settlements only (simulated recordings teach nothing).
+    if (!simulated) {
     try {
       const { rows: chatTrig } = await client.query(
         `SELECT rationale_json->>'trigger' AS trig,
@@ -692,8 +705,11 @@ export async function resolvePayment(pl: {
     } catch (chatErr: any) {
       log.warn({ error: chatErr?.message }, "Chat success recording skipped (non-critical)");
     }
+    }
 
     // G7 (v4.3): a paid link is a strategy success for the recorded angle.
+    // Real settlements only.
+    if (!simulated) {
     try {
       const { rows: stratRows } = await client.query(
         `SELECT rationale_json->>'message_strategy' AS strat FROM audit_log WHERE seq = $1`,
@@ -707,6 +723,7 @@ export async function resolvePayment(pl: {
       }
     } catch (stratErr: any) {
       log.warn({ error: stratErr?.message }, "Strategy success recording skipped (non-critical)");
+    }
     }
 
     // Budget settle
@@ -728,8 +745,8 @@ export async function resolvePayment(pl: {
       );
     }
 
-    // Touches update
-    if (pl.customer_id) {
+    // Touches update — real settlements only (a recording is not engagement).
+    if (pl.customer_id && !simulated) {
       const today = new Date().toISOString().slice(0, 10);
       await client.query(
         `INSERT INTO touches (merchant_id, customer_id, day, count) VALUES ($1, $2, $3, 1)
@@ -787,20 +804,26 @@ export async function resolvePayment(pl: {
     }
   } catch { /* feed fan-out never fails resolution */ }
 
-  // Post-commit: trigger UpsellBot (outside the transaction)
+  // Post-commit: trigger UpsellBot (outside the transaction).
+  // Never for simulated recordings — no customer comms for a non-event.
+  if (!simulated) {
   try {
     const { processPaidOrder } = await import("../agents/upsellBot.js");
     await processPaidOrder(pl);
   } catch (err: any) {
     log.error({ error: err.message }, "UpsellBot trigger failed");
   }
+  }
 
   // G6 (v4.3): post-purchase reassurance (transactional class, separate
   // from UpsellBot — never a pitch). Best-effort, never fails resolution.
+  // Never for simulated recordings.
+  if (!simulated) {
   try {
     await sendReassurance(pl);
   } catch (err: any) {
     log.warn({ error: err?.message }, "Reassurance send skipped (non-critical)");
+  }
   }
 }
 

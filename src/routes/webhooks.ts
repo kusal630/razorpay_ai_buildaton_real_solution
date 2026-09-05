@@ -60,6 +60,52 @@ webhookRouter.post("/webhooks/razorpay", async (req: Request, res: Response) => 
       const newStatus = eventType === "payment_link.expired" ? "expired" : "cancelled";
       await query("UPDATE payment_links SET status = $1 WHERE razorpay_link_id = $2", [newStatus, linkId]);
     }
+  } else if (eventType === "payment.failed") {
+    // Failed attempt on a link: the link itself stays 'created' (failures
+    // live on payment entities), so without this branch failures were
+    // invisible. Converges with the poller on link_payment_attempts —
+    // first sighting records + nudges, re-sightings stay silent.
+    try {
+      const entity = event.payload?.payment?.entity || {};
+      const linkId =
+        event.payload?.payment_link?.entity?.id ||
+        entity.notes?.link_id ||
+        entity.notes?.razorpay_link_id ||
+        null;
+      const rpOrderId = entity.order_id || null;
+      let links: any[] = [];
+      if (linkId) {
+        ({ rows: links } = await query(
+          `SELECT id, razorpay_link_id, merchant_id, cart_id, customer_id, amount_paise, short_url
+           FROM payment_links WHERE razorpay_link_id = $1 AND status = 'live'`,
+          [linkId]
+        ));
+      }
+      if (links.length === 0 && rpOrderId) {
+        ({ rows: links } = await query(
+          `SELECT id, razorpay_link_id, merchant_id, cart_id, customer_id, amount_paise, short_url
+           FROM payment_links WHERE razorpay_order_id = $1 AND status = 'live'`,
+          [rpOrderId]
+        ));
+      }
+      if (links[0]) {
+        const { ensureLinkAttemptsTable, recordLinkPaymentFailure } = await import("../lib/linkFailures.js");
+        await ensureLinkAttemptsTable();
+        const rec = await recordLinkPaymentFailure(undefined, links[0], { ...entity, status: "failed" });
+        if (rec.isNew) {
+          const { sendLinkFailureNudge } = await import("../agents/failureRetryBot.js");
+          await appendActivity({
+            merchant_id: links[0].merchant_id || MERCHANT_ID, actor: "Webhook", type: "PAYMENT_FAILED",
+            summary: `Webhook: payment failed on link ${links[0].razorpay_link_id} — retry nudge armed`,
+            data: { razorpay_link_id: links[0].razorpay_link_id, razorpay_payment_id: rec.paymentId, order_id: rec.orderId },
+            severity: "warning",
+          });
+          await sendLinkFailureNudge(links[0], { ...entity, status: "failed" }, rec.orderId);
+        }
+      }
+    } catch (failErr: any) {
+      log.warn({ error: failErr?.message }, "payment.failed handling skipped (non-critical)");
+    }
   }
 
   await appendActivity({
