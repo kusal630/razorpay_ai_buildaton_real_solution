@@ -288,12 +288,24 @@ async function seed() {
         JSON.stringify({ enabled: false, delay_days: 7 })]
     );
 
-    const adminHash = await argon2.hash(process.env.ADMIN_PASSWORD || "admin123");
-    await client.query(
-      `INSERT INTO merchant_admins (id, email, password_hash) VALUES ($1, $2, $3)
-       ON CONFLICT (email) DO NOTHING`,
-      [crypto.randomUUID(), process.env.ADMIN_EMAIL || "admin@sellable.dev", adminHash]
-    );
+    // Admin: explicit ADMIN_PASSWORD in .env is source of truth (upserted so
+    // a changed password actually takes effect); otherwise keep existing.
+    const adminEmail = process.env.ADMIN_EMAIL || "admin@sellable.dev";
+    if (process.env.ADMIN_PASSWORD) {
+      const adminHash = await argon2.hash(process.env.ADMIN_PASSWORD);
+      await client.query(
+        `INSERT INTO merchant_admins (id, email, password_hash) VALUES ($1, $2, $3)
+         ON CONFLICT (email) DO UPDATE SET password_hash = $3`,
+        [crypto.randomUUID(), adminEmail, adminHash]
+      );
+    } else {
+      const adminHash = await argon2.hash("admin123");
+      await client.query(
+        `INSERT INTO merchant_admins (id, email, password_hash) VALUES ($1, $2, $3)
+         ON CONFLICT (email) DO NOTHING`,
+        [crypto.randomUUID(), adminEmail, adminHash]
+      );
+    }
 
     // Buyer API key — created once, printed ONCE (console only).
     const existing = await client.query("SELECT id FROM buyer_api_keys WHERE merchant_id = $1 AND label = 'demo-buyer-key' AND revoked_at IS NULL", [MERCHANT_ID]);

@@ -107,7 +107,8 @@ npm run dev            # http://localhost:3000 → login
 
 `.env` values: `DATABASE_URL` (Supabase session-pooler URI +
 `?sslmode=require`); `RAZORPAY_KEY_ID` / `RAZORPAY_KEY_SECRET` (TEST mode);
-`ADMIN_EMAIL` / `ADMIN_PASSWORD` (your choice); `APP_SECRET` and
+`ADMIN_EMAIL` / `ADMIN_PASSWORD` (your choice — `npm run seed` applies
+an explicitly set `ADMIN_PASSWORD` to the dashboard login); `APP_SECRET` and
 `APP_ENCRYPTION_KEY` (generate: `openssl rand -hex 32`, and for the
 encryption key `openssl rand -base64 32`); `LLM_BASE_URL` / `LLM_API_KEY` /
 `LLM_MODEL` if available.
