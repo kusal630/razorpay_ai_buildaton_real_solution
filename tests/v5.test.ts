@@ -959,3 +959,81 @@ describe("U-BENCH inference", () => {
     expect(intel.inferIndustry(["Wireless Earbuds"], "Clothing")).toBe("Clothing");
   });
 });
+
+// ── LLM-audit §2.4: quote repair, extra-field tolerance, variant folding, meter ──
+describe("U-Parse247", () => {
+  it("single-quote JSON repaired structurally; apostrophes never corrupted", async () => {
+    const sb = await import("../src/lib/sharedBrain.js");
+    expect(sb.repairSingleQuotes("{'a': 1}")).toBe('{"a": 1}');
+    // interior apostrophe: NO safe repair exists → null (honest reject)
+    expect(sb.repairSingleQuotes("{'a': 'don't'}")).toBe(null);
+    expect(sb.repairSingleQuotes('{"a": "x"}')).toBe(null);
+    expect(sb.repairSingleQuotes("not json")).toBe(null);
+  });
+  it("extra fields tolerated with warn; missing fields fail", async () => {
+    const sb = await import("../src/lib/sharedBrain.js");
+    const base = {
+      strategy: "send_plain_link", incentive_bucket_paise: 0, message_tone: "neutral",
+      message_copy: "Hi! You left something in your cart. Complete your purchase here.",
+      rationale: { reasoning: "r", evidence_ids: ["c1"] },
+    };
+    const ctx: any = {
+      agent: "recovery",
+      customer: { pseudonym: "c", segment: "s", touch_history: 0, consent_state: "t", experiment_arm: "a" },
+      cart: [], feasible_options: [{ action: "send_plain_link", bucket_paise: 0, ev_paise: 0, theta: 0 }],
+      policy_numbers: { max_incentive_paise: 0, margin_paise: 0, max_discount_pct: 15 },
+      theta_estimates: {}, known_ids: ["c1"],
+    };
+    const withExtra = sb.validateBrainOutput(JSON.stringify({ ...base, surprise: 1 }), ctx, "recovery");
+    expect(withExtra.valid).toBe(true);
+    expect(withExtra.output._extra_fields).toEqual(["surprise"]);
+    const missing = sb.validateBrainOutput(JSON.stringify({ strategy: "send_plain_link" }), ctx, "recovery");
+    expect(missing.valid).toBe(false);
+  });
+  it("[[..]] and {..} variants fold before V1 (ledgered, non-blocking)", async () => {
+    const sb = await import("../src/lib/sharedBrain.js");
+    const { foldTokenVariants } = await import("../src/lib/v5brain.js");
+    const f = foldTokenVariants("Only [[stock:p1]] left and {expiry:h1} soon, plus {nonsense} kept");
+    expect(f.copy).toContain("{{stock:p1}}");
+    expect(f.copy).toContain("{{expiry:h1}}");
+    expect(f.copy).toContain("{nonsense}");
+    expect(f.normalized).toHaveLength(2);
+  });
+  it("fallback meter: 6 rules + 4 llm over 10 calls → 60%, alarming", async () => {
+    const sb = await import("../src/lib/sharedBrain.js");
+    sb.resetFallbackMeter();
+    sb.setFallbackSink(async () => {});
+    const good = JSON.stringify({
+      strategy: "send_plain_link", incentive_bucket_paise: 0, message_tone: "neutral",
+      message_copy: "Hi! You left something in your cart. Complete your purchase here.",
+      rationale: { reasoning: "r", evidence_ids: ["c1"] },
+    });
+    let n = 0;
+    vi.stubGlobal("fetch", async (url: any) => {
+      if (String(url).includes("/models")) {
+        return { ok: true, json: async () => ({ data: [{ id: "bonsai-8b" }] }) };
+      }
+      n++;
+      // 6 calls × up to 2 attempts each = first 12 fetches garbage (rules),
+      // then valid (llm). 6 rules + 4 llm → 60% fallback, alarming.
+      const content = n <= 12 ? "not json at all" : good;
+      return { ok: true, json: async () => ({ choices: [{ message: { content } }] }) };
+    });
+    const ctx: any = {
+      agent: "recovery",
+      customer: { pseudonym: "c", segment: "s", touch_history: 0, consent_state: "t", experiment_arm: "a" },
+      cart: [], feasible_options: [{ action: "send_plain_link", bucket_paise: 0, ev_paise: 0, theta: 0 }],
+      policy_numbers: { max_incentive_paise: 0, margin_paise: 0, max_discount_pct: 15 },
+      theta_estimates: {}, known_ids: ["c1"], merchant_id: "m1",
+    };
+    for (let i = 0; i < 10; i++) await sb.callBrain("recovery", ctx);
+    const rate = sb.getFallbackRate();
+    expect(rate.n).toBe(10);
+    expect(rate.fallback_pct).toBe(60);
+    expect(rate.alarming).toBe(true);
+    sb.setFallbackSink(null);
+    sb.resetFallbackMeter();
+    sb.clearModelCheckCache();
+    vi.unstubAllGlobals();
+  });
+});

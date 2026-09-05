@@ -126,6 +126,7 @@ export async function handleChatMessage(
     },
     cartItems: chatItems,
     merchantId: MERCHANT_ID,
+    caseType: "chat",
   });
 
   const brain = await callBrain("chat", brainContext);
@@ -153,6 +154,8 @@ export async function handleChatMessage(
       mode: brain.mode,
       tool,
       params: toolParams,
+      case_type: "chat",
+      fallback_reason: (brain as any).fallback_reason || null,
       reasoning: brain.rationale.reasoning,
       message_copy: brain.message_copy,
     },

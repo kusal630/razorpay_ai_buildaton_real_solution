@@ -66,6 +66,33 @@ export const PERSUASION_TOKENS = new Set(["expiry", "stock", "social_proof", "sa
  */
 export function foldTokenBrackets(copy: string): string {
   return copy.replace(/<\{\s*([a-z_]+:[^<>{}]*)\s*\}>/g, "{{$1}}");
+}
+
+/**
+ * §2.4 token-syntax drift: normalize common variants ONCE before V1 —
+ * `[[type:ref]]` and lone `{type:ref}` (known token names only) fold to
+ * `{{type:ref}}`. Regeneration is expensive on an 8B model; normalization
+ * is ledgered as normalized_token_syntax. Returns {copy, normalized}.
+ */
+const KNOWN_TOKEN_NAMES = new Set([
+  "stock", "expiry", "social_proof", "saved_amount", "all_in_total",
+  "threshold_gap", "offer", "price", "returns_policy", "delivery_estimate",
+]);
+export function foldTokenVariants(copy: string): { copy: string; normalized: string[] } {
+  const normalized: string[] = [];
+  let out = copy.replace(/\[\[\s*([a-z_]+:[^\[\]]+?)\s*\]\]/g, (m, inner) => {
+    const name = String(inner).split(":")[0];
+    if (!KNOWN_TOKEN_NAMES.has(name)) return m;
+    normalized.push(m);
+    return `{{${inner.trim()}}}`;
+  });
+  out = out.replace(/(?<!\{)\{([a-z_]+:[^{}]+?)\}(?!\})/g, (m, inner) => {
+    const name = String(inner).split(":")[0];
+    if (!KNOWN_TOKEN_NAMES.has(name)) return m;
+    normalized.push(m);
+    return `{{${inner.trim()}}}`;
+  });
+  return { copy: out, normalized };
 }/**
  * T1 transparency set: TRUST claims (price transparency + policy facts),
  * never persuasion. They may coexist with ONE persuasion claim (I-3).

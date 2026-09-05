@@ -578,6 +578,8 @@ export async function processAbandonedCart(
       incentive_token: incentiveToken,
       case_type: "recovery",
       fallback_reason: (brain as any).fallback_reason || null,
+      // §2.4: token-syntax normalizations ledgered on the expanded row.
+      normalized_token_syntax: (brain as any).normalizations || undefined,
     },
   });
 
@@ -705,7 +707,9 @@ export async function processAbandonedCart(
       fallback_reason: (brain as any).fallback_reason || null,
       // T4: covariate in the rationale (no learning weight yet).
       abandonment_cycles: abandonmentCycles,
-      prompt_version: "v5.0",
+      // §2.4: token-syntax normalizations on the ledger row.
+      normalized_token_syntax: (brain as any).normalizations || undefined,
+      prompt_version: "v5.6",
       model: getConfig().LLM_MODEL || "rules",
     },
     MERCHANT_ID

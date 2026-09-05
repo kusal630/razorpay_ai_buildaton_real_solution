@@ -127,6 +127,7 @@ export async function processFailedOrder(orderId: string): Promise<void> {
     maxIncentivePaise: 0, marginPaise: Math.floor(cartTotal * 0.4),
     thetaEstimates: { "0": 0.1 },
     merchantId: MERCHANT_ID,
+    caseType: "failure_retry",
   }));
 
   const frame = methodSwitchSentence(order.payment_method);
@@ -149,6 +150,9 @@ export async function processFailedOrder(orderId: string): Promise<void> {
     data: {
       mode: brain.mode, strategy: "send_plain_link", tone: brain.message_tone,
       incentive_bucket_paise: 0, order_id: orderId, recency_class: actionClass,
+      case_type: "failure_retry",
+      secondary_cta: (brain as any).raw?.secondary_cta || "none",
+      fallback_reason: (brain as any).fallback_reason || null,
       reasoning: brain.rationale.reasoning, message_copy: finalized.copy,
       claims_resolved: finalized.result.resolved, claims_stripped: finalized.result.stripped,
     },

@@ -7,6 +7,7 @@ import {
   validateV20,
   unknownTokens,
   foldTokenBrackets,
+  foldTokenVariants,
   INLINE_TOKEN_RE,
   defaultBrainExtension,
   type SecondaryCta,
@@ -58,6 +59,52 @@ export function resetBreaker(reason = "manual_reset"): void {
   lastTripReason = null;
   lastTripAt = 0;
   log.info({ reason }, "Circuit breaker manually reset");
+}
+
+// ── §2.4 FALLBACK-RATE METER ──
+// Rolling window over brain outcomes (1 = llm, 0 = rules). Alarm fires when
+// fallbacks exceed 40% — prompt/model mismatch needing attention, never
+// silent acceptance.
+const outcomeWindow: number[] = [];
+const OUTCOME_WINDOW_MAX = 50;
+const FALLBACK_ALARM_PCT = 40;
+let fallbackAlarming = false;
+
+export function getFallbackRate(): { n: number; llm: number; fallback_pct: number | null; alarming: boolean } {
+  const n = outcomeWindow.length;
+  if (n < 10) return { n, llm: outcomeWindow.reduce((a, b) => a + b, 0), fallback_pct: null, alarming: fallbackAlarming };
+  const llm = outcomeWindow.reduce((a, b) => a + b, 0);
+  return { n, llm, fallback_pct: ((n - llm) / n) * 100, alarming: fallbackAlarming };
+}
+
+/** Test hook: reset the meter (fresh process starts empty anyway). */
+export function resetFallbackMeter(): void {
+  outcomeWindow.length = 0;
+  fallbackAlarming = false;
+}
+
+async function recordBrainOutcome(mode: "llm" | "rules", merchantId?: string | null): Promise<void> {
+  outcomeWindow.push(mode === "llm" ? 1 : 0);
+  if (outcomeWindow.length > OUTCOME_WINDOW_MAX) outcomeWindow.shift();
+  const rate = getFallbackRate();
+  if (rate.fallback_pct == null) return;
+  if (rate.fallback_pct > FALLBACK_ALARM_PCT && !fallbackAlarming) {
+    fallbackAlarming = true;
+    log.warn({ fallback_pct: rate.fallback_pct, n: rate.n }, "Brain fallback rate above 40%");
+    if (merchantId) {
+      try {
+        const { appendActivity } = await import("./activity.js");
+        await appendActivity({
+          merchant_id: merchantId, actor: "Brain", type: "BRAIN_ALARM",
+          summary: `Brain fallback rate ${rate.fallback_pct.toFixed(0)}% over last ${rate.n} calls — prompt/model mismatch?`,
+          data: { fallback_pct: rate.fallback_pct, n: rate.n },
+          severity: "warn",
+        });
+      } catch { /* metering never blocks */ }
+    }
+  } else if (rate.fallback_pct <= FALLBACK_ALARM_PCT && fallbackAlarming) {
+    fallbackAlarming = false;
+  }
 }
 
 /** M32: open events in the trailing hour (alarm at ≥3). */
@@ -315,6 +362,28 @@ function extractJSON(text: string): string {
   return text.trim();
 }
 
+/**
+ * §2.4: single-quote repair — attempted ONLY after standard parse fails.
+ * Swaps structural quotes ONLY ('key': and : 'value' with no interior
+ * quotes), so apostrophes like "don't" can never be corrupted into
+ * parseable-but-wrong JSON: anything ambiguous returns null (honest
+ * validation failure, not silent repair).
+ */
+export function repairSingleQuotes(candidate: string): string | null {
+  if (candidate.includes('"')) return null;
+  if (!candidate.includes("'")) return null;
+  const repaired = candidate
+    .replace(/'([^'\n]*?)'\s*:/g, '"$1":')
+    .replace(/:\s*'((?:[^'\\\n]|\\.)*)'/g, ': "$1"');
+  if (repaired === candidate) return null;
+  try {
+    JSON.parse(repaired);
+    return repaired;
+  } catch {
+    return null;
+  }
+}
+
 const BANNED_PATTERNS: { pattern: RegExp; label: string }[] = [
   { pattern: /only \d+ left/i, label: "unverified_scarcity" },
   { pattern: /guaranteed/i, label: "false_guarantee" },
@@ -424,6 +493,13 @@ function checkV20Stripped(parsed: any, context: BrainContext, agentType: string)
   const noWhitelist = (context.available_tokens ?? []).length === 0;
   // Fold near-miss brackets first so validation and the resolver agree.
   parsed.message_copy = foldTokenBrackets(String(parsed.message_copy));
+  // §2.4: normalize common token-syntax variants ONCE before V1.
+  // Ledgered as normalized_token_syntax on the output (non-blocking).
+  const folded = foldTokenVariants(String(parsed.message_copy));
+  if (folded.normalized.length > 0) {
+    parsed.message_copy = folded.copy;
+    parsed._normalized_tokens = folded.normalized;
+  }
   if (!noWhitelist) {
     const stripped: string[] = unknownTokens(String(parsed.message_copy), ext.available_tokens);
     if (stripped.length > 0) {
@@ -449,14 +525,27 @@ export function validateBrainOutput(
   const violations: string[] = [];
 
   // 1. PARSE
+  // 1. PARSE (§2.4: fenced + trailing text via extractJSON; single-quote
+  // repair attempted once before parse failure counts as validation_failed).
   let parsed: any;
+  let repairedQuotes = false;
   try {
     parsed = JSON.parse(extractJSON(rawResponse));
   } catch {
-    return { valid: false, violations: ["unparseable_output"], mode: "rules" };
+    const fixed = repairSingleQuotes(extractJSON(rawResponse));
+    if (fixed == null) {
+      return { valid: false, violations: ["unparseable_output"], mode: "rules" };
+    }
+    try {
+      parsed = JSON.parse(fixed);
+      repairedQuotes = true;
+    } catch {
+      return { valid: false, violations: ["unparseable_output"], mode: "rules" };
+    }
   }
 
-  // 2. SCHEMA
+  // 2. SCHEMA (§2.4: unknown EXTRA fields tolerated with warn+log; MISSING
+  // required fields fail).
   const schemaMap: Record<string, z.ZodSchema> = {
     recovery: RecoveryOutputSchema,
     upsell: UpsellOutputSchema,
@@ -467,8 +556,16 @@ export function validateBrainOutput(
     const result = schema.safeParse(parsed);
     if (!result.success) {
       violations.push("schema_mismatch: " + result.error.issues.map(i => i.path.join(".")).join(","));
+    } else {
+      const known = new Set(Object.keys((schema as any).shape || {}));
+      const extra = Object.keys(parsed).filter((k) => !known.has(k) && !k.startsWith("_"));
+      if (extra.length > 0) {
+        log.warn({ agentType, extra }, "LLM output carries unknown extra fields (tolerated)");
+        parsed._extra_fields = extra;
+      }
     }
   }
+  if (repairedQuotes) parsed._repaired_quotes = true;
 
   // M19/M20: resolve a missing bucket from the typed incentive_token.
   // The model picks from the menu; code maps the pick to paise (gwp = COGS,
@@ -692,6 +789,8 @@ export interface BrainResult {
   /** F1: exact fallback cause — threaded into activity + ledger rationale. */
   fallback_reason?: FallbackReason;
   fallback_data?: Record<string, any>;
+  /** §2.4: token-syntax normalizations applied (ledgered as normalized_token_syntax). */
+  normalizations?: string[];
 }
 
 export const ZERO_USAGE: LLMUsage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
@@ -823,6 +922,7 @@ export async function callBrain(
   ): Promise<BrainResult> => {
     await emitFallbackEvent(agentType, reason, data, merchantId);
     const output = rulesBrain(agentType, context);
+    await recordBrainOutcome("rules", merchantId);
     return { mode: "rules", ...output, usage: ZERO_USAGE, fallback_reason: reason, fallback_data: data };
   };
 
@@ -928,6 +1028,7 @@ export async function callBrain(
 
     if (validation.valid) {
       log.info({ agentType, strategy: validation.output?.strategy || validation.output?.tool }, "LLM brain succeeded");
+      await recordBrainOutcome("llm", merchantId);
       return {
         mode: "llm",
         strategy: validation.output.strategy,
@@ -936,6 +1037,7 @@ export async function callBrain(
         message_copy: validation.output.message_copy,
         rationale: validation.output.rationale,
         raw: validation.output,
+        normalizations: validation.output._normalized_tokens || undefined,
         usage: withEstimatedUsage(rawResponse, [prompts[agentType] || RECOVERY_SYSTEM_PROMPT, userContent]),
       };
     }
@@ -961,6 +1063,7 @@ export async function callBrain(
       const retryValidation = validateBrainOutput(retryResponse.content, context, agentType);
       if (retryValidation.valid) {
         log.info({ agentType }, "LLM retry succeeded");
+        await recordBrainOutcome("llm", merchantId);
         return {
           mode: "llm",
           strategy: retryValidation.output.strategy,
@@ -969,6 +1072,7 @@ export async function callBrain(
           message_copy: retryValidation.output.message_copy,
           rationale: retryValidation.output.rationale,
           raw: retryValidation.output,
+          normalizations: retryValidation.output._normalized_tokens || undefined,
           usage: sumUsage(
             withEstimatedUsage(rawResponse, [prompts[agentType] || RECOVERY_SYSTEM_PROMPT, userContent]),
             retryResponse.usage
@@ -1012,6 +1116,7 @@ export function buildRecoveryContext(params: {
   thetaEstimates: Record<string, number>;
   merchantId?: string;
   abandonmentCycles?: number;
+  caseType?: string;
 }): BrainContext {
   const pseudonym = crypto.createHash("sha256").update(params.customerId).digest("hex").slice(0, 12);
 
@@ -1040,6 +1145,8 @@ export function buildRecoveryContext(params: {
     theta_estimates: params.thetaEstimates,
     known_ids: [params.cartId, `cust_${pseudonym}`, ...params.cartItems.map((i) => i.id)],
     ...(params.merchantId ? { merchant_id: params.merchantId } : {}),
+    // A10: explicit case (recovery | failure_retry | ...) for validation scope.
+    ...(params.caseType ? { case_type: params.caseType } : {}),
   };
 }
 
@@ -1050,6 +1157,7 @@ export function buildUpsellContext(params: {
   feasibleDiscounts: number[];
   maxDiscountPct: number;
   merchantId?: string;
+  caseType?: string;
 }): BrainContext {
   const pseudonym = crypto.createHash("sha256").update(params.customerId).digest("hex").slice(0, 12);
 
@@ -1081,6 +1189,7 @@ export function buildUpsellContext(params: {
     theta_estimates: {},
     known_ids: [params.orderId, `cust_${pseudonym}`, ...params.candidates.map(c => c.id)],
     ...(params.merchantId ? { merchant_id: params.merchantId } : {}),
+    ...(params.caseType ? { case_type: params.caseType } : {}),
   };
 }
 
@@ -1091,6 +1200,7 @@ export function buildChatContext(params: {
   policyNumbers: { maxDiscountPaise: number; marginPaise: number };
   cartItems?: { id: string; name: string; price_paise: number }[];
   merchantId?: string;
+  caseType?: string;
 }): BrainContext {
   return {
     agent: "chat",
@@ -1119,5 +1229,6 @@ export function buildChatContext(params: {
     theta_estimates: {},
     known_ids: [params.token],
     ...(params.merchantId ? { merchant_id: params.merchantId } : {}),
+    ...(params.caseType ? { case_type: params.caseType } : {}),
   };
 }

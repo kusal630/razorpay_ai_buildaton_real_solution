@@ -83,9 +83,10 @@ opsRouter.get("/api/state", requireAuth, async (_req: Request, res: Response) =>
       query(`SELECT simulated_revenue_paise FROM backtest_runs ORDER BY ran_at DESC LIMIT 1`).catch(() => ({ rows: [] })),
     ]);
     const { getActiveBanners } = await import("../lib/refundAlarm.js");
-    const { getCircuitStatus, getLastTrip, breakerOpensLastHour } = await import("../lib/sharedBrain.js");
+    const { getCircuitStatus, getLastTrip, breakerOpensLastHour, getFallbackRate } = await import("../lib/sharedBrain.js");
     const circuit = getCircuitStatus();
     const trip = getLastTrip();
+    const fallback = getFallbackRate();
     res.json({
       alerts: await getActiveBanners(),
       revenue: { real: Number(rev.rows[0]?.total_revenue || 0), orders: Number(rev.rows[0]?.order_count || 0), sim: Number((simRev as any).rows[0]?.simulated_revenue_paise || 0) },
@@ -95,6 +96,8 @@ opsRouter.get("/api/state", requireAuth, async (_req: Request, res: Response) =>
       kill_switch: killSwitch.rows[0]?.enabled || false,
       // F5: breaker visibility (state, last trip reason, opens/hour).
       breaker: { state: circuit.state, failures: circuit.consecutiveFailures, last_trip_reason: trip.reason, opens_last_hour: breakerOpensLastHour() },
+      // §2.4: fallback-rate meter (alarm above 40%).
+      brain: { fallback_rate_pct: fallback.fallback_pct, calls: fallback.n, alarming: fallback.alarming },
       segments: segments.rows,
       doctor: await runDoctorChecks(),
       mode: getConfig().RAZORPAY_MODE,

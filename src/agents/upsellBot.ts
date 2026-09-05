@@ -120,6 +120,7 @@ export async function processPaidOrder(pl: {
     feasibleDiscounts: feasibleDiscounts.map(d => d * 100), // convert to paise for schema
     maxDiscountPct: MAX_DISCOUNT_PCT,
     merchantId: MERCHANT_ID,
+    caseType: "upsell",
   });
 
   const brain = await callBrain("upsell", brainContext);
@@ -171,6 +172,10 @@ export async function processPaidOrder(pl: {
       discount_pct: discountPct,
       discount_paise: discountPaise,
       tone: brain.message_tone,
+      message_strategy: (brain as any).raw?.message_strategy || "functional",
+      incentive_token: (brain as any).raw?.incentive_token || null,
+      case_type: "upsell",
+      fallback_reason: (brain as any).fallback_reason || null,
       reasoning: brain.rationale.reasoning,
       message_copy: upsellCopy,
       claims_resolved: finalizedUpsell.result.resolved,
@@ -266,6 +271,11 @@ export async function processPaidOrder(pl: {
         policy_checks: policyResult.checks,
         brain_mode: brain.mode,
         brain_reasoning: brain.rationale.reasoning,
+        message_strategy: (brain as any).raw?.message_strategy || "functional",
+        incentive_token: (brain as any).raw?.incentive_token || null,
+        case_type: "upsell",
+        fallback_reason: (brain as any).fallback_reason || null,
+        prompt_version: "v5.6",
         message_copy: upsellCopy,
         claims_resolved: finalizedUpsell.result.resolved,
         claims_stripped: finalizedUpsell.result.stripped,
