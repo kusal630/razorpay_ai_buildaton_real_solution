@@ -758,7 +758,12 @@ export async function resolvePayment(pl: {
       for (const sib of siblings) {
         if (sib.razorpay_link_id) {
           try {
-            await cancelRazorpayLink(sib.razorpay_link_id);
+            const { withTimeout, GATEWAY_TIMEOUT_MS } = await import("./timeout.js");
+            await withTimeout(
+              cancelRazorpayLink(sib.razorpay_link_id),
+              GATEWAY_TIMEOUT_MS,
+              `sibling cancel ${sib.razorpay_link_id}`
+            );
           } catch { /* best effort */ }
         }
         await client.query("UPDATE payment_links SET status = 'cancelled' WHERE id = $1", [sib.id]);
@@ -866,10 +871,18 @@ export async function sweepExpiredLinks(): Promise<{ expired: number }> {
      LIMIT 100`
   );
   let expired = 0;
+  const { withTimeout, GATEWAY_TIMEOUT_MS } = await import("./timeout.js");
   for (const link of due) {
     try {
       if (link.razorpay_link_id) {
-        try { await cancelRazorpayLink(link.razorpay_link_id); } catch { /* best effort */ }
+        try {
+          // Bounded: a hung cancel must not wedge the scheduler tick.
+          await withTimeout(
+            cancelRazorpayLink(link.razorpay_link_id),
+            GATEWAY_TIMEOUT_MS,
+            `sweeper cancel ${link.razorpay_link_id}`
+          );
+        } catch { /* best effort */ }
       }
       await query("UPDATE payment_links SET status = 'expired' WHERE id = $1", [link.id]);
       // T4: cart lapsed unresolved to expiry → abandonment cycle. Payments

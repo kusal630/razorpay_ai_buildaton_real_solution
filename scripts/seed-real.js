@@ -227,9 +227,11 @@ function generateHistoricalSQL(bound) {
 
 BEGIN;
 
--- TC4: Vikram — failed payment 30 min ago (fires ₹0 retry)
-INSERT INTO orders (id, merchant_id, source, customer_id, amount_paise, fee_paise, fee_basis, incentive_paise, margin_paise, status, simulated, created_at, failed_at)
-VALUES ('${H.vikramOrder}', '${MERCHANT_ID}', 'direct', '${c('vikram')}', 149900, 0, 'modeled', 0, 55000, 'failed', false, now() - interval '30 minutes', now() - interval '30 minutes')
+-- TC4: Vikram — failed payment 30 min ago (fires ₹0 retry).
+-- cart_id is REQUIRED: the retry bot cannot build a link without the cart,
+-- and the scheduler skips cart-less failed orders entirely.
+INSERT INTO orders (id, merchant_id, source, cart_id, customer_id, amount_paise, fee_paise, fee_basis, incentive_paise, margin_paise, status, simulated, created_at, failed_at)
+VALUES ('${H.vikramOrder}', '${MERCHANT_ID}', 'direct', '${cart('vikram')}', '${c('vikram')}', 149900, 0, 'modeled', 0, 55000, 'failed', false, now() - interval '30 minutes', now() - interval '30 minutes')
 ON CONFLICT (id) DO NOTHING;
 
 -- TC5: Neha — prior paid order WITH ₹100 incentive, 12 days ago (30-day cap sees it)

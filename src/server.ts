@@ -413,6 +413,7 @@ function startScheduler() {
       const { rows: failedOrders } = await query(
         `SELECT o.id FROM orders o
          WHERE o.status = 'failed'
+         AND o.cart_id IS NOT NULL
          AND COALESCE(o.failed_at, o.created_at) < NOW() - INTERVAL '5 minutes'
          AND COALESCE(o.failed_at, o.created_at) > NOW() - INTERVAL '24 hours'
          AND NOT EXISTS (
@@ -485,9 +486,18 @@ function startScheduler() {
       );
       if (liveLinks.length > 0) {
         const { fetchPaymentLink, resolvePayment } = await import("./lib/moneyBus.js");
+        const { withTimeout, GATEWAY_TIMEOUT_MS } = await import("./lib/timeout.js");
+        let throttled = false;
         for (const link of liveLinks) {
+          if (throttled) break;
           try {
-            const rpLink = await fetchPaymentLink(link.razorpay_link_id);
+            // Bounded: one hung gateway socket must not wedge the tick
+            // (single-flight turns a hang into a full scheduler stop).
+            const rpLink = await withTimeout(
+              fetchPaymentLink(link.razorpay_link_id),
+              GATEWAY_TIMEOUT_MS,
+              `poller fetch ${link.razorpay_link_id}`
+            );
             if (rpLink.status === "paid") {
               await resolvePayment({
                 id: link.id, merchant_id: link.merchant_id || "5a3ac6ce-b2c7-4b1f-a9db-45296841f30b",
@@ -500,8 +510,19 @@ function startScheduler() {
               await query("UPDATE payment_links SET status = $1 WHERE id = $2", [rpLink.status, link.id]);
             }
           } catch (err: any) {
-            log.error({ linkId: link.razorpay_link_id, error: err.message, status: err.statusCode, detail: err.error }, "Poller error");
+            const status = err?.statusCode ?? err?.status;
+            if (status === 429) {
+              // Throttled: stop this pass early (remaining links wait for
+              // the next tick) instead of burning the rate budget on 33
+              // doomed fetches. One log line, not 33 error rows.
+              throttled = true;
+              log.warn("Poller throttled by gateway (429) — deferring rest of pass");
+            } else {
+              log.error({ linkId: link.razorpay_link_id, error: err.message, status, detail: err.error }, "Poller error");
+            }
           }
+          // Gentle spacing: 33 back-to-back fetches invite the throttle.
+          await new Promise((r) => setTimeout(r, 250));
         }
       }
     } catch (err: any) {

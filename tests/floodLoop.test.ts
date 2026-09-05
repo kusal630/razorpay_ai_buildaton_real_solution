@@ -60,4 +60,21 @@ describe("flood loop-proofing static contract", () => {
     );
     expect(track.match(/anchorTransactional/g)?.length).toBeGreaterThanOrEqual(2);
   });
+
+  it("gateway calls are time-bounded (a hung socket cannot wedge the tick)", () => {
+    expect(srv).toContain("withTimeout");
+    expect(srv).toContain("GATEWAY_TIMEOUT_MS");
+    const money = fs.readFileSync(
+      path.join(process.cwd(), "src", "lib", "moneyBus.ts"), "utf8"
+    );
+    expect(money).toContain("withTimeout");
+  });
+
+  it("poller stops the pass on 429 instead of burning the rate budget", () => {
+    expect(srv).toMatch(/throttled.*429|429.*throttl/i);
+  });
+
+  it("failure scan requires a cart (cart-less failed orders cannot retry)", () => {
+    expect(srv).toContain("o.cart_id IS NOT NULL");
+  });
 });
